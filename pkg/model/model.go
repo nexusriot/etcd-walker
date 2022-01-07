@@ -10,6 +10,11 @@ type Model struct {
 	api    client.KeysAPI
 }
 
+type Node struct {
+	Name  string
+	IsDir bool
+}
+
 func NewModel() *Model {
 	etcd, err := client.New(client.Config{
 		Endpoints: []string{"http://127.0.0.1:2379"},
@@ -25,20 +30,24 @@ func NewModel() *Model {
 	return &m
 }
 
-func (m *Model) ListRoot() ([]string, error) {
+func (m *Model) ListRoot() ([]*Node, error) {
 	options := &client.GetOptions{Sort: true, Recursive: true}
 	//_, err = api.Set(context.Background(), "ololo", "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore})
+	var result []*Node
 	response, err := m.api.Get(context.Background(), "/", options)
 	if err != nil {
 		return nil, err
 	}
-	var keys []string
 	if response.Node.Nodes != nil {
 		for _, v := range response.Node.Nodes {
-			keys = append(keys, v.Key)
+			node := Node{
+				Name:  v.Key,
+				IsDir: v.Dir,
+			}
+			result = append(result, &node)
 		}
 	}
-	return keys, nil
+	return result, nil
 }
 
 func Misc() {
