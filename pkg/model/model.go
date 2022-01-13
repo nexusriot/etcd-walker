@@ -30,11 +30,11 @@ func NewModel() *Model {
 	return &m
 }
 
-func (m *Model) ListRoot() ([]*Node, error) {
-	options := &client.GetOptions{Sort: true, Recursive: true}
+func (m *Model) List(nodePath string) ([]*Node, error) {
+	options := &client.GetOptions{Sort: true, Recursive: false}
 	//_, err = api.Set(context.Background(), "ololo", "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore})
 	var result []*Node
-	response, err := m.api.Get(context.Background(), "/", options)
+	response, err := m.api.Get(context.Background(), nodePath, options)
 	if err != nil {
 		return nil, err
 	}

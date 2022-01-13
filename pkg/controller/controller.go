@@ -5,11 +5,13 @@ import (
 	"github.com/nexusriot/etcd-walker/pkg/model"
 	"github.com/nexusriot/etcd-walker/pkg/view"
 	"github.com/rivo/tview"
+	"strings"
 )
 
 type Controller struct {
-	view  *view.View
-	model *model.Model
+	view       *view.View
+	model      *model.Model
+	currentDir string
 }
 
 func NewController(
@@ -22,26 +24,28 @@ func NewController(
 
 	v.Frame.AddText("Etcd-walker v.0.0.1-poc", true, tview.AlignCenter, tcell.ColorGreen)
 	controller := Controller{
-		view:  v,
-		model: m,
+		view:       v,
+		model:      m,
+		currentDir: "/",
 	}
 	return &controller
 }
 
 func (c *Controller) updateList() {
 	c.view.List.Clear()
-	list, err := c.model.ListRoot()
+	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
+	list, err := c.model.List(c.currentDir)
 	if err != nil {
 		panic(err)
 	}
 	for _, node := range list {
-		var nodeV string
-		if !node.IsDir {
-			nodeV = "*" + node.Name
-		} else {
-			nodeV = node.Name
-		}
-		c.view.List.AddItem(nodeV, nodeV, 0, func() {})
+		c.view.List.SetMainTextColor(tcell.Color31)
+		c.view.List.AddItem(node.Name, node.Name, 0, func() {
+			i := c.view.List.GetCurrentItem()
+			_, cur := c.view.List.GetItemText(i)
+			cur = strings.TrimSpace(cur)
+			c.Cd(c.currentDir + cur)
+		})
 	}
 }
 
@@ -57,6 +61,11 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
+}
+
+func (c *Controller) Cd(path string) {
+	c.currentDir = path
+	c.updateList()
 }
 
 func (c *Controller) Stop() {
