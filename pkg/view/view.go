@@ -3,16 +3,15 @@ package view
 import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	log "github.com/sirupsen/logrus"
-	"strings"
 )
 
 // View ...
 type View struct {
-	App   *tview.Application
-	Frame *tview.Frame
-	Pages *tview.Pages
-	List  *tview.List
+	App     *tview.Application
+	Frame   *tview.Frame
+	Pages   *tview.Pages
+	List    *tview.List
+	Details *tview.TextView
 }
 
 // NewView ...
@@ -22,11 +21,6 @@ func NewView() *View {
 		ShowSecondaryText(false)
 	list.SetBorder(true).
 		SetTitleAlign(tview.AlignLeft)
-	list.SetChangedFunc(func(i int, s string, s2 string, r rune) {
-		_, cur := list.GetItemText(i)
-		cur = strings.TrimSpace(cur)
-		log.Println("changed: ", cur)
-	})
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
@@ -54,6 +48,7 @@ func NewView() *View {
 		frame,
 		pages,
 		list,
+		tv,
 	}
 
 	return &v
@@ -63,12 +58,12 @@ func CreateInputForm() {
 	app := tview.NewApplication()
 
 	form := tview.NewForm().
-		AddInputField("Last name", "", 20, nil, nil).
+		AddInputField("Node name", "", 20, nil, nil).
 		AddButton("Save", nil).
 		AddButton("Quit", func() {
 			app.Stop()
 		})
-	form.SetBorder(true).SetTitle("Enter some data").SetTitleAlign(tview.AlignLeft)
+	form.SetBorder(true).SetTitle("Node editing").SetTitleAlign(tview.AlignLeft)
 	if err := app.SetRoot(form, true).EnableMouse(true).Run(); err != nil {
 		panic(err)
 	}

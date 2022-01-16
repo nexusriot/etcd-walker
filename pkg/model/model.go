@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+
 	"github.com/coreos/etcd/client"
 )
 
@@ -11,11 +12,14 @@ type Model struct {
 }
 
 type Node struct {
-	Name  string
-	IsDir bool
+	Name      string
+	ClusterId string
+	IsDir     bool
+	Value     string
 }
 
 func NewModel() *Model {
+	// TODO: make configurable
 	etcd, err := client.New(client.Config{
 		Endpoints: []string{"http://127.0.0.1:2379"},
 	})
@@ -30,31 +34,33 @@ func NewModel() *Model {
 	return &m
 }
 
-func (m *Model) List(nodePath string) ([]*Node, error) {
-	options := &client.GetOptions{Sort: true, Recursive: false}
-	//_, err = api.Set(context.Background(), "ololo", "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore})
-	var result []*Node
-	response, err := m.api.Get(context.Background(), nodePath, options)
-	if err != nil {
-		return nil, err
+func (m *Model) appendNode(nodes []*Node, name string, isDirectory bool, value string, clusterId string) ([]*Node, error) {
+	node := &Node{
+		Name:      name,
+		IsDir:     isDirectory,
+		ClusterId: clusterId,
+		Value:     value,
 	}
-	if response.Node.Nodes != nil {
-		for _, v := range response.Node.Nodes {
-			node := Node{
-				Name:  v.Key,
-				IsDir: v.Dir,
-			}
-			result = append(result, &node)
-		}
-	}
-	return result, nil
+	nodes = append(nodes, node)
+	return nodes, nil
 }
 
-func Misc() {
-	//options := &client.GetOptions{Sort: true, Recursive: true}
-	//_, err = api.Set(context.Background(), "ololo", "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore})
-	//response, err := api.Get(context.Background(), "/", options)
-	//_, err = api.Set(context.Background(), "/ololo/pp", "olol\nlo\nlo", nil)
-	//
-	//response, err = api.Get(context.Background(), "/ololo/pp", nil)
+func (m *Model) nodesToModelNodes(nodes client.Nodes, clusterId string) []*Node {
+	var nds []*Node
+	for _, node := range nodes {
+		nds, _ = m.appendNode(nds, node.Key, node.Dir, node.Value, clusterId)
+	}
+	return nds
+}
+
+func (m *Model) Ls(directory string) ([]*Node, error) {
+	options := &client.GetOptions{Sort: true, Recursive: false}
+	response, err := m.api.Get(context.Background(), directory, options)
+	if err != nil {
+		if client.IsKeyNotFound(err) {
+			return make([]*Node, 0), nil
+		}
+		return make([]*Node, 0), err
+	}
+	return m.nodesToModelNodes(response.Node.Nodes, response.ClusterID), nil
 }

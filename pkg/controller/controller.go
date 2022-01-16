@@ -1,17 +1,28 @@
 package controller
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/nexusriot/etcd-walker/pkg/model"
 	"github.com/nexusriot/etcd-walker/pkg/view"
 	"github.com/rivo/tview"
-	"strings"
 )
 
 type Controller struct {
-	view       *view.View
-	model      *model.Model
-	currentDir string
+	view         *view.View
+	model        *model.Model
+	currentDir   string
+	currentNodes map[string]*Node
+}
+
+type Node struct {
+	node *model.Node
+}
+
+func splitFunc(r rune) bool {
+	return r == '/'
 }
 
 func NewController(
@@ -21,8 +32,8 @@ func NewController(
 ) *Controller {
 	m := model.NewModel()
 	v := view.NewView()
+	v.Frame.AddText("Etcd-walker v.0.0.1-poc (on 127.0.0.1:2379)", true, tview.AlignCenter, tcell.ColorGreen)
 
-	v.Frame.AddText("Etcd-walker v.0.0.1-poc", true, tview.AlignCenter, tcell.ColorGreen)
 	controller := Controller{
 		view:       v,
 		model:      m,
@@ -31,22 +42,54 @@ func NewController(
 	return &controller
 }
 
+func (c *Controller) makeNodeMap() error {
+	m := make(map[string]*Node)
+	list, err := c.model.Ls(c.currentDir)
+	if err != nil {
+		return err
+	}
+	for _, node := range list {
+		rawname := node.Name
+		fields := strings.FieldsFunc(strings.TrimSpace(rawname), splitFunc)
+		m[fields[len(fields)-1]] = &Node{
+			node: node,
+		}
+	}
+	c.currentNodes = m
+	return nil
+}
+
 func (c *Controller) updateList() {
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
-	list, err := c.model.List(c.currentDir)
-	if err != nil {
-		panic(err)
-	}
-	for _, node := range list {
+	c.makeNodeMap()
+	for key, _ := range c.currentNodes {
 		c.view.List.SetMainTextColor(tcell.Color31)
-		c.view.List.AddItem(node.Name, node.Name, 0, func() {
+		c.view.List.AddItem(key, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
-			c.Cd(c.currentDir + cur)
+			if val, ok := c.currentNodes[key]; ok {
+				if val.node.IsDir {
+					c.Down(cur)
+				}
+			}
 		})
 	}
+}
+
+func (c *Controller) fillDetails(key string) {
+	go func() {
+		c.view.Details.Clear()
+		if val, ok := c.currentNodes[key]; ok {
+			fmt.Fprintf(c.view.Details, "[blue] Cluster Id: [gray] %s\n", val.node.ClusterId)
+			fmt.Fprintf(c.view.Details, "[green] Full name: [white] %s\n", val.node.Name)
+			fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n\n", val.node.IsDir)
+			if !val.node.IsDir {
+				fmt.Fprintf(c.view.Details, "[green] Value: [white] \n%s\n", val.node.Value)
+			}
+		}
+	}()
 }
 
 func (c *Controller) setInput() {
@@ -61,10 +104,37 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
+	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'u', 'h':
+				c.Up()
+				return nil
+			case 'l':
+				return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+			}
+
+		}
+		return event
+	})
+}
+
+func (c *Controller) Down(cur string) {
+	c.currentDir = c.currentDir + cur + "/"
+	c.Cd(c.currentDir)
+}
+
+func (c *Controller) Up() {
+	fields := strings.FieldsFunc(strings.TrimSpace(c.currentDir), splitFunc)
+	if len(fields) == 0 {
+		return
+	}
+	c.currentDir = "/" + strings.Join(fields[:len(fields)-1], "/")
+	c.Cd(c.currentDir + fields[0] + "/")
 }
 
 func (c *Controller) Cd(path string) {
-	c.currentDir = path
 	c.updateList()
 }
 
@@ -73,6 +143,11 @@ func (c *Controller) Stop() {
 }
 
 func (c *Controller) Run() error {
+	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
+		_, cur := c.view.List.GetItemText(i)
+		cur = strings.TrimSpace(cur)
+		c.fillDetails(cur)
+	})
 	c.updateList()
 	c.setInput()
 	return c.view.App.Run()
