@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -63,7 +64,12 @@ func (c *Controller) updateList() {
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
 	c.makeNodeMap()
-	for key, _ := range c.currentNodes {
+	keys := make([]string, 0, len(c.currentNodes))
+	for k := range c.currentNodes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		c.view.List.SetMainTextColor(tcell.Color31)
 		c.view.List.AddItem(key, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
