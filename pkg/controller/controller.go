@@ -12,6 +12,7 @@ import (
 )
 
 type Controller struct {
+	debug        bool
 	view         *view.View
 	model        *model.Model
 	currentDir   string
@@ -29,13 +30,14 @@ func splitFunc(r rune) bool {
 func NewController(
 	host string,
 	port string,
-	debug string,
+	debug bool,
 ) *Controller {
-	m := model.NewModel()
+	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText("Etcd-walker v.0.0.1-poc (on 127.0.0.1:2379)", true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.2 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
+		debug:      debug,
 		view:       v,
 		model:      m,
 		currentDir: "/",
@@ -50,8 +52,8 @@ func (c *Controller) makeNodeMap() error {
 		return err
 	}
 	for _, node := range list {
-		rawname := node.Name
-		fields := strings.FieldsFunc(strings.TrimSpace(rawname), splitFunc)
+		rawName := node.Name
+		fields := strings.FieldsFunc(strings.TrimSpace(rawName), splitFunc)
 		m[fields[len(fields)-1]] = &Node{
 			node: node,
 		}
@@ -75,7 +77,7 @@ func (c *Controller) updateList() {
 			i := c.view.List.GetCurrentItem()
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
-			if val, ok := c.currentNodes[key]; ok {
+			if val, ok := c.currentNodes[cur]; ok {
 				if val.node.IsDir {
 					c.Down(cur)
 				}

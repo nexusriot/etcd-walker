@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/coreos/etcd/client"
 )
@@ -18,10 +19,10 @@ type Node struct {
 	Value     string
 }
 
-func NewModel() *Model {
+func NewModel(host string, port string) *Model {
 	// TODO: make configurable
 	etcd, err := client.New(client.Config{
-		Endpoints: []string{"http://127.0.0.1:2379"},
+		Endpoints: []string{fmt.Sprintf("http://%s:%s", host, port)},
 	})
 	api := client.NewKeysAPI(etcd)
 	if err != nil {
