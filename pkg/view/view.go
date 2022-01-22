@@ -7,11 +7,12 @@ import (
 
 // View ...
 type View struct {
-	App     *tview.Application
-	Frame   *tview.Frame
-	Pages   *tview.Pages
-	List    *tview.List
-	Details *tview.TextView
+	App       *tview.Application
+	Frame     *tview.Frame
+	Pages     *tview.Pages
+	List      *tview.List
+	Details   *tview.TextView
+	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
 }
 
 // NewView ...
@@ -38,8 +39,18 @@ func NewView() *View {
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
 
+	modal := func(p tview.Primitive, width, height int) tview.Primitive {
+		return tview.NewFlex().
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(nil, 0, 1, false).
+				AddItem(p, 0, 1, true).
+				AddItem(nil, 0, 1, false), width, 1, true).
+			AddItem(nil, 0, 1, false)
+	}
+
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][e[][::-] Edit value [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -49,22 +60,29 @@ func NewView() *View {
 		pages,
 		list,
 		tv,
+		modal,
 	}
 
 	return &v
 }
 
-func CreateInputForm() {
-	app := tview.NewApplication()
-
+func (v *View) NewCreateForm(header string) *tview.Form {
 	form := tview.NewForm().
-		AddInputField("Node name", "", 20, nil, nil).
-		AddButton("Save", nil).
-		AddButton("Quit", func() {
-			app.Stop()
-		})
-	form.SetBorder(true).SetTitle("Node editing").SetTitleAlign(tview.AlignLeft)
-	if err := app.SetRoot(form, true).EnableMouse(true).Run(); err != nil {
-		panic(err)
-	}
+		AddInputField("Node name", "", 30, nil, nil).
+		AddInputField("Value", "", 30, nil, nil)
+
+	form.AddCheckbox("Is a Directory", false, func(checked bool) {
+	})
+	form.SetBorder(true)
+	form.SetTitle(header)
+	return form
+}
+
+func (v *View) NewEditValueForm(header string, value string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("Value", "", 30, nil, nil)
+	form.GetFormItem(0).(*tview.InputField).SetText(value)
+	form.SetBorder(true)
+	form.SetTitle(header)
+	return form
 }
