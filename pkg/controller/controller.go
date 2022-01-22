@@ -9,6 +9,7 @@ import (
 	"github.com/nexusriot/etcd-walker/pkg/model"
 	"github.com/nexusriot/etcd-walker/pkg/view"
 	"github.com/rivo/tview"
+	log "github.com/sirupsen/logrus"
 )
 
 type Controller struct {
@@ -46,6 +47,7 @@ func NewController(
 }
 
 func (c *Controller) makeNodeMap() error {
+	log.Debugf("updating node map started")
 	m := make(map[string]*Node)
 	list, err := c.model.Ls(c.currentDir)
 	if err != nil {
@@ -54,15 +56,19 @@ func (c *Controller) makeNodeMap() error {
 	for _, node := range list {
 		rawName := node.Name
 		fields := strings.FieldsFunc(strings.TrimSpace(rawName), splitFunc)
-		m[fields[len(fields)-1]] = &Node{
+		cNode := Node{
 			node: node,
 		}
+		m[fields[len(fields)-1]] = &cNode
+		log.Debugf("added node %s, %v", node.Name, cNode)
 	}
 	c.currentNodes = m
+	log.Debugf("updating node map completed")
 	return nil
 }
 
 func (c *Controller) updateList() {
+	log.Debugf("updating list")
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
 	c.makeNodeMap()
@@ -90,6 +96,7 @@ func (c *Controller) fillDetails(key string) {
 	go func() {
 		c.view.Details.Clear()
 		if val, ok := c.currentNodes[key]; ok {
+			log.Debugf("Node details name: %s, isDir: %t, clusterId: %s", val.node.Name, val.node.IsDir, val.node.ClusterId)
 			fmt.Fprintf(c.view.Details, "[blue] Cluster Id: [gray] %s\n", val.node.ClusterId)
 			fmt.Fprintf(c.view.Details, "[green] Full name: [white] %s\n", val.node.Name)
 			fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n\n", val.node.IsDir)
@@ -129,7 +136,9 @@ func (c *Controller) setInput() {
 }
 
 func (c *Controller) Down(cur string) {
-	c.currentDir = c.currentDir + cur + "/"
+	newDir := c.currentDir + cur + "/"
+	log.Debugf("command: down - current dir: %s, new dir: %s", c.currentDir, newDir)
+	c.currentDir = newDir
 	c.Cd(c.currentDir)
 }
 
@@ -138,8 +147,10 @@ func (c *Controller) Up() {
 	if len(fields) == 0 {
 		return
 	}
-	c.currentDir = "/" + strings.Join(fields[:len(fields)-1], "/")
-	c.Cd(c.currentDir + fields[0] + "/")
+	newDir := "/" + strings.Join(fields[:len(fields)-1], "/")
+	log.Debugf("command: up - current dir: %s, new dir: %s", c.currentDir, newDir)
+	c.currentDir = newDir
+	c.Cd(c.currentDir)
 }
 
 func (c *Controller) Cd(path string) {
@@ -147,6 +158,7 @@ func (c *Controller) Cd(path string) {
 }
 
 func (c *Controller) Stop() {
+	log.Debugf("exit...")
 	c.view.App.Stop()
 }
 
