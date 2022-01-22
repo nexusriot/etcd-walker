@@ -12,6 +12,9 @@ type View struct {
 	Pages   *tview.Pages
 	List    *tview.List
 	Details *tview.TextView
+	Box     *tview.Box
+	Modal   func(p tview.Primitive, width, height int) tview.Primitive
+	Form    *tview.Form
 }
 
 // NewView ...
@@ -35,8 +38,39 @@ func NewView() *View {
 	main.AddItem(list, 0, 2, true)
 	main.AddItem(tv, 0, 3, false)
 
+	box := tview.NewFlex().
+		SetBorder(true).
+		SetTitle("Box")
+
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
+
+	form := tview.NewForm().
+		AddInputField("Node name", "", 20, nil, nil).
+		AddCheckbox("Is a Directory", false, func(checked bool) {
+			if checked {
+
+			}
+
+		}).
+		AddInputField("Value", "", 30, nil, nil).
+		AddButton("Save", func() {
+			pages.RemovePage("modal")
+		}).
+		AddButton("Quit", func() {
+			app.Stop()
+		})
+	form.SetBorder(true)
+
+	modal := func(p tview.Primitive, width, height int) tview.Primitive {
+		return tview.NewFlex().
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(nil, 0, 1, false).
+				AddItem(p, 0, 1, true).
+				AddItem(nil, 0, 1, false), width, 1, true).
+			AddItem(nil, 0, 1, false)
+	}
 
 	frame := tview.NewFrame(pages)
 	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
@@ -49,22 +83,10 @@ func NewView() *View {
 		pages,
 		list,
 		tv,
+		box,
+		modal,
+		form,
 	}
 
 	return &v
-}
-
-func CreateInputForm() {
-	app := tview.NewApplication()
-
-	form := tview.NewForm().
-		AddInputField("Node name", "", 20, nil, nil).
-		AddButton("Save", nil).
-		AddButton("Quit", func() {
-			app.Stop()
-		})
-	form.SetBorder(true).SetTitle("Node editing").SetTitleAlign(tview.AlignLeft)
-	if err := app.SetRoot(form, true).EnableMouse(true).Run(); err != nil {
-		panic(err)
-	}
 }

@@ -121,7 +121,13 @@ func (c *Controller) setInput() {
 			case 'q':
 				c.Stop()
 				return nil
+
+			case 'c':
+				c.view.Pages.RemovePage("modal")
+				c.view.Pages.AddPage("modal", c.view.Modal(c.view.Form, 60, 50), true, true)
+				return nil
 			}
+
 		}
 		return event
 	})
@@ -180,5 +186,6 @@ func (c *Controller) Run() error {
 	})
 	c.updateList()
 	c.setInput()
+
 	return c.view.App.Run()
 }
