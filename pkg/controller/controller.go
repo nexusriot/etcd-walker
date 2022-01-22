@@ -81,6 +81,7 @@ func (c *Controller) updateList() {
 	sort.Strings(keys)
 	for _, key := range keys {
 		c.view.List.SetMainTextColor(tcell.Color31)
+		c.view.List.SetSecondaryTextColor(tcell.Color18)
 		c.view.List.AddItem(key, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			_, cur := c.view.List.GetItemText(i)
@@ -121,11 +122,6 @@ func (c *Controller) setInput() {
 			case 'q':
 				c.Stop()
 				return nil
-
-			case 'c':
-				c.view.Pages.RemovePage("modal")
-				c.view.Pages.AddPage("modal", c.view.Modal(c.view.Form, 60, 50), true, true)
-				return nil
 			}
 
 		}
@@ -135,6 +131,29 @@ func (c *Controller) setInput() {
 		switch event.Key() {
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case 'c':
+				createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
+				createForm.AddButton("Save", func() {
+					node := createForm.GetFormItem(0).(*tview.InputField).GetText()
+					value := createForm.GetFormItem(1).(*tview.InputField).GetText()
+					isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
+					if node != "" {
+						log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
+						if !isDir {
+							c.model.Set(c.currentDir+"/"+node, value)
+							// TODO: show err
+						} else {
+							c.model.MkDir(c.currentDir + node)
+						}
+						c.updateList()
+					}
+					c.view.Pages.RemovePage("modal")
+				})
+				createForm.AddButton("Quit", func() {
+					c.view.Pages.RemovePage("modal")
+				})
+				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 50), true, true)
+				return nil
 			case 'u', 'h':
 				c.Up()
 				return nil

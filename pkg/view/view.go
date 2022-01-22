@@ -7,14 +7,12 @@ import (
 
 // View ...
 type View struct {
-	App     *tview.Application
-	Frame   *tview.Frame
-	Pages   *tview.Pages
-	List    *tview.List
-	Details *tview.TextView
-	Box     *tview.Box
-	Modal   func(p tview.Primitive, width, height int) tview.Primitive
-	Form    *tview.Form
+	App       *tview.Application
+	Frame     *tview.Frame
+	Pages     *tview.Pages
+	List      *tview.List
+	Details   *tview.TextView
+	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
 }
 
 // NewView ...
@@ -38,29 +36,8 @@ func NewView() *View {
 	main.AddItem(list, 0, 2, true)
 	main.AddItem(tv, 0, 3, false)
 
-	box := tview.NewFlex().
-		SetBorder(true).
-		SetTitle("Box")
-
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
-
-	form := tview.NewForm().
-		AddInputField("Node name", "", 20, nil, nil).
-		AddCheckbox("Is a Directory", false, func(checked bool) {
-			if checked {
-
-			}
-
-		}).
-		AddInputField("Value", "", 30, nil, nil).
-		AddButton("Save", func() {
-			pages.RemovePage("modal")
-		}).
-		AddButton("Quit", func() {
-			app.Stop()
-		})
-	form.SetBorder(true)
 
 	modal := func(p tview.Primitive, width, height int) tview.Primitive {
 		return tview.NewFlex().
@@ -73,7 +50,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -83,10 +60,20 @@ func NewView() *View {
 		pages,
 		list,
 		tv,
-		box,
 		modal,
-		form,
 	}
 
 	return &v
+}
+
+func (v *View) NewCreateForm(header string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("Node name", "", 20, nil, nil).
+		AddInputField("Value", "", 30, nil, nil)
+
+	form.AddCheckbox("Is a Directory", false, func(checked bool) {
+	})
+	form.SetBorder(true)
+	form.SetTitle(header)
+	return form
 }

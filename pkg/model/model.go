@@ -65,3 +65,27 @@ func (m *Model) Ls(directory string) ([]*Node, error) {
 	}
 	return m.nodesToModelNodes(response.Node.Nodes, response.ClusterID), nil
 }
+
+func (m *Model) Set(key, value string) error {
+	_, err := m.api.Set(context.Background(), key, value, nil)
+	return err
+}
+
+func (m *Model) MkDir(directory string) error {
+	res, err := m.api.Get(context.Background(), directory, nil)
+
+	if err != nil && !client.IsKeyNotFound(err) {
+		return err
+	}
+
+	if err != nil && client.IsKeyNotFound(err) {
+		_, err = m.api.Set(context.Background(), directory, "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore})
+		return err
+	}
+
+	if !res.Node.Dir {
+		return fmt.Errorf("trying to rewrite existing value with dir: %v", directory)
+	}
+
+	return nil
+}
