@@ -13,13 +13,12 @@ import (
 )
 
 type Controller struct {
-	debug          bool
-	view           *view.View
-	model          *model.Model
-	currentDir     string
-	currentNodes   map[string]*Node
-	prevItemIdx    int
-	restoreIdxFlag bool
+	debug        bool
+	view         *view.View
+	model        *model.Model
+	currentDir   string
+	currentNodes map[string]*Node
+	position     map[string]int
 }
 
 type Node struct {
@@ -44,6 +43,7 @@ func NewController(
 		view:       v,
 		model:      m,
 		currentDir: "/",
+		position:   make(map[string]int),
 	}
 	return &controller
 }
@@ -87,15 +87,17 @@ func (c *Controller) updateList() {
 			cur = strings.TrimSpace(cur)
 			if val, ok := c.currentNodes[cur]; ok {
 				if val.node.IsDir {
+					c.position[c.currentDir] = c.view.List.GetCurrentItem()
 					c.Down(cur)
 				}
 			}
 		})
 	}
-	if c.restoreIdxFlag {
-		c.view.List.SetCurrentItem(c.prevItemIdx)
-		c.restoreIdxFlag = false
+	if val, ok := c.position[c.currentDir]; ok {
+		c.view.List.SetCurrentItem(val)
+		delete(c.position, c.currentDir)
 	}
+
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -162,7 +164,6 @@ func (c *Controller) Up() {
 }
 
 func (c *Controller) Cd(path string) {
-	c.restoreIdxFlag = true
 	c.updateList()
 }
 
@@ -173,9 +174,6 @@ func (c *Controller) Stop() {
 
 func (c *Controller) Run() error {
 	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
-		if !c.restoreIdxFlag {
-			c.prevItemIdx = c.view.List.GetCurrentItem()
-		}
 		_, cur := c.view.List.GetItemText(i)
 		cur = strings.TrimSpace(cur)
 		c.fillDetails(cur)
