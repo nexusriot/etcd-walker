@@ -13,11 +13,13 @@ import (
 )
 
 type Controller struct {
-	debug        bool
-	view         *view.View
-	model        *model.Model
-	currentDir   string
-	currentNodes map[string]*Node
+	debug          bool
+	view           *view.View
+	model          *model.Model
+	currentDir     string
+	currentNodes   map[string]*Node
+	prevItemIdx    int
+	restoreIdxFlag bool
 }
 
 type Node struct {
@@ -90,21 +92,23 @@ func (c *Controller) updateList() {
 			}
 		})
 	}
+	if c.restoreIdxFlag {
+		c.view.List.SetCurrentItem(c.prevItemIdx)
+		c.restoreIdxFlag = false
+	}
 }
 
 func (c *Controller) fillDetails(key string) {
-	go func() {
-		c.view.Details.Clear()
-		if val, ok := c.currentNodes[key]; ok {
-			log.Debugf("Node details name: %s, isDir: %t, clusterId: %s", val.node.Name, val.node.IsDir, val.node.ClusterId)
-			fmt.Fprintf(c.view.Details, "[blue] Cluster Id: [gray] %s\n", val.node.ClusterId)
-			fmt.Fprintf(c.view.Details, "[green] Full name: [white] %s\n", val.node.Name)
-			fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n\n", val.node.IsDir)
-			if !val.node.IsDir {
-				fmt.Fprintf(c.view.Details, "[green] Value: [white] \n%s\n", val.node.Value)
-			}
+	c.view.Details.Clear()
+	if val, ok := c.currentNodes[key]; ok {
+		log.Debugf("Node details name: %s, isDir: %t, clusterId: %s", val.node.Name, val.node.IsDir, val.node.ClusterId)
+		fmt.Fprintf(c.view.Details, "[blue] Cluster Id: [gray] %s\n", val.node.ClusterId)
+		fmt.Fprintf(c.view.Details, "[green] Full name: [white] %s\n", val.node.Name)
+		fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n\n", val.node.IsDir)
+		if !val.node.IsDir {
+			fmt.Fprintf(c.view.Details, "[green] Value: [white] \n%s\n", val.node.Value)
 		}
-	}()
+	}
 }
 
 func (c *Controller) setInput() {
@@ -148,12 +152,17 @@ func (c *Controller) Up() {
 		return
 	}
 	newDir := "/" + strings.Join(fields[:len(fields)-1], "/")
+	if len(fields) > 1 {
+		newDir = newDir + "/"
+	}
+
 	log.Debugf("command: up - current dir: %s, new dir: %s", c.currentDir, newDir)
 	c.currentDir = newDir
 	c.Cd(c.currentDir)
 }
 
 func (c *Controller) Cd(path string) {
+	c.restoreIdxFlag = true
 	c.updateList()
 }
 
@@ -164,6 +173,9 @@ func (c *Controller) Stop() {
 
 func (c *Controller) Run() error {
 	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
+		if !c.restoreIdxFlag {
+			c.prevItemIdx = c.view.List.GetCurrentItem()
+		}
 		_, cur := c.view.List.GetItemText(i)
 		cur = strings.TrimSpace(cur)
 		c.fillDetails(cur)
