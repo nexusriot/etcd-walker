@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.2 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.3b (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -69,7 +69,7 @@ func (c *Controller) makeNodeMap() error {
 	return nil
 }
 
-func (c *Controller) updateList() {
+func (c *Controller) updateList() []string {
 	log.Debugf("updating list")
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
@@ -81,7 +81,6 @@ func (c *Controller) updateList() {
 	sort.Strings(keys)
 	for _, key := range keys {
 		c.view.List.SetMainTextColor(tcell.Color31)
-		c.view.List.SetSecondaryTextColor(tcell.Color18)
 		c.view.List.AddItem(key, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			_, cur := c.view.List.GetItemText(i)
@@ -98,7 +97,7 @@ func (c *Controller) updateList() {
 		c.view.List.SetCurrentItem(val)
 		delete(c.position, c.currentDir)
 	}
-
+	return keys
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -112,6 +111,15 @@ func (c *Controller) fillDetails(key string) {
 			fmt.Fprintf(c.view.Details, "[green] Value: [white] \n%s\n", val.node.Value)
 		}
 	}
+}
+
+func (c *Controller) getPosition(element string, slice []string) int {
+	for k, v := range slice {
+		if element == v {
+			return k
+		}
+	}
+	return 0
 }
 
 func (c *Controller) setInput() {
@@ -132,6 +140,7 @@ func (c *Controller) setInput() {
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case 'c':
+				pos := 0
 				createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
 				createForm.AddButton("Save", func() {
 					node := createForm.GetFormItem(0).(*tview.InputField).GetText()
@@ -139,20 +148,46 @@ func (c *Controller) setInput() {
 					isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
 					if node != "" {
 						log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
+						// TODO: error handling & reporting
 						if !isDir {
 							c.model.Set(c.currentDir+"/"+node, value)
-							// TODO: show err
 						} else {
 							c.model.MkDir(c.currentDir + node)
 						}
-						c.updateList()
+						pos = c.getPosition(node, c.updateList())
+						c.view.Pages.RemovePage("modal")
+						c.view.List.SetCurrentItem(pos)
 					}
-					c.view.Pages.RemovePage("modal")
+
 				})
 				createForm.AddButton("Quit", func() {
 					c.view.Pages.RemovePage("modal")
 				})
-				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 50), true, true)
+				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 70, 60), true, true)
+				return nil
+			case 'e':
+				pos := 0
+				i := c.view.List.GetCurrentItem()
+				_, cur := c.view.List.GetItemText(i)
+				cur = strings.TrimSpace(cur)
+				if val, ok := c.currentNodes[cur]; ok {
+					if !val.node.IsDir {
+						editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
+						editValueForm.AddButton("Save", func() {
+							value := editValueForm.GetFormItem(0).(*tview.InputField).GetText()
+							log.Debugf("Editing Node Value: name: %s, value: %s", val.node.Name, value)
+							// TODO: error handling & reporting
+							c.model.Set(val.node.Name, value)
+							pos = c.getPosition(cur, c.updateList())
+							c.view.Pages.RemovePage("modal")
+							c.view.List.SetCurrentItem(pos)
+						})
+						editValueForm.AddButton("Quit", func() {
+							c.view.Pages.RemovePage("modal")
+						})
+						c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 20), true, true)
+					}
+				}
 				return nil
 			case 'u', 'h':
 				c.Up()
@@ -160,7 +195,6 @@ func (c *Controller) setInput() {
 			case 'l':
 				return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 			}
-
 		}
 		return event
 	})
@@ -205,6 +239,5 @@ func (c *Controller) Run() error {
 	})
 	c.updateList()
 	c.setInput()
-
 	return c.view.App.Run()
 }

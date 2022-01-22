@@ -50,7 +50,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][e[][::-] Edit value [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -68,11 +68,20 @@ func NewView() *View {
 
 func (v *View) NewCreateForm(header string) *tview.Form {
 	form := tview.NewForm().
-		AddInputField("Node name", "", 20, nil, nil).
+		AddInputField("Node name", "", 30, nil, nil).
 		AddInputField("Value", "", 30, nil, nil)
 
 	form.AddCheckbox("Is a Directory", false, func(checked bool) {
 	})
+	form.SetBorder(true)
+	form.SetTitle(header)
+	return form
+}
+
+func (v *View) NewEditValueForm(header string, value string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("Value", "", 30, nil, nil)
+	form.GetFormItem(0).(*tview.InputField).SetText(value)
 	form.SetBorder(true)
 	form.SetTitle(header)
 	return form
