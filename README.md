@@ -11,4 +11,4 @@ in some cases (for example for running inside containers) need to build statical
 go build -ldflags "-linkmode external -extldflags -static"
 ```
 
-![etcd walker](https://github.com/nexusriot/etcd-walker/blob/main/walker.png?raw=true)
+![etcd walker](https://github.com/nexusriot/etcd-walker/blob/main/etcd-walker.gif?raw=true)
