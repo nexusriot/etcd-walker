@@ -196,18 +196,18 @@ func (c *Controller) setInput() {
 					keys = append(keys, k)
 				}
 				sort.Strings(keys)
+				search.SetDoneFunc(func(key tcell.Key) {
+					c.view.Pages.RemovePage("modal")
+				})
 				search.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 					switch event.Key() {
-					case tcell.KeyEsc:
+					case tcell.KeyEnter:
+						value := search.GetText()
+						pos := c.getPosition(value, keys)
+						c.view.List.SetCurrentItem(pos)
 						c.view.Pages.RemovePage("modal")
 					}
 					return event
-				})
-				search.SetDoneFunc(func(key tcell.Key) {
-					value := search.GetText()
-					pos := c.getPosition(value, keys)
-					c.view.List.SetCurrentItem(pos)
-					c.view.Pages.RemovePage("modal")
 				})
 				search.SetAutocompleteFunc(func(currentText string) []string {
 					prefix := strings.TrimSpace(strings.ToLower(currentText))
