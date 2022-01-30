@@ -44,13 +44,13 @@ func NewView() *View {
 			AddItem(nil, 0, 1, false).
 			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 				AddItem(nil, 0, 1, false).
-				AddItem(p, 0, 1, true).
+				AddItem(p, height, 1, true).
 				AddItem(nil, 0, 1, false), width, 1, true).
 			AddItem(nil, 0, 1, false)
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][e[][::-] Edit value [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][e[][::-] Edit value [::b][/][::-] Search [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -75,6 +75,13 @@ func (v *View) NewCreateForm(header string) *tview.Form {
 	})
 	form.SetBorder(true)
 	form.SetTitle(header)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
 	return form
 }
 
@@ -84,5 +91,20 @@ func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 	form.GetFormItem(0).(*tview.InputField).SetText(value)
 	form.SetBorder(true)
 	form.SetTitle(header)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
 	return form
+}
+
+func (v *View) NewSearch() *tview.InputField {
+	search := tview.NewInputField().
+		SetPlaceholder("search").
+		SetFieldBackgroundColor(tcell.ColorGrey).
+		SetFieldTextColor(tcell.ColorWhite)
+	return search
 }
