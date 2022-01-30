@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.3b (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.4 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -163,7 +163,7 @@ func (c *Controller) setInput() {
 				createForm.AddButton("Quit", func() {
 					c.view.Pages.RemovePage("modal")
 				})
-				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 70, 60), true, true)
+				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
 				return nil
 			case 'e':
 				pos := 0
@@ -185,9 +185,44 @@ func (c *Controller) setInput() {
 						editValueForm.AddButton("Quit", func() {
 							c.view.Pages.RemovePage("modal")
 						})
-						c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 20), true, true)
+						c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 7), true, true)
 					}
 				}
+				return nil
+			case '/':
+				search := c.view.NewSearch()
+				keys := make([]string, 0, len(c.currentNodes))
+				for k := range c.currentNodes {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				search.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+					switch event.Key() {
+					case tcell.KeyEsc:
+						c.view.Pages.RemovePage("modal")
+					}
+					return event
+				})
+				search.SetDoneFunc(func(key tcell.Key) {
+					value := search.GetText()
+					pos := c.getPosition(value, keys)
+					c.view.List.SetCurrentItem(pos)
+					c.view.Pages.RemovePage("modal")
+				})
+				search.SetAutocompleteFunc(func(currentText string) []string {
+					prefix := strings.TrimSpace(strings.ToLower(currentText))
+					if prefix == "" {
+						return nil
+					}
+					result := make([]string, 0, len(c.currentNodes))
+					for _, word := range keys {
+						if strings.HasPrefix(strings.ToLower(word), strings.ToLower(currentText)) {
+							result = append(result, word)
+						}
+					}
+					return result
+				})
+				c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
 				return nil
 			case 'u', 'h':
 				c.Up()
