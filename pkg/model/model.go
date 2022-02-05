@@ -89,3 +89,23 @@ func (m *Model) MkDir(directory string) error {
 
 	return nil
 }
+
+func (m *Model) Del(key string) error {
+	_, err := m.api.Delete(context.Background(), key, nil)
+	if err != nil {
+		if client.IsKeyNotFound(err) {
+			return nil
+		}
+	}
+	return err
+}
+
+func (m *Model) DelDir(key string) error {
+	_, err := m.api.Delete(context.Background(), key, &client.DeleteOptions{Dir: true, Recursive: true})
+	if err != nil {
+		if client.IsKeyNotFound(err) {
+			return nil
+		}
+	}
+	return err
+}
