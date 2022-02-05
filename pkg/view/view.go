@@ -1,6 +1,7 @@
 package view
 
 import (
+	"fmt"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -50,7 +51,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][e[][::-] Edit value [::b][/][::-] Search [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][d[][::-] Delete [::b][e[][::-] Edit value [::b][/][::-] Search [::b][q[][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
@@ -107,4 +108,10 @@ func (v *View) NewSearch() *tview.InputField {
 		SetFieldBackgroundColor(tcell.ColorGrey).
 		SetFieldTextColor(tcell.ColorWhite)
 	return search
+}
+
+func (v *View) NewDeleteQ(header string) *tview.Modal {
+	deleteQ := tview.NewModal()
+	deleteQ.SetText(fmt.Sprintf("Delete %s ?", header)).AddButtons([]string{"ok", "cancel"})
+	return deleteQ
 }

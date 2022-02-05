@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.4 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.5 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -220,6 +220,35 @@ func (c *Controller) setInput() {
 				})
 				c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
 				return nil
+			case 'd':
+				i := c.view.List.GetCurrentItem()
+				if c.view.List.GetItemCount() == 0 {
+					return nil
+				}
+				_, cur := c.view.List.GetItemText(i)
+				cur = strings.TrimSpace(cur)
+
+				if val, ok := c.currentNodes[cur]; ok {
+					elem := cur
+					isDir := val.node.IsDir
+					if isDir {
+						elem = elem + " (recursive)"
+					}
+					delQ := c.view.NewDeleteQ(elem)
+					delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+						if buttonLabel == "ok" {
+							if !isDir {
+								c.model.Del(val.node.Name)
+							} else {
+								c.model.DelDir(val.node.Name)
+							}
+							c.view.Details.Clear()
+							c.updateList()
+						}
+						c.view.Pages.RemovePage("modal")
+					})
+					c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
+				}
 			case 'u', 'h':
 				c.Up()
 				return nil
