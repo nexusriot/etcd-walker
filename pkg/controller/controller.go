@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.5 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.6 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -73,7 +73,10 @@ func (c *Controller) updateList() []string {
 	log.Debugf("updating list")
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
-	c.makeNodeMap()
+	err := c.makeNodeMap()
+	if err != nil {
+		c.error("failed to load nodes", err, true)
+	}
 	keys := make([]string, 0, len(c.currentNodes))
 	for k := range c.currentNodes {
 		keys = append(keys, k)
@@ -140,115 +143,13 @@ func (c *Controller) setInput() {
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case 'c':
-				pos := 0
-				createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
-				createForm.AddButton("Save", func() {
-					node := createForm.GetFormItem(0).(*tview.InputField).GetText()
-					value := createForm.GetFormItem(1).(*tview.InputField).GetText()
-					isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
-					if node != "" {
-						log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
-						// TODO: error handling & reporting
-						if !isDir {
-							c.model.Set(c.currentDir+"/"+node, value)
-						} else {
-							c.model.MkDir(c.currentDir + node)
-						}
-						pos = c.getPosition(node, c.updateList())
-						c.view.Pages.RemovePage("modal")
-						c.view.List.SetCurrentItem(pos)
-					}
-
-				})
-				createForm.AddButton("Quit", func() {
-					c.view.Pages.RemovePage("modal")
-				})
-				c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
-				return nil
+				return c.create()
 			case 'e':
-				pos := 0
-				i := c.view.List.GetCurrentItem()
-				_, cur := c.view.List.GetItemText(i)
-				cur = strings.TrimSpace(cur)
-				if val, ok := c.currentNodes[cur]; ok {
-					if !val.node.IsDir {
-						editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
-						editValueForm.AddButton("Save", func() {
-							value := editValueForm.GetFormItem(0).(*tview.InputField).GetText()
-							log.Debugf("Editing Node Value: name: %s, value: %s", val.node.Name, value)
-							// TODO: error handling & reporting
-							c.model.Set(val.node.Name, value)
-							pos = c.getPosition(cur, c.updateList())
-							c.view.Pages.RemovePage("modal")
-							c.view.List.SetCurrentItem(pos)
-						})
-						editValueForm.AddButton("Quit", func() {
-							c.view.Pages.RemovePage("modal")
-						})
-						c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 7), true, true)
-					}
-				}
-				return nil
+				return c.edit()
 			case '/':
-				search := c.view.NewSearch()
-				keys := make([]string, 0, len(c.currentNodes))
-				for k := range c.currentNodes {
-					keys = append(keys, k)
-				}
-				sort.Strings(keys)
-				search.SetDoneFunc(func(key tcell.Key) {
-					oldPos := c.view.List.GetCurrentItem()
-					value := search.GetText()
-					pos := c.getPosition(value, keys)
-					if pos != oldPos && key == tcell.KeyEnter {
-						c.view.List.SetCurrentItem(pos)
-					}
-					c.view.Pages.RemovePage("modal")
-				})
-				search.SetAutocompleteFunc(func(currentText string) []string {
-					prefix := strings.TrimSpace(strings.ToLower(currentText))
-					if prefix == "" {
-						return nil
-					}
-					result := make([]string, 0, len(c.currentNodes))
-					for _, word := range keys {
-						if strings.HasPrefix(strings.ToLower(word), strings.ToLower(currentText)) {
-							result = append(result, word)
-						}
-					}
-					return result
-				})
-				c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
-				return nil
+				return c.search()
 			case 'd':
-				i := c.view.List.GetCurrentItem()
-				if c.view.List.GetItemCount() == 0 {
-					return nil
-				}
-				_, cur := c.view.List.GetItemText(i)
-				cur = strings.TrimSpace(cur)
-
-				if val, ok := c.currentNodes[cur]; ok {
-					elem := cur
-					isDir := val.node.IsDir
-					if isDir {
-						elem = elem + " (recursive)"
-					}
-					delQ := c.view.NewDeleteQ(elem)
-					delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						if buttonLabel == "ok" {
-							if !isDir {
-								c.model.Del(val.node.Name)
-							} else {
-								c.model.DelDir(val.node.Name)
-							}
-							c.view.Details.Clear()
-							c.updateList()
-						}
-						c.view.Pages.RemovePage("modal")
-					})
-					c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
-				}
+				return c.delete()
 			case 'u', 'h':
 				c.Up()
 				return nil
@@ -300,4 +201,149 @@ func (c *Controller) Run() error {
 	c.updateList()
 	c.setInput()
 	return c.view.App.Run()
+}
+
+func (c *Controller) search() *tcell.EventKey {
+	search := c.view.NewSearch()
+	keys := make([]string, 0, len(c.currentNodes))
+	for k := range c.currentNodes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	search.SetDoneFunc(func(key tcell.Key) {
+		oldPos := c.view.List.GetCurrentItem()
+		value := search.GetText()
+		pos := c.getPosition(value, keys)
+		if pos != oldPos && key == tcell.KeyEnter {
+			c.view.List.SetCurrentItem(pos)
+		}
+		c.view.Pages.RemovePage("modal")
+	})
+	search.SetAutocompleteFunc(func(currentText string) []string {
+		prefix := strings.TrimSpace(strings.ToLower(currentText))
+		if prefix == "" {
+			return nil
+		}
+		result := make([]string, 0, len(c.currentNodes))
+		for _, word := range keys {
+			if strings.HasPrefix(strings.ToLower(word), strings.ToLower(currentText)) {
+				result = append(result, word)
+			}
+		}
+		return result
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
+	return nil
+}
+
+func (c *Controller) delete() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	var err error
+	i := c.view.List.GetCurrentItem()
+	_, cur := c.view.List.GetItemText(i)
+	cur = strings.TrimSpace(cur)
+
+	if val, ok := c.currentNodes[cur]; ok {
+		elem := cur
+		isDir := val.node.IsDir
+		if isDir {
+			elem = elem + " (recursive)"
+		}
+		delQ := c.view.NewDeleteQ(elem)
+		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			if buttonLabel == "ok" {
+				if !isDir {
+					err = c.model.Del(val.node.Name)
+				} else {
+					err = c.model.DelDir(val.node.Name)
+				}
+				if err != nil {
+					c.view.Pages.RemovePage("modal")
+					c.error("Error deleting node", err, false)
+					return
+				}
+				c.view.Details.Clear()
+				c.updateList()
+			}
+			c.view.Pages.RemovePage("modal")
+		})
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
+	}
+	return nil
+}
+
+func (c *Controller) create() *tcell.EventKey {
+	pos := 0
+	var err error
+	createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
+	createForm.AddButton("Save", func() {
+		node := createForm.GetFormItem(0).(*tview.InputField).GetText()
+		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
+		isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
+		if node != "" {
+			log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
+			if !isDir {
+				err = c.model.Set(c.currentDir+"/"+node, value)
+			} else {
+				err = c.model.MkDir(c.currentDir + node)
+			}
+			if err != nil {
+				c.view.Pages.RemovePage("modal")
+				c.error("Error creating node", err, false)
+				return
+			}
+			pos = c.getPosition(node, c.updateList())
+			c.view.Pages.RemovePage("modal")
+			c.view.List.SetCurrentItem(pos)
+		}
+	})
+	createForm.AddButton("Quit", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
+	return nil
+}
+
+func (c *Controller) edit() *tcell.EventKey {
+	var err error
+	pos := 0
+	i := c.view.List.GetCurrentItem()
+	_, cur := c.view.List.GetItemText(i)
+	cur = strings.TrimSpace(cur)
+	if val, ok := c.currentNodes[cur]; ok {
+		if !val.node.IsDir {
+			editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
+			editValueForm.AddButton("Save", func() {
+				value := editValueForm.GetFormItem(0).(*tview.InputField).GetText()
+				log.Debugf("Editing Node Value: name: %s, value: %s", val.node.Name, value)
+				err = c.model.Set(val.node.Name, value)
+				if err != nil {
+					c.view.Pages.RemovePage("modal")
+					c.error(fmt.Sprintf("Failed to edit %s", val.node.Name), err, false)
+					return
+				}
+				pos = c.getPosition(cur, c.updateList())
+				c.view.Pages.RemovePage("modal")
+				c.view.List.SetCurrentItem(pos)
+			})
+			editValueForm.AddButton("Quit", func() {
+				c.view.Pages.RemovePage("modal")
+			})
+			c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 7), true, true)
+		}
+	}
+	return nil
+}
+
+func (c *Controller) error(header string, err error, fatal bool) {
+	errMsg := c.view.NewErrorMessageQ(header, err.Error())
+	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.view.Pages.RemovePage("modal")
+		if fatal {
+			c.view.App.Stop()
+		}
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }
