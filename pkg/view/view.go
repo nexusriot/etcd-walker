@@ -105,7 +105,6 @@ func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 func (v *View) NewSearch() *tview.InputField {
 	search := tview.NewInputField().
 		SetPlaceholder("search").
-		SetFieldBackgroundColor(tcell.ColorGrey).
 		SetFieldTextColor(tcell.ColorWhite)
 	return search
 }
