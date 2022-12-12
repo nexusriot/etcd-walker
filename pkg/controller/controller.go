@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.7 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.8 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -128,13 +128,9 @@ func (c *Controller) getPosition(element string, slice []string) int {
 func (c *Controller) setInput() {
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyRune:
-			switch event.Rune() {
-			case 'q':
-				c.Stop()
-				return nil
-			}
-
+		case tcell.KeyCtrlQ:
+			c.Stop()
+			return nil
 		}
 		return event
 	})
