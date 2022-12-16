@@ -12,6 +12,27 @@ in some cases (for example for running inside containers) need to build statical
 ```
 go build -ldflags "-linkmode external -extldflags -static"
 ```
+to check for lib usage please use ldd command
+```
+ldd etcd-walker 
+```
+
+building 32-bit binary
+```
+GOOS=linux GOARCH=386 go build -o  etcd-walker_linux_i686 main.go
+```
+
+### **Building deb package**
+
+installing required tools including golang
+```
+sudo apt-get install git devscripts build-essential lintian upx-ucl golang
+```
+run build script
+```
+./build-deb.sh
+```
+
 
 ### **Running:**
 ```

@@ -1,0 +1,6 @@
+Package: etcd-walker
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description: Simple free CLI tool for etcd
+Installed-Size: 10230
