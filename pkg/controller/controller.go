@@ -36,7 +36,7 @@ func NewController(
 ) *Controller {
 	m := model.NewModel(host, port)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.8 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.10 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:      debug,
@@ -77,14 +77,29 @@ func (c *Controller) updateList() []string {
 	if err != nil {
 		c.error("failed to load nodes", err, true)
 	}
-	keys := make([]string, 0, len(c.currentNodes))
-	for k := range c.currentNodes {
-		keys = append(keys, k)
+
+	// [..] always on top
+	c.view.List.AddItem("[..]", "..", 0, func() {
+		c.Up()
+	})
+
+	// Collect and split into dirs and keys
+	dirKeys := make([]string, 0, len(c.currentNodes))
+	fileKeys := make([]string, 0, len(c.currentNodes))
+	for k, v := range c.currentNodes {
+		if v.node.IsDir {
+			dirKeys = append(dirKeys, k)
+		} else {
+			fileKeys = append(fileKeys, k)
+		}
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		c.view.List.SetMainTextColor(tcell.Color31)
-		c.view.List.AddItem(key, key, 0, func() {
+	sort.Strings(dirKeys)
+	sort.Strings(fileKeys)
+
+	// Directories first
+	for _, key := range dirKeys {
+		display := "📁 " + key + "/"
+		c.view.List.AddItem(display, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			_, cur := c.view.List.GetItemText(i)
 			cur = strings.TrimSpace(cur)
@@ -96,11 +111,26 @@ func (c *Controller) updateList() []string {
 			}
 		})
 	}
+
+	// Then files
+	for _, key := range fileKeys {
+		display := "   " + key
+		c.view.List.AddItem(display, key, 0, func() {
+			// Enter on a file: no-op (details pane still updates via SetChangedFunc)
+		})
+	}
+
+	// Restore cursor position if we saved it before
 	if val, ok := c.position[c.currentDir]; ok {
 		c.view.List.SetCurrentItem(val)
 		delete(c.position, c.currentDir)
 	}
-	return keys
+
+	// Return ordering without the [..] entry (used for getPosition/search)
+	ordered := make([]string, 0, len(dirKeys)+len(fileKeys))
+	ordered = append(ordered, dirKeys...)
+	ordered = append(ordered, fileKeys...)
+	return ordered
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -136,21 +166,25 @@ func (c *Controller) setInput() {
 	})
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
+
+		case tcell.KeyCtrlN:
+			return c.create()
+		case tcell.KeyDelete:
+			return c.delete()
+		case tcell.KeyCtrlE:
+			return c.edit()
+		case tcell.KeyCtrlS:
+			return c.search()
+		case tcell.KeyBackspace2:
+			c.Up()
+			return nil
+
 		case tcell.KeyRune:
 			switch event.Rune() {
-			case 'c':
-				return c.create()
-			case 'e':
-				return c.edit()
 			case '/':
 				return c.search()
-			case 'd':
-				return c.delete()
-			case 'u', 'h':
-				c.Up()
-				return nil
-			case 'l':
-				return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+				//case 'l':
+				//	return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 			}
 		}
 		return event
@@ -201,33 +235,47 @@ func (c *Controller) Run() error {
 
 func (c *Controller) search() *tcell.EventKey {
 	search := c.view.NewSearch()
-	keys := make([]string, 0, len(c.currentNodes))
-	for k := range c.currentNodes {
-		keys = append(keys, k)
+
+	// Build the SAME visual ordering as updateList(): dirs first, then files.
+	dirKeys := []string{}
+	fileKeys := []string{}
+	for k, v := range c.currentNodes {
+		if v.node.IsDir {
+			dirKeys = append(dirKeys, k)
+		} else {
+			fileKeys = append(fileKeys, k)
+		}
 	}
-	sort.Strings(keys)
+	sort.Strings(dirKeys)
+	sort.Strings(fileKeys)
+	ordered := append(dirKeys, fileKeys...)
+
 	search.SetDoneFunc(func(key tcell.Key) {
 		oldPos := c.view.List.GetCurrentItem()
-		value := search.GetText()
-		pos := c.getPosition(value, keys)
-		if pos != oldPos && key == tcell.KeyEnter {
-			c.view.List.SetCurrentItem(pos)
+		value := strings.TrimSpace(search.GetText())
+		pos := c.getPosition(value, ordered)
+		// +1 because of the top "[..]" entry
+		if pos+1 != oldPos && key == tcell.KeyEnter {
+			c.view.List.SetCurrentItem(pos + 1)
 		}
 		c.view.Pages.RemovePage("modal")
 	})
+
+	// Autocomplete also based on the visual order.
 	search.SetAutocompleteFunc(func(currentText string) []string {
 		prefix := strings.TrimSpace(strings.ToLower(currentText))
 		if prefix == "" {
 			return nil
 		}
-		result := make([]string, 0, len(c.currentNodes))
-		for _, word := range keys {
-			if strings.HasPrefix(strings.ToLower(word), strings.ToLower(currentText)) {
+		result := make([]string, 0, len(ordered))
+		for _, word := range ordered {
+			if strings.HasPrefix(strings.ToLower(word), prefix) {
 				result = append(result, word)
 			}
 		}
 		return result
 	})
+
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
 	return nil
 }
@@ -240,6 +288,11 @@ func (c *Controller) delete() *tcell.EventKey {
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
 	cur = strings.TrimSpace(cur)
+
+	// Ignore [..]
+	if cur == ".." {
+		return nil
+	}
 
 	if val, ok := c.currentNodes[cur]; ok {
 		elem := cur
@@ -290,7 +343,8 @@ func (c *Controller) create() *tcell.EventKey {
 				c.error("Error creating node", err, false)
 				return
 			}
-			pos = c.getPosition(node, c.updateList())
+			// +1 to account for the [..] entry at index 0
+			pos = c.getPosition(node, c.updateList()) + 1
 			c.view.Pages.RemovePage("modal")
 			c.view.List.SetCurrentItem(pos)
 		}
@@ -308,7 +362,14 @@ func (c *Controller) edit() *tcell.EventKey {
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
 	cur = strings.TrimSpace(cur)
+
+	// Ignore [..]
+	if cur == ".." {
+		return nil
+	}
+
 	if val, ok := c.currentNodes[cur]; ok {
+		// Edit file (value)
 		if !val.node.IsDir {
 			editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
 			editValueForm.AddButton("Save", func() {
@@ -317,10 +378,11 @@ func (c *Controller) edit() *tcell.EventKey {
 				err = c.model.Set(val.node.Name, value)
 				if err != nil {
 					c.view.Pages.RemovePage("modal")
-					c.error(fmt.Sprintf("Failed to edit %s", val.node.Name), err, false)
+					c.error(fmt.Errorf("Failed to edit %s: %w", val.node.Name, err).Error(), err, false)
 					return
 				}
-				pos = c.getPosition(cur, c.updateList())
+				// +1 to account for the [..] entry at index 0
+				pos = c.getPosition(cur, c.updateList()) + 1
 				c.view.Pages.RemovePage("modal")
 				c.view.List.SetCurrentItem(pos)
 			})
@@ -328,7 +390,40 @@ func (c *Controller) edit() *tcell.EventKey {
 				c.view.Pages.RemovePage("modal")
 			})
 			c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 7), true, true)
+			return nil
 		}
+
+		// Edit directory (rename)
+		editDirForm := c.view.NewEditValueForm(fmt.Sprintf("Rename folder: %s", val.node.Name), cur)
+		editDirForm.AddButton("Save", func() {
+			newName := strings.TrimSpace(editDirForm.GetFormItem(0).(*tview.InputField).GetText())
+			if newName == "" || strings.Contains(newName, "/") {
+				c.view.Pages.RemovePage("modal")
+				c.error("Invalid folder name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
+				return
+			}
+			oldPath := val.node.Name
+			newPath := c.currentDir + newName
+			if newPath == oldPath {
+				c.view.Pages.RemovePage("modal")
+				return
+			}
+			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
+			err = c.model.RenameDir(oldPath, newPath)
+			if err != nil {
+				c.view.Pages.RemovePage("modal")
+				c.error("Failed to rename folder", err, false)
+				return
+			}
+			// Refresh and select the new folder name (+1 for [..])
+			pos = c.getPosition(newName, c.updateList()) + 1
+			c.view.Pages.RemovePage("modal")
+			c.view.List.SetCurrentItem(pos)
+		})
+		editDirForm.AddButton("Quit", func() {
+			c.view.Pages.RemovePage("modal")
+		})
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(editDirForm, 60, 7), true, true)
 	}
 	return nil
 }

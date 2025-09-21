@@ -2,6 +2,7 @@ package view
 
 import (
 	"fmt"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -19,10 +20,14 @@ type View struct {
 // NewView ...
 func NewView() *View {
 	app := tview.NewApplication()
+
 	list := tview.NewList().
-		ShowSecondaryText(false)
+		ShowSecondaryText(false) // secondary text hidden but used to store raw keys
 	list.SetBorder(true).
 		SetTitleAlign(tview.AlignLeft)
+	// Readable selection
+	list.SetSelectedTextColor(tcell.ColorBlack).
+		SetSelectedBackgroundColor(tcell.ColorYellow)
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
@@ -51,7 +56,12 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][d[][::-] Delete [::b][e[][::-] Edit value [::b][/][::-] Search [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText(
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+q][::-]Quit",
+		false,
+		tview.AlignCenter,
+		tcell.ColorWhite,
+	)
 
 	app.SetRoot(frame, true)
 
