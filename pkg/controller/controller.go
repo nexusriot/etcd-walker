@@ -235,34 +235,47 @@ func (c *Controller) Run() error {
 
 func (c *Controller) search() *tcell.EventKey {
 	search := c.view.NewSearch()
-	keys := make([]string, 0, len(c.currentNodes))
-	for k := range c.currentNodes {
-		keys = append(keys, k)
+
+	// Build the SAME visual ordering as updateList(): dirs first, then files.
+	dirKeys := []string{}
+	fileKeys := []string{}
+	for k, v := range c.currentNodes {
+		if v.node.IsDir {
+			dirKeys = append(dirKeys, k)
+		} else {
+			fileKeys = append(fileKeys, k)
+		}
 	}
-	sort.Strings(keys)
+	sort.Strings(dirKeys)
+	sort.Strings(fileKeys)
+	ordered := append(dirKeys, fileKeys...)
+
 	search.SetDoneFunc(func(key tcell.Key) {
 		oldPos := c.view.List.GetCurrentItem()
-		value := search.GetText()
-		pos := c.getPosition(value, keys)
+		value := strings.TrimSpace(search.GetText())
+		pos := c.getPosition(value, ordered)
 		// +1 because of the top "[..]" entry
 		if pos+1 != oldPos && key == tcell.KeyEnter {
 			c.view.List.SetCurrentItem(pos + 1)
 		}
 		c.view.Pages.RemovePage("modal")
 	})
+
+	// Autocomplete also based on the visual order.
 	search.SetAutocompleteFunc(func(currentText string) []string {
 		prefix := strings.TrimSpace(strings.ToLower(currentText))
 		if prefix == "" {
 			return nil
 		}
-		result := make([]string, 0, len(c.currentNodes))
-		for _, word := range keys {
-			if strings.HasPrefix(strings.ToLower(word), strings.ToLower(currentText)) {
+		result := make([]string, 0, len(ordered))
+		for _, word := range ordered {
+			if strings.HasPrefix(strings.ToLower(word), prefix) {
 				result = append(result, word)
 			}
 		}
 		return result
 	})
+
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
 	return nil
 }
@@ -365,7 +378,7 @@ func (c *Controller) edit() *tcell.EventKey {
 				err = c.model.Set(val.node.Name, value)
 				if err != nil {
 					c.view.Pages.RemovePage("modal")
-					c.error(fmt.Sprintf("Failed to edit %s", val.node.Name), err, false)
+					c.error(fmt.Errorf("Failed to edit %s: %w", val.node.Name, err).Error(), err, false)
 					return
 				}
 				// +1 to account for the [..] entry at index 0
