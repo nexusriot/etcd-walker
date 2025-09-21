@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.0.8
+version=0.0.10
 
 echo "building deb for etcd-walker $version"
 

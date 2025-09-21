@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/coreos/etcd/client"
 )
@@ -107,5 +108,74 @@ func (m *Model) DelDir(key string) error {
 			return nil
 		}
 	}
+	return err
+}
+
+func (m *Model) RenameDir(oldDir, newDir string) error {
+	ctx := context.Background()
+
+	// Normalize (no trailing slash in keys in this app)
+	if oldDir == newDir {
+		return nil
+	}
+
+	// Ensure source exists
+	srcResp, err := m.api.Get(ctx, oldDir, &client.GetOptions{Recursive: true})
+	if err != nil {
+		return err
+	}
+	if !srcResp.Node.Dir {
+		return fmt.Errorf("source is not a directory: %s", oldDir)
+	}
+
+	// Ensure target does not exist
+	if _, err := m.api.Get(ctx, newDir, nil); err == nil {
+		return fmt.Errorf("target already exists: %s", newDir)
+	} else if !client.IsKeyNotFound(err) {
+		return err
+	}
+
+	// Create target root dir
+	if _, err := m.api.Set(ctx, newDir, "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore}); err != nil {
+		return err
+	}
+
+	// Recursively copy tree to new path
+	var copyTree func(n *client.Node) error
+	copyTree = func(n *client.Node) error {
+		// Skip the root itself; handle children
+		if n.Key == oldDir {
+			for _, ch := range n.Nodes {
+				if err := copyTree(ch); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		targetKey := strings.Replace(n.Key, oldDir, newDir, 1)
+		if n.Dir {
+			if _, err := m.api.Set(ctx, targetKey, "", &client.SetOptions{Dir: true, PrevExist: client.PrevIgnore}); err != nil && !client.IsKeyNotFound(err) {
+				return err
+			}
+			for _, ch := range n.Nodes {
+				if err := copyTree(ch); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		// leaf value
+		_, err := m.api.Set(ctx, targetKey, n.Value, nil)
+		return err
+	}
+
+	if err := copyTree(srcResp.Node); err != nil {
+		return err
+	}
+
+	// Delete old directory recursively
+	_, err = m.api.Delete(ctx, oldDir, &client.DeleteOptions{Dir: true, Recursive: true})
 	return err
 }
