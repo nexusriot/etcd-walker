@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
