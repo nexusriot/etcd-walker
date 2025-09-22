@@ -175,6 +175,18 @@ func (c *Controller) setInput() {
 			return c.edit()
 		case tcell.KeyCtrlS:
 			return c.search()
+		case tcell.KeyCtrlH:
+			help := c.view.NewHotkeysModal()
+
+			// Close help on any key press inside the help view
+			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+				c.view.Pages.RemovePage("modal-help")
+				return nil
+			})
+
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			return nil
+
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
@@ -183,8 +195,6 @@ func (c *Controller) setInput() {
 			switch event.Rune() {
 			case '/':
 				return c.search()
-				//case 'l':
-				//	return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 			}
 		}
 		return event

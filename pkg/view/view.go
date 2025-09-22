@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -129,4 +129,32 @@ func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 	errorQ := tview.NewModal()
 	errorQ.SetText(header + ": " + details).SetBackgroundColor(tcell.ColorRed).AddButtons([]string{"ok"})
 	return errorQ
+}
+
+func (v *View) NewHotkeysModal() *tview.TextView {
+	helpText := `
+		[::b]Navigation[::-]
+		  Enter         Open dir / select
+		  Backspace     Up ([..])
+		[::b]Actions[::-]
+		  Ctrl+N        Create node
+		  Ctrl+E        Edit (value / rename dir)
+		  Del           Delete (recursive for dirs)
+		[::b]Search[::-]
+		  /, Ctrl+S     Search by name (in current level)
+		[::b]Misc[::-]
+		  Ctrl+H        This help
+		  Ctrl+Q        Quit
+		
+		[dim]Press any key to close.[-]
+	`
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignLeft)
+	tv.SetWordWrap(true)
+	tv.SetText(helpText)
+	tv.SetBorder(true)
+	tv.SetTitle(" Hotkeys ")
+
+	return tv
 }
