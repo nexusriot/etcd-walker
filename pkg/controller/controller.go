@@ -21,16 +21,24 @@ type Controller struct {
 	position     map[string]int
 }
 
-type Node struct{ node *model.Node }
+type Node struct {
+	node *model.Node
+}
 
-func splitFunc(r rune) bool { return r == '/' }
+func splitFunc(r rune) bool {
+	return r == '/'
+}
 
-func NewController(host, port string, debug bool, protocol string) *Controller {
+func NewController(
+	host string,
+	port string,
+	debug bool,
+	protocol string,
+) *Controller {
 	m := model.NewModel(host, port, protocol)
 	v := view.NewView()
-
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.1.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		fmt.Sprintf("Etcd-walker v.0.1.0 preview (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
@@ -198,7 +206,12 @@ func (c *Controller) setInput() {
 }
 
 func (c *Controller) Down(cur string) {
-	newDir := c.currentDir + cur + "/"
+	var newDir string
+	if c.currentDir == "/" {
+		newDir = "/" + strings.TrimPrefix(cur, "/") + "/"
+	} else {
+		newDir = strings.TrimSuffix(c.currentDir, "/") + "/" + strings.TrimPrefix(cur, "/") + "/"
+	}
 	log.Debugf("command: down - current dir: %s, new dir: %s", c.currentDir, newDir)
 	c.currentDir = newDir
 	c.Cd(c.currentDir)
@@ -340,7 +353,8 @@ func (c *Controller) create() *tcell.EventKey {
 		if node != "" {
 			log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
 			if !isDir {
-				err = c.model.Set(c.currentDir+"/"+node, value)
+				// currentDir already ends with "/", so just append node
+				err = c.model.Set(c.currentDir+node, value)
 			} else {
 				err = c.model.MkDir(c.currentDir + node)
 			}

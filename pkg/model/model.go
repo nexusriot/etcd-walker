@@ -65,7 +65,6 @@ func NewModel(host, port, protocol string) *Model {
 		if err != nil {
 			panic(fmt.Sprintf("v3 init failed: %v", err))
 		}
-		// quick probe
 		if _, err := b3.ls("/"); err != nil {
 			panic(fmt.Sprintf("v3 probe failed: %v", err))
 		}
@@ -95,7 +94,7 @@ func NewModel(host, port, protocol string) *Model {
 }
 
 // ============================================================================
-// v3 backend (prefix-based “dirs” with .dir marker)
+// v3 backend (prefix-based “dirs” with .dir marker) + normalization
 // ============================================================================
 
 type v3Backend struct {
@@ -118,11 +117,33 @@ func (b *v3Backend) proto() string { return "v3" }
 
 const dirMarker = ".dir"
 
+// ---- helpers for v3 ----
+func normPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	return p
+}
+
+func withTrail(p string) string {
+	p = normPath(p)
+	if p == "/" {
+		return "/"
+	}
+	return strings.TrimSuffix(p, "/") + "/"
+}
+
 func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	prefix := withTrailingSlash(directory)
+	prefix := withTrail(directory)
 	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
@@ -137,11 +158,12 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	children := map[string]*childInfo{}
 
 	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
+		key := normPath(string(kv.Key))
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		rest := strings.TrimPrefix(key, prefix)
+		rest = strings.TrimLeft(rest, "/") // tolerate legacy double slashes
 		if rest == "" {
 			continue
 		}
@@ -189,6 +211,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 func (b *v3Backend) set(key, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	key = normPath(key)
 	_, err := b.cli.Put(ctx, key, value)
 	return err
 }
@@ -196,7 +219,7 @@ func (b *v3Backend) set(key, value string) error {
 func (b *v3Backend) mkdir(directory string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	dir := strings.TrimSuffix(directory, "/")
+	dir := strings.TrimSuffix(normPath(directory), "/")
 	marker := dir + "/" + dirMarker
 	pfx := dir + "/"
 	resp, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
@@ -213,6 +236,7 @@ func (b *v3Backend) mkdir(directory string) error {
 func (b *v3Backend) del(key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	key = normPath(key)
 	_, err := b.cli.Delete(ctx, key)
 	return err
 }
@@ -220,7 +244,7 @@ func (b *v3Backend) del(key string) error {
 func (b *v3Backend) deldir(key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pfx := strings.TrimSuffix(key, "/") + "/"
+	pfx := withTrail(key)
 	_, err := b.cli.Delete(ctx, pfx, clientv3.WithPrefix())
 	return err
 }
@@ -229,9 +253,8 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	oldPfx := strings.TrimSuffix(oldDir, "/") + "/"
-	newPfx := strings.TrimSuffix(newDir, "/") + "/"
-
+	oldPfx := withTrail(oldDir)
+	newPfx := withTrail(newDir)
 	if oldPfx == newPfx {
 		return nil
 	}
@@ -252,7 +275,7 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	}
 
 	for _, kv := range src.Kvs {
-		oldKey := string(kv.Key)
+		oldKey := normPath(string(kv.Key))
 		newKey := strings.Replace(oldKey, oldPfx, newPfx, 1)
 		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
 			return fmt.Errorf("copy %s -> %s failed: %w", oldKey, newKey, err)
@@ -360,6 +383,7 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 	if _, err := b.api.Set(ctx, newDir, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
 		return err
 	}
+
 	var copyTree func(n *clientv2.Node) error
 	copyTree = func(n *clientv2.Node) error {
 		if n.Key == oldDir {
@@ -385,18 +409,11 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 		_, err := b.api.Set(ctx, targetKey, n.Value, nil)
 		return err
 	}
+
 	if err := copyTree(srcResp.Node); err != nil {
 		return err
 	}
+
 	_, err = b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
-}
-
-// ---------------- helpers ----------------
-
-func withTrailingSlash(p string) string {
-	if p == "/" {
-		return p
-	}
-	return strings.TrimSuffix(p, "/") + "/"
 }
