@@ -31,7 +31,7 @@ func NewController(host, port string, debug bool, protocol string) *Controller {
 	m := model.NewModel(host, port, protocol)
 	v := view.NewView()
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.0.11 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		fmt.Sprintf("Etcd-walker v.0.1.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
