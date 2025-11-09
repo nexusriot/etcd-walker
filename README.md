@@ -1,7 +1,18 @@
 ## Etcd-walker
 _Simple CLI tool for etcd_
 
-![etcd walker](https://github.com/nexusriot/etcd-walker/blob/main/etcd-walker.gif?raw=true)
+Features
+-------------
+-  Walking dirs/keys
+- Support creating/deleting/editing keys
+- Directory rename support
+- Search in current level - "quick jump"
+- Support etcd v2/v3 (v3 - experimental, v.0.1+)
+- Hidden key support (experimental, v,0.1+)
+------------- 
+Grab: [latest version](https://github.com/nexusriot/etcd-walker/releases/latest)
+
+![Profiles](resources/screenshot-v2.png)
 
 ### **Building:**
 
@@ -36,10 +47,10 @@ run build script
 
 ### **Running:**
 ```
-./etcd-walker [-host host] [-port port] [-debug]
+./etcd-walker [-host host] [-port port] [-protocol] [-debug]
 ```
 
-Default values are: **localhost** for host, **2379** for port, debug is **false**
+Default values are: **localhost** for host, **2379** for port, protocol is **v2**, debug is **false**
 
 ### **Starting etcd for development/testing**
 
