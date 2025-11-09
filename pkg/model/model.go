@@ -50,14 +50,7 @@ type backend interface {
 }
 
 // ---------------- NewModel with explicit protocol ----------------
-//
-// protocol values:
-//
-//	"v2"  -> force etcd v2
-//	"v3"  -> force etcd v3
-//	"auto"-> try v3 then fallback to v2
-//
-// default is v2 (anything else treated as v2)
+
 func NewModel(host, port, protocol string) *Model {
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
 	case "v3":
@@ -199,9 +192,12 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	for _, name := range names {
 		ci := children[name]
 		full := root + "/" + name
+
+		// If both exist, return BOTH entries: directory and file.
 		if ci.isDir {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
-		} else if ci.hasFile {
+		}
+		if ci.hasFile {
 			nodes = append(nodes, &Node{Name: full, IsDir: false, Value: ci.fileValue, ClusterId: clusterID})
 		}
 	}
