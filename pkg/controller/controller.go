@@ -21,22 +21,18 @@ type Controller struct {
 	position     map[string]int
 }
 
-type Node struct {
-	node *model.Node
-}
+type Node struct{ node *model.Node }
 
-func splitFunc(r rune) bool {
-	return r == '/'
-}
+func splitFunc(r rune) bool { return r == '/' }
 
-func NewController(
-	host string,
-	port string,
-	debug bool,
-) *Controller {
-	m := model.NewModel(host, port)
+func NewController(host, port string, debug bool, protocol string) *Controller {
+	m := model.NewModel(host, port, protocol)
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("Etcd-walker v.0.0.11 (on %s:%s)", host, port), true, tview.AlignCenter, tcell.ColorGreen)
+
+	v.Frame.AddText(
+		fmt.Sprintf("Etcd-walker v.0.1.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		true, tview.AlignCenter, tcell.ColorGreen,
+	)
 
 	controller := Controller{
 		debug:      debug,

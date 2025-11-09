@@ -1,4 +1,3 @@
-// pkg/model/model.go
 package model
 
 import (
@@ -8,12 +7,16 @@ import (
 	"strings"
 	"time"
 
+	// v3 client
 	clientv3 "go.etcd.io/etcd/client/v3"
+	// v2 client
+	clientv2 "github.com/coreos/etcd/client"
 )
 
+// ---------------- Public types ----------------
+
 type Model struct {
-	client *clientv3.Client
-	kv     clientv3.KV
+	backend backend
 }
 
 type Node struct {
@@ -23,113 +26,146 @@ type Node struct {
 	Value     string
 }
 
-// A hidden marker key to allow empty "directories" to exist in etcd v3.
-const dirMarker = ".dir"
+// ProtocolVersion reports which backend is in use ("v2" or "v3").
+func (m *Model) ProtocolVersion() string { return m.backend.proto() }
 
-func NewModel(host string, port string) *Model {
-	cli, err := clientv3.New(clientv3.Config{
+// Public API bridged to the selected backend.
+func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
+func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
+func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
+func (m *Model) Del(key string) error                  { return m.backend.del(key) }
+func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
+func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.renameDir(oldDir, newDir) }
+
+// ---------------- Backend interface ----------------
+
+type backend interface {
+	proto() string
+	ls(directory string) ([]*Node, error)
+	set(key, value string) error
+	mkdir(directory string) error
+	del(key string) error
+	deldir(key string) error
+	renameDir(oldDir, newDir string) error
+}
+
+// ---------------- NewModel with explicit protocol ----------------
+//
+// protocol values:
+//
+//	"v2"  -> force etcd v2
+//	"v3"  -> force etcd v3
+//	"auto"-> try v3 then fallback to v2
+//
+// default is v2 (anything else treated as v2)
+func NewModel(host, port, protocol string) *Model {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "v3":
+		b3, err := newV3Backend(host, port)
+		if err != nil {
+			panic(fmt.Sprintf("v3 init failed: %v", err))
+		}
+		// quick probe
+		if _, err := b3.ls("/"); err != nil {
+			panic(fmt.Sprintf("v3 probe failed: %v", err))
+		}
+		return &Model{backend: b3}
+	case "auto":
+		if b3, err := newV3Backend(host, port); err == nil {
+			if _, err := b3.ls("/"); err == nil {
+				return &Model{backend: b3}
+			}
+		}
+		if b2, err := newV2Backend(host, port); err == nil {
+			if _, err := b2.ls("/"); err == nil {
+				return &Model{backend: b2}
+			}
+		}
+		panic("failed to connect using auto: neither v3 nor v2 worked")
+	default: // "v2"
+		b2, err := newV2Backend(host, port)
+		if err != nil {
+			panic(fmt.Sprintf("v2 init failed: %v", err))
+		}
+		if _, err := b2.ls("/"); err != nil {
+			panic(fmt.Sprintf("v2 probe failed: %v", err))
+		}
+		return &Model{backend: b2}
+	}
+}
+
+// ============================================================================
+// v3 backend (prefix-based “dirs” with .dir marker)
+// ============================================================================
+
+type v3Backend struct {
+	cli clientv3.KV
+	c   *clientv3.Client
+}
+
+func newV3Backend(host, port string) (*v3Backend, error) {
+	c, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{fmt.Sprintf("http://%s:%s", host, port)},
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return &Model{
-		client: cli,
-		kv:     clientv3.NewKV(cli),
-	}
+	return &v3Backend{cli: clientv3.NewKV(c), c: c}, nil
 }
 
-func (m *Model) appendNode(nodes []*Node, name string, isDirectory bool, value string, clusterId string) ([]*Node, error) {
-	node := &Node{
-		Name:      name,
-		IsDir:     isDirectory,
-		ClusterId: clusterId,
-		Value:     value,
-	}
-	nodes = append(nodes, node)
-	return nodes, nil
-}
+func (b *v3Backend) proto() string { return "v3" }
 
-// Ls lists only the immediate children of "directory".
-// "directory" should end with "/" (controller already does this).
-// We treat keys with prefix "directory" as members; a child is:
-//   - a "file" if there's a key exactly "directory + child"
-//   - a "dir" if there's any key "directory + child/..." OR a marker "directory + child/.dir"
-func (m *Model) Ls(directory string) ([]*Node, error) {
+const dirMarker = ".dir"
+
+func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Normalize: ensure trailing slash for prefix ranges.
 	prefix := withTrailingSlash(directory)
-
-	// Fetch keys+values once (we need values for direct child files).
-	resp, err := m.kv.Get(ctx, prefix, clientv3.WithPrefix())
+	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
 	clusterID := fmt.Sprintf("%d", resp.Header.GetClusterId())
 
-	// Maps to collect what immediate children exist
 	type childInfo struct {
 		isDir     bool
 		hasFile   bool
-		fileValue string // if direct child file exists
+		fileValue string
 	}
 	children := map[string]*childInfo{}
 
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-
-		// Strip the directory prefix to analyze the child path
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		rest := strings.TrimPrefix(key, prefix)
 		if rest == "" {
-			// Key equals the directory itself; ignore (we never write such key)
 			continue
 		}
-		// immediate child name is up to the first slash (if any)
 		parts := strings.SplitN(rest, "/", 2)
 		child := parts[0]
-		if child == "" {
+		if child == "" || child == dirMarker {
 			continue
 		}
-		// skip our marker when listing the child (marker lives inside the child dir)
-		if child == dirMarker {
-			// This would be the unlikely case of writing "/path/.dir" directly.
-			// We ignore it at parent level.
-			continue
+		ci := children[child]
+		if ci == nil {
+			ci = &childInfo{}
+			children[child] = ci
 		}
-
-		info := children[child]
-		if info == nil {
-			info = &childInfo{}
-			children[child] = info
-		}
-
-		// If there is a remaining part after child/, then it's a directory
 		if len(parts) == 2 {
-			info.isDir = true
-			// If that remaining tail is exactly ".dir" it also proves directory existence
+			ci.isDir = true
 			if parts[1] == dirMarker {
-				info.isDir = true
+				ci.isDir = true
 			}
-			continue
+		} else {
+			ci.hasFile = true
+			ci.fileValue = string(kv.Value)
 		}
-
-		// No further slash → candidate file (direct child)
-		// But also watch out for a child that equals ".dir" (dir marker at this level) – do not list as a file.
-		if child == dirMarker {
-			continue
-		}
-		info.hasFile = true
-		info.fileValue = string(kv.Value)
 	}
 
-	// Build Node slice; stable order (controller sorts again, but keep deterministic)
 	names := make([]string, 0, len(children))
 	for k := range children {
 		names = append(names, k)
@@ -137,80 +173,59 @@ func (m *Model) Ls(directory string) ([]*Node, error) {
 	sort.Strings(names)
 
 	var nodes []*Node
+	root := strings.TrimSuffix(prefix, "/")
 	for _, name := range names {
-		info := children[name]
-
-		isDir := info.isDir
-		// If both a file and deeper keys exist under the same child name,
-		// treat it as a directory in UI (so “child/” appears).
-		// Otherwise, if only a file exists, show as file.
-		if isDir {
-			// directory node, value ignored
-			nodes, _ = m.appendNode(nodes, strings.TrimSuffix(prefix, "/")+"/"+name, true, "", clusterID)
-		} else if info.hasFile {
-			// file node
-			nodes, _ = m.appendNode(nodes, strings.TrimSuffix(prefix, "/")+"/"+name, false, info.fileValue, clusterID)
+		ci := children[name]
+		full := root + "/" + name
+		if ci.isDir {
+			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
+		} else if ci.hasFile {
+			nodes = append(nodes, &Node{Name: full, IsDir: false, Value: ci.fileValue, ClusterId: clusterID})
 		}
 	}
-
 	return nodes, nil
 }
 
-// Set writes a value key exactly as provided.
-func (m *Model) Set(key, value string) error {
+func (b *v3Backend) set(key, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := m.kv.Put(ctx, key, value)
+	_, err := b.cli.Put(ctx, key, value)
 	return err
 }
 
-// MkDir creates an "empty dir" by writing a hidden marker "<dir>/.dir" if nothing else exists.
-// Accepts "directory" WITHOUT a trailing slash (controller passes this form).
-func (m *Model) MkDir(directory string) error {
+func (b *v3Backend) mkdir(directory string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// Normalize (no trailing slash in arg), marker is dir + "/.dir"
 	dir := strings.TrimSuffix(directory, "/")
 	marker := dir + "/" + dirMarker
-
-	// If something already exists under prefix dir+"/", we're done (it already exists)
 	pfx := dir + "/"
-	resp, err := m.kv.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
+	resp, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
 	if err != nil {
 		return err
 	}
 	if resp.Count > 0 {
-		// Directory already “exists”
 		return nil
 	}
-	// Create marker so the empty directory shows up
-	_, err = m.kv.Put(ctx, marker, "")
+	_, err = b.cli.Put(ctx, marker, "")
 	return err
 }
 
-// Del deletes a single key (file).
-func (m *Model) Del(key string) error {
+func (b *v3Backend) del(key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := m.kv.Delete(ctx, key)
+	_, err := b.cli.Delete(ctx, key)
 	return err
 }
 
-// DelDir deletes everything under "key/" including the marker if present.
-// Accepts "key" WITHOUT trailing slash (controller passes that).
-func (m *Model) DelDir(key string) error {
+func (b *v3Backend) deldir(key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	pfx := strings.TrimSuffix(key, "/") + "/"
-	_, err := m.kv.Delete(ctx, pfx, clientv3.WithPrefix())
+	_, err := b.cli.Delete(ctx, pfx, clientv3.WithPrefix())
 	return err
 }
 
-// RenameDir copies all keys from oldDir → newDir (both without trailing slash) then deletes oldDir recursively.
-// Fails if newDir already exists (has any keys under newDir/).
-func (m *Model) RenameDir(oldDir, newDir string) error {
+func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -221,41 +236,164 @@ func (m *Model) RenameDir(oldDir, newDir string) error {
 		return nil
 	}
 
-	// Ensure source exists
-	srcResp, err := m.kv.Get(ctx, oldPfx, clientv3.WithPrefix())
+	src, err := b.cli.Get(ctx, oldPfx, clientv3.WithPrefix())
 	if err != nil {
 		return err
 	}
-	if srcResp.Count == 0 {
+	if src.Count == 0 {
 		return fmt.Errorf("source does not exist: %s", oldDir)
 	}
-
-	// Ensure target does not exist
-	dstResp, err := m.kv.Get(ctx, newPfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
+	dst, err := b.cli.Get(ctx, newPfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
 	if err != nil {
 		return err
 	}
-	if dstResp.Count > 0 {
+	if dst.Count > 0 {
 		return fmt.Errorf("target already exists: %s", newDir)
 	}
 
-	// Copy all keys (including marker and deeper)
-	for _, kv := range srcResp.Kvs {
+	for _, kv := range src.Kvs {
 		oldKey := string(kv.Key)
 		newKey := strings.Replace(oldKey, oldPfx, newPfx, 1)
-		if _, err := m.kv.Put(ctx, newKey, string(kv.Value)); err != nil {
+		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
 			return fmt.Errorf("copy %s -> %s failed: %w", oldKey, newKey, err)
 		}
 	}
+	_, err = b.cli.Delete(ctx, oldPfx, clientv3.WithPrefix())
+	return err
+}
 
-	// Delete old subtree
-	if _, err := m.kv.Delete(ctx, oldPfx, clientv3.WithPrefix()); err != nil {
+// ============================================================================
+// v2 backend (original KeysAPI logic)
+// ============================================================================
+
+type v2Backend struct {
+	api    clientv2.KeysAPI
+	client clientv2.Client
+}
+
+func newV2Backend(host, port string) (*v2Backend, error) {
+	cli, err := clientv2.New(clientv2.Config{
+		Endpoints: []string{fmt.Sprintf("http://%s:%s", host, port)},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &v2Backend{api: clientv2.NewKeysAPI(cli), client: cli}, nil
+}
+
+func (b *v2Backend) proto() string { return "v2" }
+
+func (b *v2Backend) ls(directory string) ([]*Node, error) {
+	options := &clientv2.GetOptions{Sort: true, Recursive: false}
+	resp, err := b.api.Get(context.Background(), directory, options)
+	if err != nil {
+		if clientv2.IsKeyNotFound(err) {
+			return []*Node{}, nil
+		}
+		return []*Node{}, err
+	}
+	var nds []*Node
+	for _, n := range resp.Node.Nodes {
+		nds = append(nds, &Node{
+			Name:      n.Key,
+			ClusterId: resp.ClusterID,
+			IsDir:     n.Dir,
+			Value:     n.Value,
+		})
+	}
+	return nds, nil
+}
+
+func (b *v2Backend) set(key, value string) error {
+	_, err := b.api.Set(context.Background(), key, value, nil)
+	return err
+}
+
+func (b *v2Backend) mkdir(directory string) error {
+	res, err := b.api.Get(context.Background(), directory, nil)
+	if err != nil && !clientv2.IsKeyNotFound(err) {
+		return err
+	}
+	if err != nil && clientv2.IsKeyNotFound(err) {
+		_, err = b.api.Set(context.Background(), directory, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
+		return err
+	}
+	if !res.Node.Dir {
+		return fmt.Errorf("trying to rewrite existing value with dir: %v", directory)
+	}
+	return nil
+}
+
+func (b *v2Backend) del(key string) error {
+	_, err := b.api.Delete(context.Background(), key, nil)
+	if err != nil && !clientv2.IsKeyNotFound(err) {
 		return err
 	}
 	return nil
 }
 
-// withTrailingSlash ensures a trailing "/" unless the string is exactly "/".
+func (b *v2Backend) deldir(key string) error {
+	_, err := b.api.Delete(context.Background(), key, &clientv2.DeleteOptions{Dir: true, Recursive: true})
+	if err != nil && !clientv2.IsKeyNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func (b *v2Backend) renameDir(oldDir, newDir string) error {
+	ctx := context.Background()
+	if oldDir == newDir {
+		return nil
+	}
+	srcResp, err := b.api.Get(ctx, oldDir, &clientv2.GetOptions{Recursive: true})
+	if err != nil {
+		return err
+	}
+	if !srcResp.Node.Dir {
+		return fmt.Errorf("source is not a directory: %s", oldDir)
+	}
+	if _, err := b.api.Get(ctx, newDir, nil); err == nil {
+		return fmt.Errorf("target already exists: %s", newDir)
+	} else if !clientv2.IsKeyNotFound(err) {
+		return err
+	}
+	if _, err := b.api.Set(ctx, newDir, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
+		return err
+	}
+	var copyTree func(n *clientv2.Node) error
+	copyTree = func(n *clientv2.Node) error {
+		if n.Key == oldDir {
+			for _, ch := range n.Nodes {
+				if err := copyTree(ch); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		targetKey := strings.Replace(n.Key, oldDir, newDir, 1)
+		if n.Dir {
+			if _, err := b.api.Set(ctx, targetKey, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil && !clientv2.IsKeyNotFound(err) {
+				return err
+			}
+			for _, ch := range n.Nodes {
+				if err := copyTree(ch); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		_, err := b.api.Set(ctx, targetKey, n.Value, nil)
+		return err
+	}
+	if err := copyTree(srcResp.Node); err != nil {
+		return err
+	}
+	_, err = b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
+	return err
+}
+
+// ---------------- helpers ----------------
+
 func withTrailingSlash(p string) string {
 	if p == "/" {
 		return p

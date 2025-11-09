@@ -10,10 +10,10 @@ import (
 )
 
 func main() {
-
 	hostname := flag.String("host", "localhost", "host name")
 	port := flag.Int("port", 2379, "port number")
 	debug := flag.Bool("debug", false, "debug logging")
+	protocol := flag.String("protocol", "v2", "etcd protocol: v2 | v3 | auto")
 	flag.Parse()
 
 	if *debug {
@@ -27,5 +27,6 @@ func main() {
 		log.SetOutput(f)
 		log.SetLevel(log.DebugLevel)
 	}
-	controller.NewController(*hostname, strconv.Itoa(*port), *debug).Run()
+
+	controller.NewController(*hostname, strconv.Itoa(*port), *debug, *protocol).Run()
 }
