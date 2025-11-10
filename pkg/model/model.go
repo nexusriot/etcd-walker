@@ -31,6 +31,7 @@ func (m *Model) ProtocolVersion() string { return m.backend.proto() }
 
 // Public API bridged to the selected backend.
 func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
+func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) } // NEW
 func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
 func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
 func (m *Model) Del(key string) error                  { return m.backend.del(key) }
@@ -42,6 +43,7 @@ func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.rename
 type backend interface {
 	proto() string
 	ls(directory string) ([]*Node, error)
+	get(key string) (*Node, error) // NEW
 	set(key, value string) error
 	mkdir(directory string) error
 	del(key string) error
@@ -281,6 +283,11 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	return err
 }
 
+// v3 get stub (jump is v2-only)
+func (b *v3Backend) get(key string) (*Node, error) {
+	return nil, fmt.Errorf("get(): not supported in v3 backend (jump is v2-only)")
+}
+
 // ============================================================================
 // v2 backend (original KeysAPI logic)
 // ============================================================================
@@ -321,6 +328,28 @@ func (b *v2Backend) ls(directory string) ([]*Node, error) {
 		})
 	}
 	return nds, nil
+}
+
+func (b *v2Backend) get(key string) (*Node, error) {
+	ctx := context.Background()
+
+	k := strings.TrimSpace(key)
+	if k == "" {
+		k = "/"
+	}
+	if k != "/" {
+		k = strings.TrimRight(k, "/")
+	}
+	resp, err := b.api.Get(ctx, k, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Node{
+		Name:      resp.Node.Key,
+		ClusterId: resp.ClusterID,
+		IsDir:     resp.Node.Dir,
+		Value:     resp.Node.Value,
+	}, nil
 }
 
 func (b *v2Backend) set(key, value string) error {

@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -119,6 +119,13 @@ func (v *View) NewSearch() *tview.InputField {
 	return search
 }
 
+func (v *View) NewJump() *tview.InputField {
+	inp := tview.NewInputField().
+		SetPlaceholder("Jump to key or dir/ (abs or relative).")
+	inp.SetBorder(true).SetTitle(" Jump ")
+	return inp
+}
+
 func (v *View) NewDeleteQ(header string) *tview.Modal {
 	deleteQ := tview.NewModal()
 	deleteQ.SetText(fmt.Sprintf("Delete %s ?", header)).AddButtons([]string{"ok", "cancel"})
@@ -140,6 +147,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+N        Create node
 		  Ctrl+E        Edit (value / rename dir)
 		  Del           Delete (recursive for dirs)
+		  Ctrl+J        Jump to key/dir(dir ends with '/)
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		[::b]Misc[::-]
