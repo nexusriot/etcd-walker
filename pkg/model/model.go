@@ -31,7 +31,7 @@ func (m *Model) ProtocolVersion() string { return m.backend.proto() }
 
 // Public API bridged to the selected backend.
 func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
-func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) } // NEW
+func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) } // used by Jump
 func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
 func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
 func (m *Model) Del(key string) error                  { return m.backend.del(key) }
@@ -43,7 +43,7 @@ func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.rename
 type backend interface {
 	proto() string
 	ls(directory string) ([]*Node, error)
-	get(key string) (*Node, error) // NEW
+	get(key string) (*Node, error)
 	set(key, value string) error
 	mkdir(directory string) error
 	del(key string) error
@@ -283,9 +283,46 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	return err
 }
 
-// v3 get stub (jump is v2-only)
+// v3 Get: return file node if exact key exists,
+// else return directory node if any key exists under the path (prefix match).
 func (b *v3Backend) get(key string) (*Node, error) {
-	return nil, fmt.Errorf("get(): not supported in v3 backend (jump is v2-only)")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	raw := key
+	k := normPath(raw)
+
+	exact, err := b.cli.Get(ctx, k)
+	if err != nil {
+		return nil, err
+	}
+	if exact.Count > 0 {
+		// There could be multiple KVs if compaction/revision, but the first is fine for value.
+		kv := exact.Kvs[0]
+		return &Node{
+			Name:      k,
+			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
+			IsDir:     false,
+			Value:     string(kv.Value),
+		}, nil
+	}
+
+	// Try directory existence by prefix (any child or .dir marker)
+	pfx := withTrail(k)
+	dirProbe, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
+	if err != nil {
+		return nil, err
+	}
+	if dirProbe.Count > 0 {
+		return &Node{
+			Name:      k, // directory logical name (no trailing slash)
+			ClusterId: fmt.Sprintf("%d", dirProbe.Header.GetClusterId()),
+			IsDir:     true,
+			Value:     "",
+		}, nil
+	}
+
+	return nil, fmt.Errorf("not found: %s", k)
 }
 
 // ============================================================================

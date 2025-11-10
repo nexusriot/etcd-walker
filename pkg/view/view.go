@@ -147,7 +147,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+N        Create node
 		  Ctrl+E        Edit (value / rename dir)
 		  Del           Delete (recursive for dirs)
-		  Ctrl+J        Jump to key/dir(dir ends with '/)
+		  Ctrl+J        Jump to key/dir(dir ends with '/')
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		[::b]Misc[::-]

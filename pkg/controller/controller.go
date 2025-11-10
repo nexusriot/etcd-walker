@@ -118,6 +118,7 @@ func (c *Controller) ensureInjectedBucket(parent string) map[string]*model.Node 
 	return c.injected[parent]
 }
 
+// inject node so it appears in the list for its parent directory.
 func (c *Controller) injectNode(nd *model.Node) {
 	if nd == nil {
 		return
@@ -134,6 +135,7 @@ func (c *Controller) injectNode(nd *model.Node) {
 	log.Debugf("injected node %s under %s as %s (dir=%t)", nd.Name, par, mk, nd.IsDir)
 }
 
+// remove injected node (e.g., after delete/rename)
 func (c *Controller) removeInjected(nd *model.Node) {
 	if nd == nil {
 		return
@@ -332,7 +334,7 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlS:
 			return c.search()
 		case tcell.KeyCtrlJ:
-			return c.jump() // v2-only jump
+			return c.jump()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
 
@@ -632,15 +634,7 @@ func (c *Controller) error(header string, err error, fatal bool) {
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }
 
-// ----------------- Jump (v2-only) -----------------
-
 func (c *Controller) jump() *tcell.EventKey {
-	// Only for v2 backend
-	if c.model.ProtocolVersion() != "v2" {
-		c.error("Jump is available only for etcd v2", fmt.Errorf("current: %s", c.model.ProtocolVersion()), false)
-		return nil
-	}
-
 	inp := c.view.NewJump()
 	inp.SetDoneFunc(func(key tcell.Key) {
 		defer c.view.Pages.RemovePage("modal")
@@ -666,7 +660,7 @@ func (c *Controller) jump() *tcell.EventKey {
 			}
 		}
 
-		// Require existing node from etcd (do NOT create synthetic entries)
+		// Check existence via model (works for both v2 and v3 now).
 		nd, err := c.model.Get(target)
 		if err != nil {
 			c.error("Not found", fmt.Errorf("%s", target), false)
@@ -679,7 +673,7 @@ func (c *Controller) jump() *tcell.EventKey {
 			return
 		}
 
-		// Inject real node so it appears in the tree if etcd doesn't list it (e.g., underscore at root)
+		// Inject real node so it appears in the tree (needed for v2 underscore case; harmless for v3).
 		c.injectNode(nd)
 
 		// If it's a dir (with or without slash) — enter it

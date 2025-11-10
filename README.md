@@ -21,7 +21,7 @@ go build
 ```
 in some cases (for example for running inside containers) need to build statically without dependency on libc:
 ```
-go build -ldflags "-linkmode external -extldflags -static"
+go build -o  etcd-walker_linux_x64_static -ldflags "-linkmode external -extldflags -static"
 ```
 to check for lib usage please use ldd command
 ```
@@ -30,7 +30,7 @@ ldd etcd-walker
 
 building 32-bit binary
 ```
-GOOS=linux GOARCH=386 go build -o  etcd-walker_linux_i686 main.go
+GOOS=linux GOARCH=386 go build -o etcd-walker_linux_i686 main.go
 ```
 
 ### **Building deb package**
