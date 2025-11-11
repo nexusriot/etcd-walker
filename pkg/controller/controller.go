@@ -19,6 +19,10 @@ type Controller struct {
 	currentDir   string
 	currentNodes map[string]*Node // mapKey => Node (mapKey is "<basename>|dir" or "<basename>|file")
 	position     map[string]int
+
+	// Injected nodes that may not appear in v2 listings (e.g., names starting with "_").
+	// Keyed by parent directory (normalized, with trailing "/"), value is a map of mapKey->*model.Node.
+	injected map[string]map[string]*model.Node
 }
 
 type Node struct {
@@ -31,7 +35,7 @@ func NewController(host, port string, debug bool, protocol string) *Controller {
 	m := model.NewModel(host, port, protocol)
 	v := view.NewView()
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.1.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		fmt.Sprintf("Etcd-walker v.0.1.1 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
@@ -41,6 +45,7 @@ func NewController(host, port string, debug bool, protocol string) *Controller {
 		model:      m,
 		currentDir: "/",
 		position:   make(map[string]int),
+		injected:   make(map[string]map[string]*model.Node),
 	}
 	return &controller
 }
@@ -61,15 +66,113 @@ func displayName(base string, isDir bool) string {
 	return base
 }
 
+func normAbs(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	if p != "/" {
+		p = strings.TrimRight(p, "/")
+	}
+	return p
+}
+
+func parentOf(p string) string {
+	p = normAbs(p)
+	if p == "/" {
+		return "/"
+	}
+	i := strings.LastIndex(p, "/")
+	if i <= 0 {
+		return "/"
+	}
+	return p[:i]
+}
+
+func baseOf(p string) string {
+	p = normAbs(p)
+	if p == "/" {
+		return "/"
+	}
+	i := strings.LastIndex(p, "/")
+	if i < 0 || i == len(p)-1 {
+		return p
+	}
+	return p[i+1:]
+}
+
+func (c *Controller) ensureInjectedBucket(parent string) map[string]*model.Node {
+	parent = normAbs(parent)
+	if !strings.HasSuffix(parent, "/") {
+		parent += "/"
+	}
+	if c.injected[parent] == nil {
+		c.injected[parent] = make(map[string]*model.Node)
+	}
+	return c.injected[parent]
+}
+
+// inject node so it appears in the list for its parent directory.
+func (c *Controller) injectNode(nd *model.Node) {
+	if nd == nil {
+		return
+	}
+	par := parentOf(nd.Name)
+	if par != "/" {
+		par += "/"
+	}
+	bucket := c.ensureInjectedBucket(par)
+	fields := strings.FieldsFunc(nd.Name, splitFunc)
+	base := fields[len(fields)-1]
+	mk := makeMapKey(base, nd.IsDir)
+	bucket[mk] = nd
+	log.Debugf("injected node %s under %s as %s (dir=%t)", nd.Name, par, mk, nd.IsDir)
+}
+
+// remove injected node (e.g., after delete/rename)
+func (c *Controller) removeInjected(nd *model.Node) {
+	if nd == nil {
+		return
+	}
+	par := parentOf(nd.Name)
+	if par != "/" {
+		par += "/"
+	}
+	fields := strings.FieldsFunc(nd.Name, splitFunc)
+	base := fields[len(fields)-1]
+	mk := makeMapKey(base, nd.IsDir)
+	if bucket, ok := c.injected[par]; ok {
+		delete(bucket, mk)
+		if len(bucket) == 0 {
+			delete(c.injected, par)
+		}
+	}
+}
+
+// re-inject after rename (old -> new)
+func (c *Controller) reinjectRename(oldName, newName string, isDir bool, clusterID, value string) {
+	old := &model.Node{Name: normAbs(oldName), IsDir: isDir, ClusterId: clusterID, Value: value}
+	c.removeInjected(old)
+	newN := &model.Node{Name: normAbs(newName), IsDir: isDir, ClusterId: clusterID, Value: value}
+	c.injectNode(newN)
+}
+
 func (c *Controller) makeNodeMap() error {
 	log.Debugf("updating node map started")
 	m := make(map[string]*Node)
+
+	// Model-provided listing
 	list, err := c.model.Ls(c.currentDir)
 	if err != nil {
 		return err
 	}
 	for _, n := range list {
-		// basename
 		rawName := n.Name
 		fields := strings.FieldsFunc(strings.TrimSpace(rawName), splitFunc)
 		base := fields[len(fields)-1]
@@ -78,9 +181,33 @@ func (c *Controller) makeNodeMap() error {
 		m[mapKey] = &cNode
 		log.Debugf("added node %s -> base=%s key=%s isDir=%t", n.Name, base, mapKey, n.IsDir)
 	}
+
+	// Merge injected entries for current directory
+	cur := normAbs(c.currentDir)
+	if !strings.HasSuffix(cur, "/") {
+		cur += "/"
+	}
+	if bucket, ok := c.injected[cur]; ok {
+		for mk, nd := range bucket {
+			// If server listing already returned an entry with same mk, keep server version (prefer real listing)
+			if _, exists := m[mk]; !exists {
+				m[mk] = &Node{node: nd}
+				log.Debugf("merged injected node %s into current map as %s", nd.Name, mk)
+			}
+		}
+	}
+
 	c.currentNodes = m
 	log.Debugf("updating node map completed")
 	return nil
+}
+
+func (c *Controller) colorize(base string, isDir bool, label string) string {
+	// Highlight entries that start with '_' in yellow
+	if strings.HasPrefix(base, "_") {
+		return "[yellow]" + label + "[-]"
+	}
+	return label
 }
 
 func (c *Controller) updateList() []string {
@@ -114,7 +241,8 @@ func (c *Controller) updateList() []string {
 		n := c.currentNodes[mk].node
 		fields := strings.FieldsFunc(n.Name, splitFunc)
 		base := fields[len(fields)-1]
-		label := "📁 " + displayName(base, true)
+		rawLabel := "📁 " + displayName(base, true)
+		label := c.colorize(base, true, rawLabel)
 		// Use mapKey as secondary text (stable key for actions)
 		c.view.List.AddItem(label, mk, 0, func() {
 			i := c.view.List.GetCurrentItem()
@@ -123,7 +251,6 @@ func (c *Controller) updateList() []string {
 			if val, ok := c.currentNodes[curMK]; ok && val.node.IsDir {
 				// Save cursor before moving
 				c.position[c.currentDir] = c.view.List.GetCurrentItem()
-				// Go down using actual basename from the selected node
 				fields := strings.FieldsFunc(val.node.Name, splitFunc)
 				base := fields[len(fields)-1]
 				c.Down(base)
@@ -136,7 +263,8 @@ func (c *Controller) updateList() []string {
 		n := c.currentNodes[mk].node
 		fields := strings.FieldsFunc(n.Name, splitFunc)
 		base := fields[len(fields)-1]
-		label := "   " + displayName(base, false)
+		rawLabel := "   " + displayName(base, false)
+		label := c.colorize(base, false, rawLabel)
 		c.view.List.AddItem(label, mk, 0, func() {
 			// no-op; details pane updates via SetChangedFunc
 		})
@@ -205,6 +333,8 @@ func (c *Controller) setInput() {
 			return c.edit()
 		case tcell.KeyCtrlS:
 			return c.search()
+		case tcell.KeyCtrlJ:
+			return c.jump()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
 
@@ -354,6 +484,8 @@ func (c *Controller) delete() *tcell.EventKey {
 					c.error("Error deleting node", err, false)
 					return
 				}
+				// Remove from injected cache if present
+				c.removeInjected(val.node)
 				c.view.Details.Clear()
 				c.updateList()
 			}
@@ -374,15 +506,21 @@ func (c *Controller) create() *tcell.EventKey {
 		isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
 		if node != "" {
 			log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
+			full := normAbs(c.currentDir + node)
 			if !isDir {
-				err = c.model.Set(c.currentDir+node, value)
+				err = c.model.Set(full, value)
 			} else {
-				err = c.model.MkDir(c.currentDir + node)
+				err = c.model.MkDir(full)
 			}
 			if err != nil {
 				c.view.Pages.RemovePage("modal")
 				c.error("Error creating node", err, false)
 				return
+			}
+			// If underscore-prefixed, inject so it shows even in v2
+			if strings.HasPrefix(node, "_") {
+				nd := &model.Node{Name: full, IsDir: isDir, Value: value}
+				c.injectNode(nd)
 			}
 			ordered := c.updateList()
 			target := node
@@ -425,6 +563,11 @@ func (c *Controller) edit() *tcell.EventKey {
 					c.error(fmt.Errorf("Failed to edit %s: %w", val.node.Name, err).Error(), err, false)
 					return
 				}
+				// If underscore, refresh injected value (path unchanged)
+				if strings.HasPrefix(baseOf(val.node.Name), "_") {
+					nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId}
+					c.injectNode(nd)
+				}
 				ordered := c.updateList()
 				fs := strings.FieldsFunc(val.node.Name, splitFunc)
 				target := displayName(fs[len(fs)-1], false)
@@ -451,7 +594,7 @@ func (c *Controller) edit() *tcell.EventKey {
 				return
 			}
 			oldPath := val.node.Name
-			newPath := c.currentDir + newName
+			newPath := normAbs(c.currentDir + newName)
 			if newPath == oldPath {
 				c.view.Pages.RemovePage("modal")
 				return
@@ -462,6 +605,10 @@ func (c *Controller) edit() *tcell.EventKey {
 				c.view.Pages.RemovePage("modal")
 				c.error("Failed to rename folder", err, false)
 				return
+			}
+			// Update injected cache if underscore involved
+			if strings.HasPrefix(curBase, "_") || strings.HasPrefix(newName, "_") {
+				c.reinjectRename(oldPath, newPath, true, val.node.ClusterId, "")
 			}
 			ordered := c.updateList()
 			pos = c.getPosition(newName+"/", ordered) + 1
@@ -485,4 +632,98 @@ func (c *Controller) error(header string, err error, fatal bool) {
 		}
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+}
+
+func (c *Controller) jump() *tcell.EventKey {
+	inp := c.view.NewJump()
+	inp.SetDoneFunc(func(key tcell.Key) {
+		defer c.view.Pages.RemovePage("modal")
+		if key != tcell.KeyEnter {
+			return
+		}
+
+		raw := strings.TrimSpace(inp.GetText())
+		if raw == "" {
+			return
+		}
+
+		isDirHint := strings.HasSuffix(raw, "/")
+		var target string
+		if strings.HasPrefix(raw, "/") {
+			target = normAbs(raw)
+		} else {
+			cur := normAbs(c.currentDir)
+			if cur != "/" {
+				target = normAbs(cur + "/" + raw)
+			} else {
+				target = normAbs("/" + raw)
+			}
+		}
+
+		// Check existence via model (works for both v2 and v3 now).
+		nd, err := c.model.Get(target)
+		if err != nil {
+			c.error("Not found", fmt.Errorf("%s", target), false)
+			return
+		}
+
+		// If user used trailing slash, enforce that it's a folder
+		if isDirHint && !nd.IsDir {
+			c.error("Not a folder", fmt.Errorf("%s", target), false)
+			return
+		}
+
+		// Inject real node so it appears in the tree (needed for v2 underscore case; harmless for v3).
+		c.injectNode(nd)
+
+		// If it's a dir (with or without slash) — enter it
+		if nd.IsDir {
+			c.currentDir = normAbs(nd.Name) + "/"
+			c.Cd(c.currentDir)
+			return
+		}
+
+		// It's a file: go to its parent and select it
+		parent := parentOf(nd.Name)
+		base := baseOf(nd.Name)
+		if !strings.HasSuffix(parent, "/") {
+			parent += "/"
+		}
+		c.currentDir = parent
+		ordered := c.updateList()
+
+		// precise position finder (returns -1 if not found)
+		findIndex := func(name string, list []string) int {
+			for i, v := range list {
+				if v == name {
+					return i
+				}
+			}
+			return -1
+		}
+
+		// Select file name (no slash)
+		if pos := findIndex(base, ordered); pos >= 0 {
+			c.view.List.SetCurrentItem(pos + 1) // +1 for [..]
+			i := c.view.List.GetCurrentItem()
+			_, mk := c.view.List.GetItemText(i)
+			c.fillDetails(strings.TrimSpace(mk))
+			return
+		}
+
+		// Fallback: try folder-style just in case
+		if pos := findIndex(base+"/", ordered); pos >= 0 {
+			c.view.List.SetCurrentItem(pos + 1)
+			i := c.view.List.GetCurrentItem()
+			_, mk := c.view.List.GetItemText(i)
+			c.fillDetails(strings.TrimSpace(mk))
+			return
+		}
+
+		// Shouldn't happen after injection, but be explicit
+		c.error("Not found", fmt.Errorf("%s", target), false)
+	})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
+	return nil
 }
