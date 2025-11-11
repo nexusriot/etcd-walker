@@ -53,38 +53,42 @@ type backend interface {
 
 // ---------------- NewModel with explicit protocol ----------------
 
-func NewModel(host, port, protocol string) *Model {
+// NewModel tries to initialize the requested protocol ("v2", "v3", or "auto").
+// returns (*Model, error)
+func NewModel(host, port, protocol string) (*Model, error) {
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
 	case "v3":
 		b3, err := newV3Backend(host, port)
 		if err != nil {
-			panic(fmt.Sprintf("v3 init failed: %v", err))
+			return nil, fmt.Errorf("v3 init failed: %w", err)
 		}
 		if _, err := b3.ls("/"); err != nil {
-			panic(fmt.Sprintf("v3 probe failed: %v", err))
+			return nil, fmt.Errorf("v3 probe failed: %w", err)
 		}
-		return &Model{backend: b3}
+		return &Model{backend: b3}, nil
+
 	case "auto":
 		if b3, err := newV3Backend(host, port); err == nil {
 			if _, err := b3.ls("/"); err == nil {
-				return &Model{backend: b3}
+				return &Model{backend: b3}, nil
 			}
 		}
 		if b2, err := newV2Backend(host, port); err == nil {
 			if _, err := b2.ls("/"); err == nil {
-				return &Model{backend: b2}
+				return &Model{backend: b2}, nil
 			}
 		}
-		panic("failed to connect using auto: neither v3 nor v2 worked")
+		return nil, fmt.Errorf("auto: neither v3 nor v2 is reachable at %s:%s", host, port)
+
 	default: // "v2"
 		b2, err := newV2Backend(host, port)
 		if err != nil {
-			panic(fmt.Sprintf("v2 init failed: %v", err))
+			return nil, fmt.Errorf("v2 init failed: %w", err)
 		}
 		if _, err := b2.ls("/"); err != nil {
-			panic(fmt.Sprintf("v2 probe failed: %v", err))
+			return nil, fmt.Errorf("v2 probe failed: %w", err)
 		}
-		return &Model{backend: b2}
+		return &Model{backend: b2}, nil
 	}
 }
 
@@ -158,7 +162,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 			continue
 		}
 		rest := strings.TrimPrefix(key, prefix)
-		rest = strings.TrimLeft(rest, "/") // tolerate legacy double slashes
+		rest = strings.TrimLeft(rest, "/")
 		if rest == "" {
 			continue
 		}
@@ -195,7 +199,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 		ci := children[name]
 		full := root + "/" + name
 
-		// If both exist, return BOTH entries: directory and file.
 		if ci.isDir {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
 		}
@@ -283,21 +286,17 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	return err
 }
 
-// v3 Get: return file node if exact key exists,
-// else return directory node if any key exists under the path (prefix match).
 func (b *v3Backend) get(key string) (*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	raw := key
-	k := normPath(raw)
+	k := normPath(key)
 
 	exact, err := b.cli.Get(ctx, k)
 	if err != nil {
 		return nil, err
 	}
 	if exact.Count > 0 {
-		// There could be multiple KVs if compaction/revision, but the first is fine for value.
 		kv := exact.Kvs[0]
 		return &Node{
 			Name:      k,
@@ -307,7 +306,6 @@ func (b *v3Backend) get(key string) (*Node, error) {
 		}, nil
 	}
 
-	// Try directory existence by prefix (any child or .dir marker)
 	pfx := withTrail(k)
 	dirProbe, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
 	if err != nil {
@@ -315,7 +313,7 @@ func (b *v3Backend) get(key string) (*Node, error) {
 	}
 	if dirProbe.Count > 0 {
 		return &Node{
-			Name:      k, // directory logical name (no trailing slash)
+			Name:      k,
 			ClusterId: fmt.Sprintf("%d", dirProbe.Header.GetClusterId()),
 			IsDir:     true,
 			Value:     "",
