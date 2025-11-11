@@ -19,10 +19,9 @@ type Controller struct {
 	currentDir   string
 	currentNodes map[string]*Node // mapKey => Node (mapKey is "<basename>|dir" or "<basename>|file")
 	position     map[string]int
+	injected     map[string]map[string]*model.Node
 
-	// Injected nodes that may not appear in v2 listings (e.g., names starting with "_").
-	// Keyed by parent directory (normalized, with trailing "/"), value is a map of mapKey->*model.Node.
-	injected map[string]map[string]*model.Node
+	startupErr error
 }
 
 type Node struct {
@@ -32,22 +31,28 @@ type Node struct {
 func splitFunc(r rune) bool { return r == '/' }
 
 func NewController(host, port string, debug bool, protocol string) *Controller {
-	m := model.NewModel(host, port, protocol)
+	m, err := model.NewModel(host, port, protocol)
+
 	v := view.NewView()
+	headerProto := protocol
+	if err == nil && m != nil {
+		headerProto = m.ProtocolVersion()
+	}
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.2.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		fmt.Sprintf("Etcd-walker v.0.2.1 (on %s:%s)  –  protocol: %s", host, port, headerProto),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
-	controller := Controller{
+	controller := &Controller{
 		debug:      debug,
 		view:       v,
 		model:      m,
 		currentDir: "/",
 		position:   make(map[string]int),
 		injected:   make(map[string]map[string]*model.Node),
+		startupErr: err,
 	}
-	return &controller
+	return controller
 }
 
 // makeMapKey ensures uniqueness when file and dir share the same basename.
@@ -394,6 +399,20 @@ func (c *Controller) Stop() {
 }
 
 func (c *Controller) Run() error {
+	if c.startupErr != nil {
+		// Allow Ctrl+Q to exit as well
+		c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			if event.Key() == tcell.KeyCtrlQ {
+				c.Stop()
+				return nil
+			}
+			return event
+		})
+		c.error("Connection error", c.startupErr, true)
+		return c.view.App.Run()
+	}
+
+	// Normal flow
 	c.view.List.SetChangedFunc(func(i int, main string, secondary string, _ rune) {
 		curMK := strings.TrimSpace(secondary) // mapKey
 		c.fillDetails(curMK)
