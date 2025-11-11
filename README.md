@@ -7,8 +7,9 @@ Features
 - Support creating/deleting/editing keys
 - Directory rename support
 - Search in current level - "quick jump"
-- Support etcd v2/v3 (v3 - experimental, v.0.1+)
-- Hidden key support (experimental, v.0.1.1+)
+- Support etcd v2/v3 (v3 - experimental, v0.1+)
+- Hidden key support (experimental, v0.1.1+)
+- Keys multi-line editing (experimental, v0.2+)
 ------------- 
 Grab: [latest version](https://github.com/nexusriot/etcd-walker/releases/latest)
 
@@ -21,7 +22,7 @@ go build
 ```
 in some cases (for example for running inside containers) need to build statically without dependency on libc:
 ```
-go build -o  etcd-walker_linux_x64_static -ldflags "-linkmode external -extldflags -static"
+go build -o etcd-walker_linux_x64_static -ldflags "-linkmode external -extldflags -static"
 ```
 to check for lib usage please use ldd command
 ```
@@ -30,7 +31,7 @@ ldd etcd-walker
 
 building 32-bit binary
 ```
-GOOS=linux GOARCH=386 go build -o etcd-walker_linux_i686 main.go
+GOOS=linux GOARCH=386 go build -o etcd-walker_linux_i686
 ```
 
 ### **Building deb package**

@@ -145,11 +145,14 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Backspace     Up ([..])
 		[::b]Actions[::-]
 		  Ctrl+N        Create node
-		  Ctrl+E        Edit (value / rename dir)
+		  Ctrl+E        Edit (value multiline/ rename dir)
 		  Del           Delete (recursive for dirs)
 		  Ctrl+J        Jump to key/dir(dir ends with '/')
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
+		[::b]Editor[::-]
+		  Ctrl+S        Save
+		  Esc/Ctrl+Q    Cancel/Cancel+Quit
 		[::b]Misc[::-]
 		  Ctrl+H        This help
 		  Ctrl+Q        Quit
@@ -165,4 +168,28 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 	tv.SetTitle(" Hotkeys ")
 
 	return tv
+}
+
+func (v *View) NewMultilineEditor(title, initial string) *tview.TextArea {
+	ta := tview.NewTextArea().
+		SetText(initial, false). // false -> caret at beginning (first line)
+		SetPlaceholder("")
+	ta.SetBorder(true).
+		SetTitle(title + "  [Ctrl+S=Save | Esc=Cancel]")
+	return ta
+}
+
+// OpenEditor replaces the Frame with a full-screen editor (hides bottom legend).
+func (v *View) OpenEditor(p tview.Primitive) {
+	editor := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(p, 0, 1, true)
+	v.App.SetRoot(editor, true) // hide frame + legend while editing
+	v.App.SetFocus(p)
+}
+
+// CloseEditor restores the normal UI.
+func (v *View) CloseEditor() {
+	v.App.SetRoot(v.Frame, true)
+	v.App.SetFocus(v.List)
 }
