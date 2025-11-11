@@ -35,7 +35,7 @@ func NewController(host, port string, debug bool, protocol string) *Controller {
 	m := model.NewModel(host, port, protocol)
 	v := view.NewView()
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.1.1 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
+		fmt.Sprintf("Etcd-walker v.0.2.0 (on %s:%s)  –  protocol: %s", host, port, m.ProtocolVersion()),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
@@ -236,7 +236,7 @@ func (c *Controller) updateList() []string {
 	sort.Strings(dirKeys)
 	sort.Strings(fileKeys)
 
-	// Directories first
+	// Directories
 	for _, mk := range dirKeys {
 		n := c.currentNodes[mk].node
 		fields := strings.FieldsFunc(n.Name, splitFunc)
@@ -258,7 +258,7 @@ func (c *Controller) updateList() []string {
 		})
 	}
 
-	// Then files
+	// Files
 	for _, mk := range fileKeys {
 		n := c.currentNodes[mk].node
 		fields := strings.FieldsFunc(n.Name, splitFunc)
@@ -276,7 +276,6 @@ func (c *Controller) updateList() []string {
 		delete(c.position, c.currentDir)
 	}
 
-	// Build an ordered list of **display names** for search/positioning (dirs with trailing "/")
 	ordered := make([]string, 0, len(dirKeys)+len(fileKeys))
 	for _, mk := range dirKeys {
 		n := c.currentNodes[mk].node
@@ -330,7 +329,7 @@ func (c *Controller) setInput() {
 		case tcell.KeyDelete:
 			return c.delete()
 		case tcell.KeyCtrlE:
-			return c.edit()
+			return c.editMultiline()
 		case tcell.KeyCtrlS:
 			return c.search()
 		case tcell.KeyCtrlJ:
@@ -623,6 +622,67 @@ func (c *Controller) edit() *tcell.EventKey {
 	return nil
 }
 
+func (c *Controller) editMultiline() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+	if mapKey == ".." {
+		return nil
+	}
+	val, ok := c.currentNodes[mapKey]
+	if !ok {
+		return nil
+	}
+	if val.node.IsDir {
+		// edit folder
+		return c.edit()
+	}
+
+	title := fmt.Sprintf(" Edit (multiline): %s ", val.node.Name)
+	ta := c.view.NewMultilineEditor(title, val.node.Value)
+
+	// Inside editor:
+	//   Ctrl+S = save
+	//   Esc / Ctrl+Q = cancel
+	ta.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Key() {
+		case tcell.KeyCtrlS:
+			value := ta.GetText()
+			log.Debugf("Multiline save: %s (%d bytes)", val.node.Name, len(value))
+			if err := c.model.Set(val.node.Name, value); err != nil {
+				c.view.CloseEditor()
+				c.error("Failed to save value", err, false)
+				return nil
+			}
+			if strings.HasPrefix(baseOf(val.node.Name), "_") {
+				nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId}
+				c.injectNode(nd)
+			}
+			c.view.CloseEditor()
+			ordered := c.updateList()
+			base := displayName(baseOf(val.node.Name), false)
+			pos := c.getPosition(base, ordered) + 1
+			c.view.List.SetCurrentItem(pos)
+			// Refresh details panel with mapKey
+			i := c.view.List.GetCurrentItem()
+			_, mk := c.view.List.GetItemText(i)
+			c.fillDetails(strings.TrimSpace(mk))
+			return nil
+
+		case tcell.KeyEsc, tcell.KeyCtrlQ:
+			c.view.CloseEditor()
+			return nil
+		}
+		return ev
+	})
+
+	c.view.OpenEditor(ta)
+	return nil
+}
+
 func (c *Controller) error(header string, err error, fatal bool) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
@@ -660,30 +720,25 @@ func (c *Controller) jump() *tcell.EventKey {
 			}
 		}
 
-		// Check existence via model (works for both v2 and v3 now).
 		nd, err := c.model.Get(target)
 		if err != nil {
 			c.error("Not found", fmt.Errorf("%s", target), false)
 			return
 		}
 
-		// If user used trailing slash, enforce that it's a folder
 		if isDirHint && !nd.IsDir {
 			c.error("Not a folder", fmt.Errorf("%s", target), false)
 			return
 		}
 
-		// Inject real node so it appears in the tree (needed for v2 underscore case; harmless for v3).
 		c.injectNode(nd)
 
-		// If it's a dir (with or without slash) — enter it
 		if nd.IsDir {
 			c.currentDir = normAbs(nd.Name) + "/"
 			c.Cd(c.currentDir)
 			return
 		}
 
-		// It's a file: go to its parent and select it
 		parent := parentOf(nd.Name)
 		base := baseOf(nd.Name)
 		if !strings.HasSuffix(parent, "/") {
@@ -692,7 +747,6 @@ func (c *Controller) jump() *tcell.EventKey {
 		c.currentDir = parent
 		ordered := c.updateList()
 
-		// precise position finder (returns -1 if not found)
 		findIndex := func(name string, list []string) int {
 			for i, v := range list {
 				if v == name {
@@ -702,7 +756,6 @@ func (c *Controller) jump() *tcell.EventKey {
 			return -1
 		}
 
-		// Select file name (no slash)
 		if pos := findIndex(base, ordered); pos >= 0 {
 			c.view.List.SetCurrentItem(pos + 1) // +1 for [..]
 			i := c.view.List.GetCurrentItem()
@@ -710,8 +763,6 @@ func (c *Controller) jump() *tcell.EventKey {
 			c.fillDetails(strings.TrimSpace(mk))
 			return
 		}
-
-		// Fallback: try folder-style just in case
 		if pos := findIndex(base+"/", ordered); pos >= 0 {
 			c.view.List.SetCurrentItem(pos + 1)
 			i := c.view.List.GetCurrentItem()
@@ -720,7 +771,6 @@ func (c *Controller) jump() *tcell.EventKey {
 			return
 		}
 
-		// Shouldn't happen after injection, but be explicit
 		c.error("Not found", fmt.Errorf("%s", target), false)
 	})
 
