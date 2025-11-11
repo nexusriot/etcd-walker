@@ -8,7 +8,7 @@ Features
 - Directory rename support
 - Search in current level - "quick jump"
 - Support etcd v2/v3 (v3 - experimental, v.0.1+)
-- Hidden key support (experimental, v,0.1+)
+- Hidden key support (experimental, v.0.1.1+)
 ------------- 
 Grab: [latest version](https://github.com/nexusriot/etcd-walker/releases/latest)
 
