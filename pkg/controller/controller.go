@@ -39,7 +39,7 @@ func NewController(host, port string, debug bool, protocol string) *Controller {
 		headerProto = m.ProtocolVersion()
 	}
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.2.1 (on %s:%s)  –  protocol: %s", host, port, headerProto),
+		fmt.Sprintf("Etcd-walker v.0.2.4 (on %s:%s)  –  protocol: %s", host, port, headerProto),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
