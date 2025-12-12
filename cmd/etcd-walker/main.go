@@ -45,6 +45,8 @@ func main() {
 		portFlag     = &stringFlag{value: ""}
 		protocolFlag = &stringFlag{value: ""}
 		debugFlag    = &boolFlag{value: false}
+		usernameFlag = &stringFlag{value: ""}
+		passwordFlag = &stringFlag{value: ""}
 		configPath   = flag.String("config", config.DefaultPath, "config file, optional")
 	)
 
@@ -52,17 +54,21 @@ func main() {
 	flag.Var(portFlag, "port", "etcd port (e.g. 2379)")
 	flag.Var(protocolFlag, "protocol", "etcd protocol: v2, v3, auto (default: auto)")
 	flag.Var(debugFlag, "debug", "enable debug logging (true/false)")
-
+	flag.Var(usernameFlag, "username", "etcd auth username")
+	flag.Var(passwordFlag, "password", "etcd auth password (consider using config file)")
 	flag.Parse()
 
 	// Hardcoded defaults
 	host := "127.0.0.1"
 	port := "2379"
 	protocol := "auto"
+	username := ""
+	password := ""
 	debug := false
 
 	// Check whether any of the connection-related CLI flags are explicitly set.
-	cliOverrides := hostFlag.set || portFlag.set || protocolFlag.set || debugFlag.set
+	cliOverrides := hostFlag.set || portFlag.set || protocolFlag.set || debugFlag.set ||
+		usernameFlag.set || passwordFlag.set
 
 	if cliOverrides {
 		// CLI has precedence: ignore config file completely.
@@ -75,6 +81,12 @@ func main() {
 		if protocolFlag.set && protocolFlag.value != "" {
 			protocol = protocolFlag.value
 		}
+		if usernameFlag.set {
+			username = usernameFlag.value
+		}
+		if passwordFlag.set {
+			password = passwordFlag.value
+		}
 		if debugFlag.set {
 			debug = debugFlag.value
 		}
@@ -85,6 +97,11 @@ func main() {
 			log.WithError(err).Warn("failed to load config, falling back to defaults")
 		}
 		if cfg != nil {
+			if cfg.Username != "" {
+				username = cfg.Username
+			}
+			if cfg.Password != "" {
+			}
 			if cfg.Host != "" {
 				host = cfg.Host
 			}
@@ -111,7 +128,7 @@ func main() {
 		"cli":      cliOverrides,
 	}).Debug("Starting etcd-walker")
 
-	ctrl := controller.NewController(host, port, debug, protocol)
+	ctrl := controller.NewController(host, port, debug, protocol, username, password)
 	if err := ctrl.Run(); err != nil {
 		log.WithError(err).Error("etcd-walker exited with error")
 		os.Exit(1)
