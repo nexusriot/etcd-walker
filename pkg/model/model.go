@@ -461,7 +461,6 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 }
 
 func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {
-	// Create a probe client WITHOUT credentials
 	cfg := clientv2.Config{
 		Endpoints: b.client.Endpoints(),
 	}
