@@ -7,15 +7,35 @@ Features
 - Support creating/deleting/editing keys
 - Directory rename support
 - Search in current level - "quick jump"
-- Support etcd v2/v3 (v3 - experimental, v0.1+)
-- Hidden key support (experimental, v0.1.1+)
-- Keys multi-line editing (experimental, v0.2+)
+- Support etcd v2/v3 (v0.1+)
+- Hidden key support (v0.1.1+)
+- Keys multi-line editing (v0.2+)
+- Config file support (v0.3+)
+- Auth support (v3 only, experimental, v0.3.2+)
 ------------- 
 Grab: [latest version](https://github.com/nexusriot/etcd-walker/releases/latest)
 
 ![Profiles](resources/screenshot-v2.png)
 
-### **Building:**
+### **Configuration**
+Config can be placed in ```/etc/etcd-walker/config.json```
+
+```
+{
+  "host": "127.0.0.1",
+  "port": "2379",
+  "protocol": "v3",
+  "debug": false,
+  "username": "root",
+  "password": "supersecretpassword"
+}
+```
+Configuration file is __optional__.
+
+### **Authentication**
+Since v.0.3.2 etcd-walker supports authentication (v3 only).
+
+### **Building**
 
 ```
 go build
@@ -46,12 +66,12 @@ run build script
 ```
 
 
-### **Running:**
+### **Running**
 ```
-./etcd-walker [-host host] [-port port] [-protocol] [-debug]
+./etcd-walker [-host host] [-port port] [-protocol] [-username user] [-password pass] [-debug]
 ```
 
-Default values are: **localhost** for host, **2379** for port, protocol is **v2**, debug is **false**
+Default values are: **localhost** for host, **2379** for port, protocol is **auto**, debug is **false**
 
 ### **Starting etcd for development/testing**
 
