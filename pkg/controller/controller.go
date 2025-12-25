@@ -37,12 +37,17 @@ func NewController(host, port string, debug bool, protocol, username, password s
 	})
 
 	v := view.NewView()
+
 	headerProto := protocol
+	auth := "?"
 	if err == nil && m != nil {
 		headerProto = m.ProtocolVersion()
+		auth = m.AuthLabel()
 	}
+
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.3.0 (on %s:%s)  –  protocol: %s", host, port, headerProto),
+		fmt.Sprintf("Etcd-walker v.0.3.2 (on %s:%s)  –  protocol: %s  |  Auth: %s",
+			host, port, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 

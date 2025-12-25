@@ -16,7 +16,8 @@ import (
 )
 
 type Model struct {
-	backend backend
+	backend   backend
+	authLabel string
 }
 
 type Node struct {
@@ -35,6 +36,12 @@ type Options struct {
 }
 
 func (m *Model) ProtocolVersion() string { return m.backend.proto() }
+func (m *Model) AuthLabel() string {
+	if m == nil || m.authLabel == "" {
+		return "?"
+	}
+	return m.authLabel
+}
 
 func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
 func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) }
@@ -53,6 +60,7 @@ type backend interface {
 	del(key string) error
 	deldir(key string) error
 	renameDir(oldDir, newDir string) error
+	authStatus() (enabled bool, known bool, err error)
 }
 
 func NewModel(opts Options) (*Model, error) {
@@ -71,7 +79,17 @@ func NewModel(opts Options) (*Model, error) {
 		if _, err := b3.ls("/"); err != nil {
 			return nil, fmt.Errorf("v3 probe failed: %w", err)
 		}
-		return &Model{backend: b3}, nil
+
+		label := "?"
+		if en, known, _ := b3.authStatus(); known {
+			if en {
+				label = "ON"
+			} else {
+				label = "OFF"
+			}
+		}
+
+		return &Model{backend: b3, authLabel: label}, nil
 
 	case "auto":
 		if b3, err := newV3Backend(host, port, opts.Username, opts.Password); err == nil {
@@ -313,6 +331,30 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	return err
 }
 
+func (b *v3Backend) authStatus() (bool, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := b.c.Auth.AuthStatus(ctx)
+	if err == nil {
+		// If it succeeded, auth is enabled (and we are authenticated or auth is on).
+		return true, true, nil
+	}
+
+	s := err.Error()
+
+	// Different etcd builds phrase this slightly differently; keep it tolerant.
+	if strings.Contains(strings.ToLower(s), "auth") && strings.Contains(strings.ToLower(s), "not enabled") {
+		return false, true, nil
+	}
+	if strings.Contains(strings.ToLower(s), "permission denied") ||
+		strings.Contains(strings.ToLower(s), "unauthorized") {
+		return true, true, nil
+	}
+	// unknown
+	return false, false, err
+}
+
 type v2Backend struct {
 	api    clientv2.KeysAPI
 	client clientv2.Client
@@ -416,4 +458,40 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 	_, err = b.api.Delete(context.Background(), oldDir,
 		&clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
+}
+
+func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {
+	// Create a probe client WITHOUT credentials
+	cfg := clientv2.Config{
+		Endpoints: b.client.Endpoints(),
+	}
+
+	cli, err := clientv2.New(cfg)
+	if err != nil {
+		return false, false, err
+	}
+	api := clientv2.NewKeysAPI(cli)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err = api.Get(ctx, "/", nil)
+	if err == nil {
+		return false, true, nil
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	switch {
+	case strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "authentication"),
+		strings.Contains(msg, "permission denied"),
+		strings.Contains(msg, "401"):
+		return true, true, nil
+
+	case clientv2.IsKeyNotFound(err):
+		return false, true, nil
+	}
+
+	return false, false, err
 }
