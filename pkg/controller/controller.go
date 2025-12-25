@@ -51,7 +51,7 @@ func NewController(host, port string, debug bool, protocol, username, password s
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.3.2 (on %s:%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.3.5 (on %s:%s)  –  protocol: %s  |  Auth: %s",
 			host, port, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
@@ -351,10 +351,7 @@ func (c *Controller) fillDetails(mapKey string) {
 			fmt.Fprintf(c.view.Details, "\n[yellow]Binary / non-UTF8 value (preview suppressed)[-]\n")
 		}
 	} else {
-		// Directory stats: ask backend for this directory listing
 		dirPath := normAbs(n.Name)
-		// your model.Ls expects directory path; your controller uses trailing "/" for dirs
-		// but backends handle both. Still, keep it consistent:
 		if dirPath != "/" && !strings.HasSuffix(dirPath, "/") {
 			dirPath = dirPath + "/"
 		}
@@ -368,8 +365,6 @@ func (c *Controller) fillDetails(mapKey string) {
 
 		subdirs := 0
 		keys := 0
-
-		// De-dupe by basename + type (v3 can return both dir and file with same basename)
 		seen := make(map[string]struct{}, len(list))
 		for _, ch := range list {
 			if ch == nil {
@@ -905,7 +900,7 @@ func valueStats(v string) (bytes int, lines int, printable bool) {
 
 func shortHash(v string) string {
 	h := sha256.Sum256([]byte(v))
-	return hex.EncodeToString(h[:8]) // short & readable
+	return hex.EncodeToString(h[:8])
 }
 
 func depthOf(path string) int {
@@ -978,7 +973,7 @@ func (c *Controller) jump() *tcell.EventKey {
 		}
 
 		if pos := findIndex(base, ordered); pos >= 0 {
-			c.view.List.SetCurrentItem(pos + 1) // +1 for [..]
+			c.view.List.SetCurrentItem(pos + 1) // for [..]
 			i := c.view.List.GetCurrentItem()
 			_, mk := c.view.List.GetItemText(i)
 			c.fillDetails(strings.TrimSpace(mk))
