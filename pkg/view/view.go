@@ -96,6 +96,14 @@ func (v *View) NewCreateForm(header string) *tview.Form {
 	return form
 }
 
+func (v *View) NewInfoMessageQ(header string, details string) *tview.Modal {
+	infoQ := tview.NewModal()
+	infoQ.SetText(header + ": " + details).
+		SetBackgroundColor(tcell.ColorDarkGreen).
+		AddButtons([]string{"copied"})
+	return infoQ
+}
+
 func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 	form := tview.NewForm().
 		AddInputField("Value", "", 30, nil, nil)
@@ -148,6 +156,8 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+E        Edit (value multiline/ rename dir)
 		  Del           Delete (recursive for dirs)
 		  Ctrl+J        Jump to key/dir(dir ends with '/')
+		  Ctrl+P        Copy path (key/dir)
+		  Ctrl+Y        Copy key value
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		[::b]Editor[::-]
