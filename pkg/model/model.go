@@ -7,16 +7,17 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	// v3 client
 	clientv3 "go.etcd.io/etcd/client/v3"
 	// v2 client
 	clientv2 "github.com/coreos/etcd/client"
 )
 
-// ---------------- Public types ----------------
-
 type Model struct {
-	backend backend
+	backend   backend
+	authLabel string
 }
 
 type Node struct {
@@ -26,19 +27,29 @@ type Node struct {
 	Value     string
 }
 
-// ProtocolVersion reports which backend is in use ("v2" or "v3").
-func (m *Model) ProtocolVersion() string { return m.backend.proto() }
+type Options struct {
+	Host     string
+	Port     string
+	Protocol string // v2, v3, auto
+	Username string
+	Password string
+}
 
-// Public API bridged to the selected backend.
+func (m *Model) ProtocolVersion() string { return m.backend.proto() }
+func (m *Model) AuthLabel() string {
+	if m == nil || m.authLabel == "" {
+		return "?"
+	}
+	return m.authLabel
+}
+
 func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
-func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) } // used by Jump
+func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) }
 func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
 func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
 func (m *Model) Del(key string) error                  { return m.backend.del(key) }
 func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
 func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.renameDir(oldDir, newDir) }
-
-// ---------------- Backend interface ----------------
 
 type backend interface {
 	proto() string
@@ -49,39 +60,57 @@ type backend interface {
 	del(key string) error
 	deldir(key string) error
 	renameDir(oldDir, newDir string) error
+	authStatus() (enabled bool, known bool, err error)
 }
 
-// ---------------- NewModel with explicit protocol ----------------
+func NewModel(opts Options) (*Model, error) {
+	host, port := opts.Host, opts.Port
 
-// NewModel tries to initialize the requested protocol ("v2", "v3", or "auto").
-// returns (*Model, error)
-func NewModel(host, port, protocol string) (*Model, error) {
-	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	if strings.TrimSpace(opts.Username) == "" && strings.TrimSpace(opts.Password) != "" {
+		return nil, fmt.Errorf("auth misconfigured: password is set but username is empty (set --username or username in config)")
+	}
+	switch strings.ToLower(strings.TrimSpace(opts.Protocol)) {
+
 	case "v3":
-		b3, err := newV3Backend(host, port)
+		b3, err := newV3Backend(host, port, opts.Username, opts.Password)
 		if err != nil {
 			return nil, fmt.Errorf("v3 init failed: %w", err)
 		}
 		if _, err := b3.ls("/"); err != nil {
 			return nil, fmt.Errorf("v3 probe failed: %w", err)
 		}
-		return &Model{backend: b3}, nil
+
+		label := "?"
+		if en, known, _ := b3.authStatus(); known {
+			if en {
+				label = "ON"
+			} else {
+				label = "OFF"
+			}
+		}
+
+		return &Model{backend: b3, authLabel: label}, nil
 
 	case "auto":
-		if b3, err := newV3Backend(host, port); err == nil {
+		if b3, err := newV3Backend(host, port, opts.Username, opts.Password); err == nil {
 			if _, err := b3.ls("/"); err == nil {
 				return &Model{backend: b3}, nil
+			} else if isAuthRequiredErr(err) {
+				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
-		if b2, err := newV2Backend(host, port); err == nil {
+		if b2, err := newV2Backend(host, port, opts.Username, opts.Password); err == nil {
 			if _, err := b2.ls("/"); err == nil {
 				return &Model{backend: b2}, nil
+			} else if isAuthRequiredErr(err) {
+				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
-		return nil, fmt.Errorf("auto: neither v3 nor v2 is reachable at %s:%s", host, port)
 
-	default: // "v2"
-		b2, err := newV2Backend(host, port)
+		return nil, fmt.Errorf("auto: neither v3 nor v2 reachable at %s:%s", host, port)
+
+	default: // v2
+		b2, err := newV2Backend(host, port, opts.Username, opts.Password)
 		if err != nil {
 			return nil, fmt.Errorf("v2 init failed: %w", err)
 		}
@@ -92,20 +121,33 @@ func NewModel(host, port, protocol string) (*Model, error) {
 	}
 }
 
-// ============================================================================
-// v3 backend (prefix-based “dirs” with .dir marker) + normalization
-// ============================================================================
-
 type v3Backend struct {
 	cli clientv3.KV
 	c   *clientv3.Client
 }
 
-func newV3Backend(host, port string) (*v3Backend, error) {
-	c, err := clientv3.New(clientv3.Config{
+func isAuthRequiredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "user name is empty") ||
+		strings.Contains(s, "authentication required") ||
+		strings.Contains(s, "permission denied")
+}
+
+func newV3Backend(host, port, username, password string) (*v3Backend, error) {
+	cfg := clientv3.Config{
 		Endpoints:   []string{fmt.Sprintf("http://%s:%s", host, port)},
 		DialTimeout: 5 * time.Second,
-	})
+		Logger:      zap.NewNop(),
+	}
+	if username != "" {
+		cfg.Username = username
+		cfg.Password = password
+	}
+
+	c, err := clientv3.New(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +158,6 @@ func (b *v3Backend) proto() string { return "v3" }
 
 const dirMarker = ".dir"
 
-// ---- helpers for v3 ----
 func normPath(p string) string {
 	if p == "" {
 		return "/"
@@ -127,7 +168,7 @@ func normPath(p string) string {
 	for strings.Contains(p, "//") {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
-	return p
+	return strings.TrimRight(p, "/")
 }
 
 func withTrail(p string) string {
@@ -135,7 +176,7 @@ func withTrail(p string) string {
 	if p == "/" {
 		return "/"
 	}
-	return strings.TrimSuffix(p, "/") + "/"
+	return p + "/"
 }
 
 func (b *v3Backend) ls(directory string) ([]*Node, error) {
@@ -147,6 +188,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	clusterID := fmt.Sprintf("%d", resp.Header.GetClusterId())
 
 	type childInfo struct {
@@ -158,9 +200,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 
 	for _, kv := range resp.Kvs {
 		key := normPath(string(kv.Key))
-		if !strings.HasPrefix(key, prefix) {
-			continue
-		}
 		rest := strings.TrimPrefix(key, prefix)
 		rest = strings.TrimLeft(rest, "/")
 		if rest == "" {
@@ -178,9 +217,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 		}
 		if len(parts) == 2 {
 			ci.isDir = true
-			if parts[1] == dirMarker {
-				ci.isDir = true
-			}
 		} else {
 			ci.hasFile = true
 			ci.fileValue = string(kv.Value)
@@ -188,8 +224,8 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	}
 
 	names := make([]string, 0, len(children))
-	for k := range children {
-		names = append(names, k)
+	for n := range children {
+		names = append(names, n)
 	}
 	sort.Strings(names)
 
@@ -198,7 +234,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	for _, name := range names {
 		ci := children[name]
 		full := root + "/" + name
-
 		if ci.isDir {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
 		}
@@ -207,83 +242,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 		}
 	}
 	return nodes, nil
-}
-
-func (b *v3Backend) set(key, value string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	key = normPath(key)
-	_, err := b.cli.Put(ctx, key, value)
-	return err
-}
-
-func (b *v3Backend) mkdir(directory string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	dir := strings.TrimSuffix(normPath(directory), "/")
-	marker := dir + "/" + dirMarker
-	pfx := dir + "/"
-	resp, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
-	if err != nil {
-		return err
-	}
-	if resp.Count > 0 {
-		return nil
-	}
-	_, err = b.cli.Put(ctx, marker, "")
-	return err
-}
-
-func (b *v3Backend) del(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	key = normPath(key)
-	_, err := b.cli.Delete(ctx, key)
-	return err
-}
-
-func (b *v3Backend) deldir(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pfx := withTrail(key)
-	_, err := b.cli.Delete(ctx, pfx, clientv3.WithPrefix())
-	return err
-}
-
-func (b *v3Backend) renameDir(oldDir, newDir string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	oldPfx := withTrail(oldDir)
-	newPfx := withTrail(newDir)
-	if oldPfx == newPfx {
-		return nil
-	}
-
-	src, err := b.cli.Get(ctx, oldPfx, clientv3.WithPrefix())
-	if err != nil {
-		return err
-	}
-	if src.Count == 0 {
-		return fmt.Errorf("source does not exist: %s", oldDir)
-	}
-	dst, err := b.cli.Get(ctx, newPfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
-	if err != nil {
-		return err
-	}
-	if dst.Count > 0 {
-		return fmt.Errorf("target already exists: %s", newDir)
-	}
-
-	for _, kv := range src.Kvs {
-		oldKey := normPath(string(kv.Key))
-		newKey := strings.Replace(oldKey, oldPfx, newPfx, 1)
-		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
-			return fmt.Errorf("copy %s -> %s failed: %w", oldKey, newKey, err)
-		}
-	}
-	_, err = b.cli.Delete(ctx, oldPfx, clientv3.WithPrefix())
-	return err
 }
 
 func (b *v3Backend) get(key string) (*Node, error) {
@@ -300,9 +258,9 @@ func (b *v3Backend) get(key string) (*Node, error) {
 		kv := exact.Kvs[0]
 		return &Node{
 			Name:      k,
-			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
 			IsDir:     false,
 			Value:     string(kv.Value),
+			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
 		}, nil
 	}
 
@@ -314,28 +272,104 @@ func (b *v3Backend) get(key string) (*Node, error) {
 	if dirProbe.Count > 0 {
 		return &Node{
 			Name:      k,
-			ClusterId: fmt.Sprintf("%d", dirProbe.Header.GetClusterId()),
 			IsDir:     true,
-			Value:     "",
+			ClusterId: fmt.Sprintf("%d", dirProbe.Header.GetClusterId()),
 		}, nil
 	}
 
 	return nil, fmt.Errorf("not found: %s", k)
 }
 
-// ============================================================================
-// v2 backend (original KeysAPI logic)
-// ============================================================================
+func (b *v3Backend) set(key, value string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := b.cli.Put(ctx, normPath(key), value)
+	return err
+}
+
+func (b *v3Backend) mkdir(directory string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dir := normPath(directory)
+	_, err := b.cli.Put(ctx, dir+"/"+dirMarker, "")
+	return err
+}
+
+func (b *v3Backend) del(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := b.cli.Delete(ctx, normPath(key))
+	return err
+}
+
+func (b *v3Backend) deldir(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := b.cli.Delete(ctx, withTrail(key), clientv3.WithPrefix())
+	return err
+}
+
+func (b *v3Backend) renameDir(oldDir, newDir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	oldPfx := withTrail(oldDir)
+	newPfx := withTrail(newDir)
+
+	resp, err := b.cli.Get(ctx, oldPfx, clientv3.WithPrefix())
+	if err != nil {
+		return err
+	}
+
+	for _, kv := range resp.Kvs {
+		newKey := strings.Replace(string(kv.Key), oldPfx, newPfx, 1)
+		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
+			return err
+		}
+	}
+	_, err = b.cli.Delete(ctx, oldPfx, clientv3.WithPrefix())
+	return err
+}
+
+func (b *v3Backend) authStatus() (bool, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := b.c.Auth.AuthStatus(ctx)
+	if err == nil {
+		// If it succeeded, auth is enabled (and we are authenticated or auth is on).
+		return true, true, nil
+	}
+
+	s := err.Error()
+
+	// Different etcd builds phrase this slightly differently; keep it tolerant.
+	if strings.Contains(strings.ToLower(s), "auth") && strings.Contains(strings.ToLower(s), "not enabled") {
+		return false, true, nil
+	}
+	if strings.Contains(strings.ToLower(s), "permission denied") ||
+		strings.Contains(strings.ToLower(s), "unauthorized") {
+		return true, true, nil
+	}
+	// unknown
+	return false, false, err
+}
 
 type v2Backend struct {
 	api    clientv2.KeysAPI
 	client clientv2.Client
 }
 
-func newV2Backend(host, port string) (*v2Backend, error) {
-	cli, err := clientv2.New(clientv2.Config{
+func newV2Backend(host, port, username, password string) (*v2Backend, error) {
+	cfg := clientv2.Config{
 		Endpoints: []string{fmt.Sprintf("http://%s:%s", host, port)},
-	})
+	}
+	if username != "" {
+		cfg.Username = username
+		cfg.Password = password
+	}
+
+	cli, err := clientv2.New(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -345,14 +379,15 @@ func newV2Backend(host, port string) (*v2Backend, error) {
 func (b *v2Backend) proto() string { return "v2" }
 
 func (b *v2Backend) ls(directory string) ([]*Node, error) {
-	options := &clientv2.GetOptions{Sort: true, Recursive: false}
-	resp, err := b.api.Get(context.Background(), directory, options)
+	resp, err := b.api.Get(context.Background(), directory,
+		&clientv2.GetOptions{Sort: true, Recursive: false})
 	if err != nil {
 		if clientv2.IsKeyNotFound(err) {
 			return []*Node{}, nil
 		}
-		return []*Node{}, err
+		return nil, err
 	}
+
 	var nds []*Node
 	for _, n := range resp.Node.Nodes {
 		nds = append(nds, &Node{
@@ -366,16 +401,7 @@ func (b *v2Backend) ls(directory string) ([]*Node, error) {
 }
 
 func (b *v2Backend) get(key string) (*Node, error) {
-	ctx := context.Background()
-
-	k := strings.TrimSpace(key)
-	if k == "" {
-		k = "/"
-	}
-	if k != "/" {
-		k = strings.TrimRight(k, "/")
-	}
-	resp, err := b.api.Get(ctx, k, nil)
+	resp, err := b.api.Get(context.Background(), normPath(key), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -388,92 +414,83 @@ func (b *v2Backend) get(key string) (*Node, error) {
 }
 
 func (b *v2Backend) set(key, value string) error {
-	_, err := b.api.Set(context.Background(), key, value, nil)
+	_, err := b.api.Set(context.Background(), normPath(key), value, nil)
 	return err
 }
 
 func (b *v2Backend) mkdir(directory string) error {
-	res, err := b.api.Get(context.Background(), directory, nil)
-	if err != nil && !clientv2.IsKeyNotFound(err) {
-		return err
-	}
-	if err != nil && clientv2.IsKeyNotFound(err) {
-		_, err = b.api.Set(context.Background(), directory, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
-		return err
-	}
-	if !res.Node.Dir {
-		return fmt.Errorf("trying to rewrite existing value with dir: %v", directory)
-	}
-	return nil
+	_, err := b.api.Set(context.Background(), normPath(directory), "",
+		&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
+	return err
 }
 
 func (b *v2Backend) del(key string) error {
-	_, err := b.api.Delete(context.Background(), key, nil)
-	if err != nil && !clientv2.IsKeyNotFound(err) {
-		return err
-	}
-	return nil
+	_, err := b.api.Delete(context.Background(), normPath(key), nil)
+	return err
 }
 
 func (b *v2Backend) deldir(key string) error {
-	_, err := b.api.Delete(context.Background(), key, &clientv2.DeleteOptions{Dir: true, Recursive: true})
-	if err != nil && !clientv2.IsKeyNotFound(err) {
-		return err
-	}
-	return nil
+	_, err := b.api.Delete(context.Background(), normPath(key),
+		&clientv2.DeleteOptions{Dir: true, Recursive: true})
+	return err
 }
 
 func (b *v2Backend) renameDir(oldDir, newDir string) error {
-	ctx := context.Background()
-	if oldDir == newDir {
-		return nil
-	}
-	srcResp, err := b.api.Get(ctx, oldDir, &clientv2.GetOptions{Recursive: true})
+	resp, err := b.api.Get(context.Background(), oldDir,
+		&clientv2.GetOptions{Recursive: true})
 	if err != nil {
 		return err
 	}
-	if !srcResp.Node.Dir {
-		return fmt.Errorf("source is not a directory: %s", oldDir)
-	}
-	if _, err := b.api.Get(ctx, newDir, nil); err == nil {
-		return fmt.Errorf("target already exists: %s", newDir)
-	} else if !clientv2.IsKeyNotFound(err) {
-		return err
-	}
-	if _, err := b.api.Set(ctx, newDir, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
-		return err
-	}
 
-	var copyTree func(n *clientv2.Node) error
-	copyTree = func(n *clientv2.Node) error {
-		if n.Key == oldDir {
-			for _, ch := range n.Nodes {
-				if err := copyTree(ch); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		targetKey := strings.Replace(n.Key, oldDir, newDir, 1)
+	for _, n := range resp.Node.Nodes {
+		newKey := strings.Replace(n.Key, oldDir, newDir, 1)
 		if n.Dir {
-			if _, err := b.api.Set(ctx, targetKey, "", &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil && !clientv2.IsKeyNotFound(err) {
-				return err
-			}
-			for _, ch := range n.Nodes {
-				if err := copyTree(ch); err != nil {
-					return err
-				}
-			}
-			return nil
+			_, err = b.api.Set(context.Background(), newKey, "",
+				&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
+		} else {
+			_, err = b.api.Set(context.Background(), newKey, n.Value, nil)
 		}
-		_, err := b.api.Set(ctx, targetKey, n.Value, nil)
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := copyTree(srcResp.Node); err != nil {
-		return err
-	}
-
-	_, err = b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
+	_, err = b.api.Delete(context.Background(), oldDir,
+		&clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
+}
+
+func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {
+	cfg := clientv2.Config{
+		Endpoints: b.client.Endpoints(),
+	}
+
+	cli, err := clientv2.New(cfg)
+	if err != nil {
+		return false, false, err
+	}
+	api := clientv2.NewKeysAPI(cli)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err = api.Get(ctx, "/", nil)
+	if err == nil {
+		return false, true, nil
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	switch {
+	case strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "authentication"),
+		strings.Contains(msg, "permission denied"),
+		strings.Contains(msg, "401"):
+		return true, true, nil
+
+	case clientv2.IsKeyNotFound(err):
+		return false, true, nil
+	}
+
+	return false, false, err
 }

@@ -18,6 +18,8 @@ type Config struct {
 	Port     string `json:"port"`
 	Protocol string `json:"protocol"` // "v2", "v3", "auto"
 	Debug    bool   `json:"debug"`
+	Username string `json:"username" yaml:"username"`
+	Password string `json:"password" yaml:"password"`
 }
 
 // Load tries to read and unmarshal config from the given path.
