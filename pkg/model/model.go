@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	// v3 client
 	clientv3 "go.etcd.io/etcd/client/v3"
 	// v2 client
@@ -75,13 +77,18 @@ func NewModel(opts Options) (*Model, error) {
 		if b3, err := newV3Backend(host, port, opts.Username, opts.Password); err == nil {
 			if _, err := b3.ls("/"); err == nil {
 				return &Model{backend: b3}, nil
+			} else if isAuthRequiredErr(err) {
+				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
 		if b2, err := newV2Backend(host, port, opts.Username, opts.Password); err == nil {
 			if _, err := b2.ls("/"); err == nil {
 				return &Model{backend: b2}, nil
+			} else if isAuthRequiredErr(err) {
+				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
+
 		return nil, fmt.Errorf("auto: neither v3 nor v2 reachable at %s:%s", host, port)
 
 	default: // v2
@@ -101,10 +108,21 @@ type v3Backend struct {
 	c   *clientv3.Client
 }
 
+func isAuthRequiredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "user name is empty") ||
+		strings.Contains(s, "authentication required") ||
+		strings.Contains(s, "permission denied")
+}
+
 func newV3Backend(host, port, username, password string) (*v3Backend, error) {
 	cfg := clientv3.Config{
 		Endpoints:   []string{fmt.Sprintf("http://%s:%s", host, port)},
 		DialTimeout: 5 * time.Second,
+		Logger:      zap.NewNop(),
 	}
 	if username != "" {
 		cfg.Username = username
