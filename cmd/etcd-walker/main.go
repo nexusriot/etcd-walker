@@ -101,6 +101,7 @@ func main() {
 				username = cfg.Username
 			}
 			if cfg.Password != "" {
+				password = cfg.Password
 			}
 			if cfg.Host != "" {
 				host = cfg.Host
@@ -114,6 +115,7 @@ func main() {
 			debug = cfg.Debug
 		}
 	}
+	log.SetOutput(os.Stderr)
 
 	if debug {
 		log.SetLevel(log.DebugLevel)

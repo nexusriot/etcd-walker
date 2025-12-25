@@ -56,6 +56,9 @@ type backend interface {
 func NewModel(opts Options) (*Model, error) {
 	host, port := opts.Host, opts.Port
 
+	if strings.TrimSpace(opts.Username) == "" && strings.TrimSpace(opts.Password) != "" {
+		return nil, fmt.Errorf("auth misconfigured: password is set but username is empty (set --username or username in config)")
+	}
 	switch strings.ToLower(strings.TrimSpace(opts.Protocol)) {
 
 	case "v3":

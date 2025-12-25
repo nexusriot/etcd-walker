@@ -403,7 +403,6 @@ func (c *Controller) Stop() {
 
 func (c *Controller) Run() error {
 	if c.startupErr != nil {
-		// Allow Ctrl+Q to exit as well
 		c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 			if event.Key() == tcell.KeyCtrlQ {
 				c.Stop()
@@ -411,7 +410,18 @@ func (c *Controller) Run() error {
 			}
 			return event
 		})
-		c.error("Connection error", c.startupErr, true)
+
+		msg := c.startupErr.Error()
+		header := "Connection error"
+
+		// Friendly hint for the exact issue you reported
+		if strings.Contains(msg, "user name is empty") ||
+			strings.Contains(msg, "password is set but username is empty") {
+			header = "Auth configuration error"
+			msg = msg + "\n\nFix:\n- set --username (and --password)\n- or put username/password in config.json\n- or remove password if auth is disabled"
+		}
+
+		c.error(header, fmt.Errorf("%s", msg), true)
 		return c.view.App.Run()
 	}
 
