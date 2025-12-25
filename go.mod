@@ -13,6 +13,7 @@ go 1.24.0
 toolchain go1.24.6
 
 require (
+	github.com/atotto/clipboard v0.1.4
 	github.com/coreos/etcd v3.3.27+incompatible
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/rivo/tview v0.42.0

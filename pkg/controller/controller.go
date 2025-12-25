@@ -1,12 +1,17 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/nexusriot/etcd-walker/pkg/model"
+	"github.com/nexusriot/etcd-walker/pkg/util/clip"
 	"github.com/nexusriot/etcd-walker/pkg/view"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
@@ -46,7 +51,7 @@ func NewController(host, port string, debug bool, protocol, username, password s
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.3.2 (on %s:%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.3.5 (on %s:%s)  –  protocol: %s  |  Auth: %s",
 			host, port, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
@@ -305,15 +310,85 @@ func (c *Controller) updateList() []string {
 
 func (c *Controller) fillDetails(mapKey string) {
 	c.view.Details.Clear()
-	if val, ok := c.currentNodes[mapKey]; ok {
-		log.Debugf("Node details name: %s, isDir: %t, clusterId: %s", val.node.Name, val.node.IsDir, val.node.ClusterId)
-		fmt.Fprintf(c.view.Details, "[blue] Cluster Id: [gray] %s\n", val.node.ClusterId)
-		fmt.Fprintf(c.view.Details, "[green] Full name: [white] %s\n", val.node.Name)
-		fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n\n", val.node.IsDir)
-		if !val.node.IsDir {
-			fmt.Fprintf(c.view.Details, "[green] Value: [white] \n%s\n", val.node.Value)
-		}
+
+	val, ok := c.currentNodes[mapKey]
+	if !ok {
+		return
 	}
+
+	n := val.node
+	base := baseOf(n.Name)
+	parent := parentOf(n.Name)
+
+	fmt.Fprintf(c.view.Details, "[::b]Path info[::-]\n")
+	fmt.Fprintf(c.view.Details, "  [green]Type:[-] %s\n", map[bool]string{true: "Directory", false: "Key"}[n.IsDir])
+	fmt.Fprintf(c.view.Details, "  [green]Basename:[-] %s\n", base)
+	fmt.Fprintf(c.view.Details, "  [green]Parent:[-] %s\n", parent)
+	fmt.Fprintf(c.view.Details, "  [green]Full path:[-] %s\n", n.Name)
+	fmt.Fprintf(c.view.Details, "  [green]Depth:[-] %d\n", depthOf(n.Name))
+
+	fmt.Fprintf(c.view.Details, "\n[::b]Cluster info[::-]\n")
+	fmt.Fprintf(c.view.Details, "  [green]Protocol:[-] %s\n", c.model.ProtocolVersion())
+	fmt.Fprintf(c.view.Details, "  [green]Cluster ID:[-] %s\n", n.ClusterId)
+
+	if !n.IsDir {
+		bytes, lines, printable := valueStats(n.Value)
+
+		fmt.Fprintf(c.view.Details, "\n[::b]Value info[::-]\n")
+		fmt.Fprintf(c.view.Details, "  [green]Size:[-] %d bytes\n", bytes)
+		fmt.Fprintf(c.view.Details, "  [green]Lines:[-] %d\n", lines)
+		fmt.Fprintf(c.view.Details, "  [green]SHA-256:[-] %s\n", shortHash(n.Value))
+
+		const previewLimit = 512
+		if printable {
+			fmt.Fprintf(c.view.Details, "\n[::b]Preview (%d chars)[::-]\n", previewLimit)
+			if len(n.Value) > previewLimit {
+				fmt.Fprintf(c.view.Details, "%s…\n", n.Value[:previewLimit])
+			} else {
+				fmt.Fprintf(c.view.Details, "%s\n", n.Value)
+			}
+		} else {
+			fmt.Fprintf(c.view.Details, "\n[yellow]Binary / non-UTF8 value (preview suppressed)[-]\n")
+		}
+	} else {
+		dirPath := normAbs(n.Name)
+		if dirPath != "/" && !strings.HasSuffix(dirPath, "/") {
+			dirPath = dirPath + "/"
+		}
+
+		list, err := c.model.Ls(dirPath)
+		if err != nil {
+			fmt.Fprintf(c.view.Details, "\n[::b]Directory info[::-]\n")
+			fmt.Fprintf(c.view.Details, "  [red]Failed to list children:[-] %s\n", err.Error())
+			return
+		}
+
+		subdirs := 0
+		keys := 0
+		seen := make(map[string]struct{}, len(list))
+		for _, ch := range list {
+			if ch == nil {
+				continue
+			}
+			b := baseOf(ch.Name)
+			mk := makeMapKey(b, ch.IsDir)
+			if _, ok := seen[mk]; ok {
+				continue
+			}
+			seen[mk] = struct{}{}
+			if ch.IsDir {
+				subdirs++
+			} else {
+				keys++
+			}
+		}
+
+		fmt.Fprintf(c.view.Details, "\n[::b]Directory info[::-]\n")
+		fmt.Fprintf(c.view.Details, "  [green]Children:[-] %d\n", subdirs+keys)
+		fmt.Fprintf(c.view.Details, "  [green]Subdirs:[-] %d\n", subdirs)
+		fmt.Fprintf(c.view.Details, "  [green]Keys:[-] %d\n", keys)
+	}
+
 }
 
 func (c *Controller) getPosition(element string, slice []string) int {
@@ -323,6 +398,87 @@ func (c *Controller) getPosition(element string, slice []string) int {
 		}
 	}
 	return 0
+}
+
+func (c *Controller) info(header, details string) {
+	m := c.view.NewInfoMessageQ(header, details)
+	m.SetDoneFunc(func(int, string) {
+		c.view.Pages.RemovePage("modal-info")
+	})
+	c.view.Pages.AddPage("modal-info", c.view.ModalEdit(m, 60, 7), true, true)
+}
+
+func (c *Controller) copyPath() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+
+	// Copy current directory when cursor is on "[..]"
+	if mapKey == ".." {
+		if err := clip.Copy(normAbs(c.currentDir)); err != nil {
+			c.error("Clipboard error", err, false)
+			return nil
+		}
+		c.info("Copied", "Directory path copied")
+		return nil
+	}
+
+	val, ok := c.currentNodes[mapKey]
+	if !ok || val.node == nil {
+		return nil
+	}
+
+	text := normAbs(val.node.Name)
+	if val.node.IsDir {
+		text = text + "/"
+	}
+	if err := clip.Copy(text); err != nil {
+		if errors.Is(err, clip.ErrNoClipboard) {
+			c.error("Clipboard error", fmt.Errorf("No clipboard available. Tip: use a terminal that supports OSC52 (iTerm2, many modern terminals), or run inside tmux with allow-passthrough"), false)
+			return nil
+		}
+		c.error("Clipboard error", err, false)
+		return nil
+	}
+
+	if val.node.IsDir {
+		c.info("Copied", "Directory path copied")
+	} else {
+		c.info("Copied", "Key path copied")
+	}
+	return nil
+}
+
+func (c *Controller) copyValue() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+
+	if mapKey == ".." {
+		return nil
+	}
+
+	val, ok := c.currentNodes[mapKey]
+	if !ok || val.node == nil {
+		return nil
+	}
+	if val.node.IsDir {
+		c.error("Copy value", fmt.Errorf("selected item is a directory"), false)
+		return nil
+	}
+
+	if err := clip.Copy(val.node.Value); err != nil {
+		c.error("Clipboard error", err, false)
+		return nil
+	}
+	c.info("Copied", "Key value copied")
+	return nil
 }
 
 func (c *Controller) setInput() {
@@ -343,6 +499,10 @@ func (c *Controller) setInput() {
 			return c.delete()
 		case tcell.KeyCtrlE:
 			return c.editMultiline()
+		case tcell.KeyCtrlP:
+			return c.copyPath()
+		case tcell.KeyCtrlY:
+			return c.copyValue()
 		case tcell.KeyCtrlS:
 			return c.search()
 		case tcell.KeyCtrlJ:
@@ -731,6 +891,25 @@ func (c *Controller) error(header string, err error, fatal bool) {
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }
 
+func valueStats(v string) (bytes int, lines int, printable bool) {
+	bytes = len(v)
+	lines = strings.Count(v, "\n") + 1
+	printable = utf8.ValidString(v)
+	return
+}
+
+func shortHash(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:8])
+}
+
+func depthOf(path string) int {
+	if path == "/" {
+		return 0
+	}
+	return strings.Count(strings.Trim(path, "/"), "/") + 1
+}
+
 func (c *Controller) jump() *tcell.EventKey {
 	inp := c.view.NewJump()
 	inp.SetDoneFunc(func(key tcell.Key) {
@@ -794,7 +973,7 @@ func (c *Controller) jump() *tcell.EventKey {
 		}
 
 		if pos := findIndex(base, ordered); pos >= 0 {
-			c.view.List.SetCurrentItem(pos + 1) // +1 for [..]
+			c.view.List.SetCurrentItem(pos + 1) // for [..]
 			i := c.view.List.GetCurrentItem()
 			_, mk := c.view.List.GetItemText(i)
 			c.fillDetails(strings.TrimSpace(mk))
@@ -810,7 +989,6 @@ func (c *Controller) jump() *tcell.EventKey {
 
 		c.error("Not found", fmt.Errorf("%s", target), false)
 	})
-
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
 	return nil
 }
