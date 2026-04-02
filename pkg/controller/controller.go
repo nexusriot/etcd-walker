@@ -51,7 +51,7 @@ func NewController(host, port string, debug bool, protocol, username, password s
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.3.5 (on %s:%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.4.0 (on %s:%s)  –  protocol: %s  |  Auth: %s",
 			host, port, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
