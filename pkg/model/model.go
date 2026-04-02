@@ -50,6 +50,7 @@ func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(
 func (m *Model) Del(key string) error                  { return m.backend.del(key) }
 func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
 func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.renameDir(oldDir, newDir) }
+func (m *Model) RenameKey(oldKey, newKey string) error { return m.backend.renameKey(oldKey, newKey) }
 
 type backend interface {
 	proto() string
@@ -60,6 +61,7 @@ type backend interface {
 	del(key string) error
 	deldir(key string) error
 	renameDir(oldDir, newDir string) error
+	renameKey(oldKey, newKey string) error
 	authStatus() (enabled bool, known bool, err error)
 }
 
@@ -322,12 +324,32 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 	}
 
 	for _, kv := range resp.Kvs {
-		newKey := strings.Replace(string(kv.Key), oldPfx, newPfx, 1)
+		newKey := newPfx + strings.TrimPrefix(string(kv.Key), oldPfx)
 		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
 			return err
 		}
 	}
 	_, err = b.cli.Delete(ctx, oldPfx, clientv3.WithPrefix())
+	return err
+}
+
+func (b *v3Backend) renameKey(oldKey, newKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	old := normPath(oldKey)
+	resp, err := b.cli.Get(ctx, old)
+	if err != nil {
+		return err
+	}
+	if resp.Count == 0 {
+		return fmt.Errorf("key not found: %s", old)
+	}
+	value := string(resp.Kvs[0].Value)
+	if _, err := b.cli.Put(ctx, normPath(newKey), value); err != nil {
+		return err
+	}
+	_, err = b.cli.Delete(ctx, old)
 	return err
 }
 
@@ -442,21 +464,53 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 		return err
 	}
 
-	for _, n := range resp.Node.Nodes {
-		newKey := strings.Replace(n.Key, oldDir, newDir, 1)
-		if n.Dir {
-			_, err = b.api.Set(context.Background(), newKey, "",
-				&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
-		} else {
-			_, err = b.api.Set(context.Background(), newKey, n.Value, nil)
-		}
-		if err != nil {
-			return err
-		}
+	// Always create the target directory explicitly first.
+	// Without this an empty source directory would simply vanish after the
+	// delete below because v2CopyNodes would never touch newDir at all.
+	if _, err := b.api.Set(context.Background(), newDir, "",
+		&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
+		return err
+	}
+
+	if err := b.v2CopyNodes(resp.Node.Nodes, oldDir, newDir); err != nil {
+		return err
 	}
 
 	_, err = b.api.Delete(context.Background(), oldDir,
 		&clientv2.DeleteOptions{Dir: true, Recursive: true})
+	return err
+}
+
+// v2CopyNodes recursively copies nodes from oldDir prefix to newDir prefix.
+func (b *v2Backend) v2CopyNodes(nodes clientv2.Nodes, oldDir, newDir string) error {
+	for _, n := range nodes {
+		newKey := newDir + strings.TrimPrefix(n.Key, oldDir)
+		if n.Dir {
+			if _, err := b.api.Set(context.Background(), newKey, "",
+				&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
+				return err
+			}
+			if err := b.v2CopyNodes(n.Nodes, oldDir, newDir); err != nil {
+				return err
+			}
+		} else {
+			if _, err := b.api.Set(context.Background(), newKey, n.Value, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (b *v2Backend) renameKey(oldKey, newKey string) error {
+	resp, err := b.api.Get(context.Background(), normPath(oldKey), nil)
+	if err != nil {
+		return err
+	}
+	if _, err := b.api.Set(context.Background(), normPath(newKey), resp.Node.Value, nil); err != nil {
+		return err
+	}
+	_, err = b.api.Delete(context.Background(), normPath(oldKey), nil)
 	return err
 }
 
