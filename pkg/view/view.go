@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -152,10 +152,11 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Enter         Open dir / select
 		  Backspace     Up ([..])
 		[::b]Actions[::-]
-		  Ctrl+N        Create node
-		  Ctrl+E        Edit (value multiline/ rename dir)
+		  Ctrl+N        Create node or directory
+		  Ctrl+E        Edit value (multiline) / rename dir
+		  Ctrl+R        Rename key or directory
 		  Del           Delete (recursive for dirs)
-		  Ctrl+J        Jump to key/dir(dir ends with '/')
+		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)
 		  Ctrl+Y        Copy key value
 		[::b]Search[::-]
@@ -166,7 +167,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		[::b]Misc[::-]
 		  Ctrl+H        This help
 		  Ctrl+Q        Quit
-		
+
 		[dim]Press any key to close.[-]
 	`
 	tv := tview.NewTextView()

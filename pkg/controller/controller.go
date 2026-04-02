@@ -499,6 +499,8 @@ func (c *Controller) setInput() {
 			return c.delete()
 		case tcell.KeyCtrlE:
 			return c.editMultiline()
+		case tcell.KeyCtrlR:
+			return c.rename()
 		case tcell.KeyCtrlP:
 			return c.copyPath()
 		case tcell.KeyCtrlY:
@@ -819,6 +821,76 @@ func (c *Controller) edit() *tcell.EventKey {
 	return nil
 }
 
+func (c *Controller) rename() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+	if mapKey == ".." {
+		return nil
+	}
+	val, ok := c.currentNodes[mapKey]
+	if !ok {
+		return nil
+	}
+
+	fs := strings.FieldsFunc(val.node.Name, splitFunc)
+	curBase := fs[len(fs)-1]
+
+	title := fmt.Sprintf("Rename key: %s", val.node.Name)
+	if val.node.IsDir {
+		title = fmt.Sprintf("Rename folder: %s", val.node.Name)
+	}
+
+	renameForm := c.view.NewEditValueForm(title, curBase)
+	renameForm.AddButton("Save", func() {
+		newName := strings.TrimSpace(renameForm.GetFormItem(0).(*tview.InputField).GetText())
+		if newName == "" || strings.Contains(newName, "/") {
+			c.view.Pages.RemovePage("modal")
+			c.error("Invalid name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
+			return
+		}
+		oldPath := val.node.Name
+		newPath := normAbs(c.currentDir + newName)
+		if newPath == oldPath {
+			c.view.Pages.RemovePage("modal")
+			return
+		}
+		var err error
+		if val.node.IsDir {
+			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
+			err = c.model.RenameDir(oldPath, newPath)
+		} else {
+			log.Debugf("Renaming key: %s -> %s", oldPath, newPath)
+			err = c.model.RenameKey(oldPath, newPath)
+		}
+		if err != nil {
+			c.view.Pages.RemovePage("modal")
+			c.error("Failed to rename", err, false)
+			return
+		}
+		// Update injected cache if underscore-prefixed names are involved
+		if strings.HasPrefix(curBase, "_") || strings.HasPrefix(newName, "_") {
+			c.reinjectRename(oldPath, newPath, val.node.IsDir, val.node.ClusterId, val.node.Value)
+		}
+		ordered := c.updateList()
+		target := newName
+		if val.node.IsDir {
+			target = newName + "/"
+		}
+		pos := c.getPosition(target, ordered) + 1
+		c.view.Pages.RemovePage("modal")
+		c.view.List.SetCurrentItem(pos)
+	})
+	renameForm.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(renameForm, 60, 7), true, true)
+	return nil
+}
+
 func (c *Controller) editMultiline() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -888,7 +960,7 @@ func (c *Controller) error(header string, err error, fatal bool) {
 			c.view.App.Stop()
 		}
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 60, 7), true, true)
 }
 
 func valueStats(v string) (bytes int, lines int, printable bool) {
