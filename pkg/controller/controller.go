@@ -412,6 +412,14 @@ func (c *Controller) info(header, details string) {
 	c.view.Pages.AddPage("modal-info", c.view.ModalEdit(m, 60, 7), true, true)
 }
 
+func (c *Controller) copied(header, details string) {
+	m := c.view.NewCopiedMessageQ(header, details)
+	m.SetDoneFunc(func(int, string) {
+		c.view.Pages.RemovePage("modal-info")
+	})
+	c.view.Pages.AddPage("modal-info", c.view.ModalEdit(m, 60, 7), true, true)
+}
+
 func (c *Controller) copyPath() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -426,7 +434,7 @@ func (c *Controller) copyPath() *tcell.EventKey {
 			c.error("Clipboard error", err, false)
 			return nil
 		}
-		c.info("Copied", "Directory path copied")
+		c.copied("Copied", "Directory path copied")
 		return nil
 	}
 
@@ -449,9 +457,9 @@ func (c *Controller) copyPath() *tcell.EventKey {
 	}
 
 	if val.node.IsDir {
-		c.info("Copied", "Directory path copied")
+		c.copied("Copied", "Directory path copied")
 	} else {
-		c.info("Copied", "Key path copied")
+		c.copied("Copied", "Key path copied")
 	}
 	return nil
 }
@@ -481,7 +489,7 @@ func (c *Controller) copyValue() *tcell.EventKey {
 		c.error("Clipboard error", err, false)
 		return nil
 	}
-	c.info("Copied", "Key value copied")
+	c.copied("Copied", "Key value copied")
 	return nil
 }
 
@@ -977,7 +985,11 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 // export prompts for a filename and writes all non-directory keys in the
 // current directory to a JSON file as {"key": "value", ...}.
 func (c *Controller) export() *tcell.EventKey {
-	inp := c.view.NewExportInput(c.currentDir)
+	defaultPath := "export.json"
+	if home, err := os.UserHomeDir(); err == nil {
+		defaultPath = home + "/export.json"
+	}
+	inp := c.view.NewExportInput(c.currentDir, defaultPath)
 	inp.SetDoneFunc(func(key tcell.Key) {
 		defer c.view.Pages.RemovePage("modal")
 		if key != tcell.KeyEnter {
@@ -988,17 +1000,10 @@ func (c *Controller) export() *tcell.EventKey {
 			return
 		}
 
-		nodes, err := c.model.Ls(c.currentDir)
+		data, err := c.model.Export(c.currentDir)
 		if err != nil {
 			c.error("Export failed", err, false)
 			return
-		}
-
-		data := make(map[string]string)
-		for _, n := range nodes {
-			if !n.IsDir {
-				data[n.Name] = n.Value
-			}
 		}
 
 		raw, err := json.MarshalIndent(data, "", "  ")
@@ -1007,7 +1012,7 @@ func (c *Controller) export() *tcell.EventKey {
 			return
 		}
 		if err := os.WriteFile(filename, raw, 0o600); err != nil {
-			c.error("Export failed", err, false)
+			c.error("Cannot write file", fmt.Errorf("%s: %w", filename, err), false)
 			return
 		}
 		c.info("Exported", fmt.Sprintf("Saved %d keys to %s", len(data), filename))

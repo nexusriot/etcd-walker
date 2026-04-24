@@ -64,6 +64,7 @@ func (m *Model) Del(key string) error                  { return m.backend.del(ke
 func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
 func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.renameDir(oldDir, newDir) }
 func (m *Model) RenameKey(oldKey, newKey string) error { return m.backend.renameKey(oldKey, newKey) }
+func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir) }
 
 type backend interface {
 	proto() string
@@ -76,6 +77,7 @@ type backend interface {
 	renameDir(oldDir, newDir string) error
 	renameKey(oldKey, newKey string) error
 	authStatus() (enabled bool, known bool, err error)
+	export(dir string) (map[string]string, error)
 }
 
 func NewModel(opts Options) (*Model, error) {
@@ -406,6 +408,32 @@ func (b *v3Backend) renameKey(oldKey, newKey string) error {
 	return err
 }
 
+func (b *v3Backend) export(dir string) (map[string]string, error) {
+	timeout := b.timeout * 10
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	prefix := withTrail(dir)
+	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		// skip the synthetic directory marker key (.dir)
+		if strings.HasSuffix(key, "/"+dirMarker) {
+			continue
+		}
+		result[key] = string(kv.Value)
+	}
+	return result, nil
+}
+
 func (b *v3Backend) authStatus() (bool, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -584,6 +612,36 @@ func (b *v2Backend) renameKey(oldKey, newKey string) error {
 	}
 	_, err = b.api.Delete(ctx, normPath(oldKey), nil)
 	return err
+}
+
+func (b *v2Backend) export(dir string) (map[string]string, error) {
+	timeout := b.timeout * 10
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	resp, err := b.api.Get(ctx, normPath(dir), &clientv2.GetOptions{Recursive: true})
+	if err != nil {
+		if clientv2.IsKeyNotFound(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	result := make(map[string]string)
+	v2collectKeys(resp.Node.Nodes, result)
+	return result, nil
+}
+
+func v2collectKeys(nodes clientv2.Nodes, result map[string]string) {
+	for _, n := range nodes {
+		if n.Dir {
+			v2collectKeys(n.Nodes, result)
+		} else {
+			result[n.Key] = n.Value
+		}
+	}
 }
 
 func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {

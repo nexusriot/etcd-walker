@@ -97,10 +97,18 @@ func (v *View) NewCreateForm(header string) *tview.Form {
 }
 
 func (v *View) NewInfoMessageQ(header string, details string) *tview.Modal {
+	return v.NewInfoModal(header, details, "ok")
+}
+
+func (v *View) NewCopiedMessageQ(header string, details string) *tview.Modal {
+	return v.NewInfoModal(header, details, "copied")
+}
+
+func (v *View) NewInfoModal(header, details, button string) *tview.Modal {
 	infoQ := tview.NewModal()
 	infoQ.SetText(header + ": " + details).
 		SetBackgroundColor(tcell.ColorDarkGreen).
-		AddButtons([]string{"copied"})
+		AddButtons([]string{button})
 	return infoQ
 }
 
@@ -182,9 +190,9 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 	return tv
 }
 
-func (v *View) NewExportInput(dir string) *tview.InputField {
+func (v *View) NewExportInput(dir, defaultPath string) *tview.InputField {
 	inp := tview.NewInputField().
-		SetPlaceholder("e.g. /tmp/export.json")
+		SetText(defaultPath)
 	inp.SetBorder(true).SetTitle(fmt.Sprintf(" Export %q keys to JSON file ", dir))
 	return inp
 }
