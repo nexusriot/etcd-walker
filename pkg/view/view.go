@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+W][::-]Export [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -159,6 +159,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)
 		  Ctrl+Y        Copy key value
+		  Ctrl+W        Export current dir keys to JSON file
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		[::b]Editor[::-]
@@ -179,6 +180,13 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 	tv.SetTitle(" Hotkeys ")
 
 	return tv
+}
+
+func (v *View) NewExportInput(dir string) *tview.InputField {
+	inp := tview.NewInputField().
+		SetPlaceholder("e.g. /tmp/export.json")
+	inp.SetBorder(true).SetTitle(fmt.Sprintf(" Export %q keys to JSON file ", dir))
+	return inp
 }
 
 func (v *View) NewMultilineEditor(title, initial string) *tview.TextArea {

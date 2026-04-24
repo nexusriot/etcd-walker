@@ -2,7 +2,10 @@ package model
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -33,6 +36,16 @@ type Options struct {
 	Protocol string // v2, v3, auto
 	Username string
 	Password string
+
+	// TLS (v3 only)
+	TLSEnabled    bool
+	TLSCAFile     string
+	TLSCertFile   string
+	TLSKeyFile    string
+	TLSSkipVerify bool
+
+	// TimeoutSeconds for etcd operations; 0 defaults to 5s
+	TimeoutSeconds int
 }
 
 func (m *Model) ProtocolVersion() string { return m.backend.proto() }
@@ -74,7 +87,7 @@ func NewModel(opts Options) (*Model, error) {
 	switch strings.ToLower(strings.TrimSpace(opts.Protocol)) {
 
 	case "v3":
-		b3, err := newV3Backend(host, port, opts.Username, opts.Password)
+		b3, err := newV3Backend(opts)
 		if err != nil {
 			return nil, fmt.Errorf("v3 init failed: %w", err)
 		}
@@ -94,14 +107,14 @@ func NewModel(opts Options) (*Model, error) {
 		return &Model{backend: b3, authLabel: label}, nil
 
 	case "auto":
-		if b3, err := newV3Backend(host, port, opts.Username, opts.Password); err == nil {
+		if b3, err := newV3Backend(opts); err == nil {
 			if _, err := b3.ls("/"); err == nil {
 				return &Model{backend: b3}, nil
 			} else if isAuthRequiredErr(err) {
 				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
-		if b2, err := newV2Backend(host, port, opts.Username, opts.Password); err == nil {
+		if b2, err := newV2Backend(opts); err == nil {
 			if _, err := b2.ls("/"); err == nil {
 				return &Model{backend: b2}, nil
 			} else if isAuthRequiredErr(err) {
@@ -112,7 +125,7 @@ func NewModel(opts Options) (*Model, error) {
 		return nil, fmt.Errorf("auto: neither v3 nor v2 reachable at %s:%s", host, port)
 
 	default: // v2
-		b2, err := newV2Backend(host, port, opts.Username, opts.Password)
+		b2, err := newV2Backend(opts)
 		if err != nil {
 			return nil, fmt.Errorf("v2 init failed: %w", err)
 		}
@@ -124,8 +137,9 @@ func NewModel(opts Options) (*Model, error) {
 }
 
 type v3Backend struct {
-	cli clientv3.KV
-	c   *clientv3.Client
+	cli     clientv3.KV
+	c       *clientv3.Client
+	timeout time.Duration
 }
 
 func isAuthRequiredErr(err error) bool {
@@ -138,22 +152,57 @@ func isAuthRequiredErr(err error) bool {
 		strings.Contains(s, "permission denied")
 }
 
-func newV3Backend(host, port, username, password string) (*v3Backend, error) {
-	cfg := clientv3.Config{
-		Endpoints:   []string{fmt.Sprintf("http://%s:%s", host, port)},
-		DialTimeout: 5 * time.Second,
-		Logger:      zap.NewNop(),
+func newV3Backend(opts Options) (*v3Backend, error) {
+	timeout := time.Duration(opts.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
 	}
-	if username != "" {
-		cfg.Username = username
-		cfg.Password = password
+
+	scheme := "http"
+	var tlsCfg *tls.Config
+
+	if opts.TLSEnabled {
+		scheme = "https"
+		// #nosec G402 — InsecureSkipVerify is an explicit opt-in via config
+		tlsCfg = &tls.Config{InsecureSkipVerify: opts.TLSSkipVerify} //nolint:gosec
+
+		if opts.TLSCAFile != "" {
+			caCert, err := os.ReadFile(opts.TLSCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("read TLS CA file: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("invalid TLS CA cert in %s", opts.TLSCAFile)
+			}
+			tlsCfg.RootCAs = pool
+		}
+
+		if opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
+			cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("load TLS client keypair: %w", err)
+			}
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		}
+	}
+
+	cfg := clientv3.Config{
+		Endpoints:   []string{fmt.Sprintf("%s://%s:%s", scheme, opts.Host, opts.Port)},
+		DialTimeout: timeout,
+		Logger:      zap.NewNop(),
+		TLS:         tlsCfg,
+	}
+	if opts.Username != "" {
+		cfg.Username = opts.Username
+		cfg.Password = opts.Password
 	}
 
 	c, err := clientv3.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &v3Backend{cli: clientv3.NewKV(c), c: c}, nil
+	return &v3Backend{cli: clientv3.NewKV(c), c: c, timeout: timeout}, nil
 }
 
 func (b *v3Backend) proto() string { return "v3" }
@@ -182,7 +231,7 @@ func withTrail(p string) string {
 }
 
 func (b *v3Backend) ls(directory string) ([]*Node, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 
 	prefix := withTrail(directory)
@@ -247,7 +296,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 }
 
 func (b *v3Backend) get(key string) (*Node, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 
 	k := normPath(key)
@@ -283,14 +332,14 @@ func (b *v3Backend) get(key string) (*Node, error) {
 }
 
 func (b *v3Backend) set(key, value string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	_, err := b.cli.Put(ctx, normPath(key), value)
 	return err
 }
 
 func (b *v3Backend) mkdir(directory string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	dir := normPath(directory)
 	_, err := b.cli.Put(ctx, dir+"/"+dirMarker, "")
@@ -298,21 +347,25 @@ func (b *v3Backend) mkdir(directory string) error {
 }
 
 func (b *v3Backend) del(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	_, err := b.cli.Delete(ctx, normPath(key))
 	return err
 }
 
 func (b *v3Backend) deldir(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
 	defer cancel()
 	_, err := b.cli.Delete(ctx, withTrail(key), clientv3.WithPrefix())
 	return err
 }
 
 func (b *v3Backend) renameDir(oldDir, newDir string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	timeout := b.timeout * 4
+	if timeout < 20*time.Second {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	oldPfx := withTrail(oldDir)
@@ -334,7 +387,7 @@ func (b *v3Backend) renameDir(oldDir, newDir string) error {
 }
 
 func (b *v3Backend) renameKey(oldKey, newKey string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
 	defer cancel()
 
 	old := normPath(oldKey)
@@ -357,51 +410,53 @@ func (b *v3Backend) authStatus() (bool, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err := b.c.Auth.AuthStatus(ctx)
+	resp, err := b.c.Auth.AuthStatus(ctx)
 	if err == nil {
-		// If it succeeded, auth is enabled (and we are authenticated or auth is on).
-		return true, true, nil
+		return resp.Enabled, true, nil
 	}
 
 	s := err.Error()
-
-	// Different etcd builds phrase this slightly differently; keep it tolerant.
-	if strings.Contains(strings.ToLower(s), "auth") && strings.Contains(strings.ToLower(s), "not enabled") {
-		return false, true, nil
-	}
+	// If the server rejected the call due to auth, auth must be enabled.
 	if strings.Contains(strings.ToLower(s), "permission denied") ||
 		strings.Contains(strings.ToLower(s), "unauthorized") {
 		return true, true, nil
 	}
-	// unknown
 	return false, false, err
 }
 
 type v2Backend struct {
-	api    clientv2.KeysAPI
-	client clientv2.Client
+	api     clientv2.KeysAPI
+	client  clientv2.Client
+	timeout time.Duration
 }
 
-func newV2Backend(host, port, username, password string) (*v2Backend, error) {
-	cfg := clientv2.Config{
-		Endpoints: []string{fmt.Sprintf("http://%s:%s", host, port)},
+func newV2Backend(opts Options) (*v2Backend, error) {
+	timeout := time.Duration(opts.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
 	}
-	if username != "" {
-		cfg.Username = username
-		cfg.Password = password
+
+	cfg := clientv2.Config{
+		Endpoints: []string{fmt.Sprintf("http://%s:%s", opts.Host, opts.Port)},
+	}
+	if opts.Username != "" {
+		cfg.Username = opts.Username
+		cfg.Password = opts.Password
 	}
 
 	cli, err := clientv2.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &v2Backend{api: clientv2.NewKeysAPI(cli), client: cli}, nil
+	return &v2Backend{api: clientv2.NewKeysAPI(cli), client: cli, timeout: timeout}, nil
 }
 
 func (b *v2Backend) proto() string { return "v2" }
 
 func (b *v2Backend) ls(directory string) ([]*Node, error) {
-	resp, err := b.api.Get(context.Background(), directory,
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	resp, err := b.api.Get(ctx, directory,
 		&clientv2.GetOptions{Sort: true, Recursive: false})
 	if err != nil {
 		if clientv2.IsKeyNotFound(err) {
@@ -423,7 +478,9 @@ func (b *v2Backend) ls(directory string) ([]*Node, error) {
 }
 
 func (b *v2Backend) get(key string) (*Node, error) {
-	resp, err := b.api.Get(context.Background(), normPath(key), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	resp, err := b.api.Get(ctx, normPath(key), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -436,30 +493,44 @@ func (b *v2Backend) get(key string) (*Node, error) {
 }
 
 func (b *v2Backend) set(key, value string) error {
-	_, err := b.api.Set(context.Background(), normPath(key), value, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	_, err := b.api.Set(ctx, normPath(key), value, nil)
 	return err
 }
 
 func (b *v2Backend) mkdir(directory string) error {
-	_, err := b.api.Set(context.Background(), normPath(directory), "",
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	_, err := b.api.Set(ctx, normPath(directory), "",
 		&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore})
 	return err
 }
 
 func (b *v2Backend) del(key string) error {
-	_, err := b.api.Delete(context.Background(), normPath(key), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	_, err := b.api.Delete(ctx, normPath(key), nil)
 	return err
 }
 
 func (b *v2Backend) deldir(key string) error {
-	_, err := b.api.Delete(context.Background(), normPath(key),
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
+	defer cancel()
+	_, err := b.api.Delete(ctx, normPath(key),
 		&clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
 }
 
 func (b *v2Backend) renameDir(oldDir, newDir string) error {
-	resp, err := b.api.Get(context.Background(), oldDir,
-		&clientv2.GetOptions{Recursive: true})
+	timeout := b.timeout * 4
+	if timeout < 20*time.Second {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	resp, err := b.api.Get(ctx, oldDir, &clientv2.GetOptions{Recursive: true})
 	if err != nil {
 		return err
 	}
@@ -467,34 +538,33 @@ func (b *v2Backend) renameDir(oldDir, newDir string) error {
 	// Always create the target directory explicitly first.
 	// Without this an empty source directory would simply vanish after the
 	// delete below because v2CopyNodes would never touch newDir at all.
-	if _, err := b.api.Set(context.Background(), newDir, "",
+	if _, err := b.api.Set(ctx, newDir, "",
 		&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
 		return err
 	}
 
-	if err := b.v2CopyNodes(resp.Node.Nodes, oldDir, newDir); err != nil {
+	if err := b.v2CopyNodes(ctx, resp.Node.Nodes, oldDir, newDir); err != nil {
 		return err
 	}
 
-	_, err = b.api.Delete(context.Background(), oldDir,
-		&clientv2.DeleteOptions{Dir: true, Recursive: true})
+	_, err = b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
 }
 
 // v2CopyNodes recursively copies nodes from oldDir prefix to newDir prefix.
-func (b *v2Backend) v2CopyNodes(nodes clientv2.Nodes, oldDir, newDir string) error {
+func (b *v2Backend) v2CopyNodes(ctx context.Context, nodes clientv2.Nodes, oldDir, newDir string) error {
 	for _, n := range nodes {
 		newKey := newDir + strings.TrimPrefix(n.Key, oldDir)
 		if n.Dir {
-			if _, err := b.api.Set(context.Background(), newKey, "",
+			if _, err := b.api.Set(ctx, newKey, "",
 				&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
 				return err
 			}
-			if err := b.v2CopyNodes(n.Nodes, oldDir, newDir); err != nil {
+			if err := b.v2CopyNodes(ctx, n.Nodes, oldDir, newDir); err != nil {
 				return err
 			}
 		} else {
-			if _, err := b.api.Set(context.Background(), newKey, n.Value, nil); err != nil {
+			if _, err := b.api.Set(ctx, newKey, n.Value, nil); err != nil {
 				return err
 			}
 		}
@@ -503,14 +573,16 @@ func (b *v2Backend) v2CopyNodes(nodes clientv2.Nodes, oldDir, newDir string) err
 }
 
 func (b *v2Backend) renameKey(oldKey, newKey string) error {
-	resp, err := b.api.Get(context.Background(), normPath(oldKey), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
+	defer cancel()
+	resp, err := b.api.Get(ctx, normPath(oldKey), nil)
 	if err != nil {
 		return err
 	}
-	if _, err := b.api.Set(context.Background(), normPath(newKey), resp.Node.Value, nil); err != nil {
+	if _, err := b.api.Set(ctx, normPath(newKey), resp.Node.Value, nil); err != nil {
 		return err
 	}
-	_, err = b.api.Delete(context.Background(), normPath(oldKey), nil)
+	_, err = b.api.Delete(ctx, normPath(oldKey), nil)
 	return err
 }
 
@@ -525,7 +597,11 @@ func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {
 	}
 	api := clientv2.NewKeysAPI(cli)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	timeout := b.timeout
+	if timeout > 3*time.Second {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	_, err = api.Get(ctx, "/", nil)

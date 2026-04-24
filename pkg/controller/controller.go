@@ -3,8 +3,10 @@ package controller
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -35,24 +37,26 @@ type Node struct {
 
 func splitFunc(r rune) bool { return r == '/' }
 
-func NewController(host, port string, debug bool, protocol, username, password string) *Controller {
-	m, err := model.NewModel(model.Options{
-		Host: host, Port: port, Protocol: protocol,
-		Username: username, Password: password,
-	})
+func NewController(opts model.Options, debug bool) *Controller {
+	m, err := model.NewModel(opts)
 
 	v := view.NewView()
 
-	headerProto := protocol
+	headerProto := opts.Protocol
 	auth := "?"
 	if err == nil && m != nil {
 		headerProto = m.ProtocolVersion()
 		auth = m.AuthLabel()
 	}
 
+	tlsTag := ""
+	if opts.TLSEnabled {
+		tlsTag = " [TLS]"
+	}
+
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.4.0 (on %s:%s)  –  protocol: %s  |  Auth: %s",
-			host, port, headerProto, auth),
+		fmt.Sprintf("Etcd-walker v.0.4.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
@@ -509,6 +513,8 @@ func (c *Controller) setInput() {
 			return c.search()
 		case tcell.KeyCtrlJ:
 			return c.jump()
+		case tcell.KeyCtrlW:
+			return c.export()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
 
@@ -699,9 +705,14 @@ func (c *Controller) create() *tcell.EventKey {
 	var err error
 	createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
 	createForm.AddButton("Save", func() {
-		node := createForm.GetFormItem(0).(*tview.InputField).GetText()
+		node := strings.TrimSpace(createForm.GetFormItem(0).(*tview.InputField).GetText())
 		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
 		isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
+		if node == "" || strings.Contains(node, "/") {
+			c.view.Pages.RemovePage("modal")
+			c.error("Invalid name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
+			return
+		}
 		if node != "" {
 			log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
 			full := normAbs(c.currentDir + node)
@@ -797,6 +808,11 @@ func (c *Controller) edit() *tcell.EventKey {
 				c.view.Pages.RemovePage("modal")
 				return
 			}
+			if nd, err2 := c.model.Get(newPath); err2 == nil && nd != nil {
+				c.view.Pages.RemovePage("modal")
+				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
+				return
+			}
 			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
 			err = c.model.RenameDir(oldPath, newPath)
 			if err != nil {
@@ -856,6 +872,12 @@ func (c *Controller) rename() *tcell.EventKey {
 		newPath := normAbs(c.currentDir + newName)
 		if newPath == oldPath {
 			c.view.Pages.RemovePage("modal")
+			return
+		}
+		// Refuse to overwrite an existing key or directory silently.
+		if nd, err := c.model.Get(newPath); err == nil && nd != nil {
+			c.view.Pages.RemovePage("modal")
+			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
 			return
 		}
 		var err error
@@ -949,6 +971,48 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 	})
 
 	c.view.OpenEditor(ta)
+	return nil
+}
+
+// export prompts for a filename and writes all non-directory keys in the
+// current directory to a JSON file as {"key": "value", ...}.
+func (c *Controller) export() *tcell.EventKey {
+	inp := c.view.NewExportInput(c.currentDir)
+	inp.SetDoneFunc(func(key tcell.Key) {
+		defer c.view.Pages.RemovePage("modal")
+		if key != tcell.KeyEnter {
+			return
+		}
+		filename := strings.TrimSpace(inp.GetText())
+		if filename == "" {
+			return
+		}
+
+		nodes, err := c.model.Ls(c.currentDir)
+		if err != nil {
+			c.error("Export failed", err, false)
+			return
+		}
+
+		data := make(map[string]string)
+		for _, n := range nodes {
+			if !n.IsDir {
+				data[n.Name] = n.Value
+			}
+		}
+
+		raw, err := json.MarshalIndent(data, "", "  ")
+		if err != nil {
+			c.error("Export failed", err, false)
+			return
+		}
+		if err := os.WriteFile(filename, raw, 0o600); err != nil {
+			c.error("Export failed", err, false)
+			return
+		}
+		c.info("Exported", fmt.Sprintf("Saved %d keys to %s", len(data), filename))
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
 	return nil
 }
 

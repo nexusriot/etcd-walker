@@ -18,8 +18,18 @@ type Config struct {
 	Port     string `json:"port"`
 	Protocol string `json:"protocol"` // "v2", "v3", "auto"
 	Debug    bool   `json:"debug"`
-	Username string `json:"username" yaml:"username"`
-	Password string `json:"password" yaml:"password"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+
+	// TLS options (v3 only)
+	TLSEnabled    bool   `json:"tls_enabled"`
+	TLSCAFile     string `json:"tls_ca_file"`
+	TLSCertFile   string `json:"tls_cert_file"`
+	TLSKeyFile    string `json:"tls_key_file"`
+	TLSSkipVerify bool   `json:"tls_skip_verify"`
+
+	// TimeoutSeconds for etcd operations (0 = default 5s)
+	TimeoutSeconds int `json:"timeout_seconds"`
 }
 
 // Load tries to read and unmarshal config from the given path.
