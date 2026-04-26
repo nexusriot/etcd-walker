@@ -221,6 +221,12 @@ ldd etcd-walker
 GOOS=linux GOARCH=386 go build -o etcd-walker_linux_i686 ./cmd/etcd-walker
 ```
 
+FreeBSD build:
+
+```bash
+GOOS=freebsd GOARCH=amd64 go build -o etcd-walker_freebsd_x86_64 ./cmd/etcd-walker```
+```
+
 #### Building a `.deb` package
 
 Install the build dependencies once:
