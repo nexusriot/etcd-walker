@@ -531,7 +531,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 25), true, true)
 			return nil
 
 		case tcell.KeyBackspace2:
