@@ -23,6 +23,8 @@ Grab the latest pre-built binaries / `.deb` packages here:
 - Jump to an absolute or relative path (`Ctrl+J`)
 - Multi-line editor for large key values (`Ctrl+E`)
 - Export the current directory to JSON (`Ctrl+W`)
+- Import keys from a JSON file via a built-in filesystem browser, with
+  overwrite / skip-existing modes (`Ctrl+O`)
 - Copy a key path or value to the system clipboard, with OSC52 fallback
   for SSH / tmux sessions (`Ctrl+P`, `Ctrl+Y`)
 - Etcd v2 and v3 support, plus an `auto` mode that probes v3 first and
@@ -48,6 +50,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+S` or `/` | Quick search inside the current level        |
 | `Ctrl+J`        | Jump to absolute or relative path            |
 | `Ctrl+W`        | Export current directory to a JSON file      |
+| `Ctrl+O`        | Import keys from a JSON file (file browser)   |
 | `Ctrl+P`        | Copy current path to clipboard               |
 | `Ctrl+Y`        | Copy current key value to clipboard          |
 | `Ctrl+H`        | Show in-app hotkeys help                     |

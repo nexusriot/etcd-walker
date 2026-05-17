@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -55,7 +56,7 @@ func NewController(opts model.Options, debug bool) *Controller {
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.5.1 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.6.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
 			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
@@ -523,6 +524,8 @@ func (c *Controller) setInput() {
 			return c.jump()
 		case tcell.KeyCtrlW:
 			return c.export()
+		case tcell.KeyCtrlO:
+			return c.importJSON()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
 
@@ -531,7 +534,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 25), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 27), true, true)
 			return nil
 
 		case tcell.KeyBackspace2:
@@ -1019,6 +1022,133 @@ func (c *Controller) export() *tcell.EventKey {
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
 	return nil
+}
+
+// resolveImportKey turns a key from an imported file into an absolute etcd
+// path. Absolute keys (leading '/') are used as-is; relative keys are joined
+// onto the current directory.
+func (c *Controller) resolveImportKey(k string) string {
+	k = strings.TrimSpace(k)
+	if strings.HasPrefix(k, "/") {
+		return normAbs(k)
+	}
+	cur := normAbs(c.currentDir)
+	if cur == "/" {
+		return normAbs("/" + k)
+	}
+	return normAbs(cur + "/" + k)
+}
+
+// importJSON opens a small filesystem browser to pick a JSON file.
+func (c *Controller) importJSON() *tcell.EventKey {
+	start, err := os.UserHomeDir()
+	if err != nil || start == "" {
+		start = "/"
+	}
+
+	browser := c.view.NewFileBrowser(" Select JSON file ")
+
+	var render func(dir string)
+	render = func(dir string) {
+		dir = filepath.Clean(dir)
+		entries, rerr := os.ReadDir(dir)
+		if rerr != nil {
+			c.view.Pages.RemovePage("modal")
+			c.error("Cannot open directory", fmt.Errorf("%s: %w", dir, rerr), false)
+			return
+		}
+		browser.Clear()
+		browser.SetTitle(fmt.Sprintf(" Select JSON file — %s ", dir))
+
+		parent := filepath.Dir(dir)
+		browser.AddItem("[..]", parent, 0, func() { render(parent) })
+
+		type ent struct {
+			name string
+			path string
+		}
+		var dirs, files []ent
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			if e.IsDir() {
+				dirs = append(dirs, ent{name, full})
+			} else if strings.HasSuffix(strings.ToLower(name), ".json") {
+				files = append(files, ent{name, full})
+			}
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].name < dirs[j].name })
+		sort.Slice(files, func(i, j int) bool { return files[i].name < files[j].name })
+
+		for _, d := range dirs {
+			p := d.path
+			browser.AddItem("📁 "+d.name+"/", p, 0, func() { render(p) })
+		}
+		for _, f := range files {
+			p := f.path
+			browser.AddItem("   "+f.name, p, 0, func() { c.promptImportMode(p) })
+		}
+	}
+
+	browser.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if ev.Key() == tcell.KeyEsc {
+			c.view.Pages.RemovePage("modal")
+			return nil
+		}
+		return ev
+	})
+
+	render(start)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(browser, 70, 20), true, true)
+	return nil
+}
+
+// promptImportMode parses the chosen file and asks how to treat existing keys.
+func (c *Controller) promptImportMode(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.view.Pages.RemovePage("modal")
+		c.error("Cannot read file", fmt.Errorf("%s: %w", path, err), false)
+		return
+	}
+	var items map[string]string
+	if err := json.Unmarshal(data, &items); err != nil {
+		c.view.Pages.RemovePage("modal")
+		c.error("Invalid JSON", fmt.Errorf("%s: %w", filepath.Base(path), err), false)
+		return
+	}
+	if len(items) == 0 {
+		c.view.Pages.RemovePage("modal")
+		c.info("Import", "No keys found in file")
+		return
+	}
+
+	q := c.view.NewImportModeQ(fmt.Sprintf("Import %d keys from %s into %s ?",
+		len(items), filepath.Base(path), c.currentDir))
+	q.SetDoneFunc(func(_ int, label string) {
+		if label == "" || label == "cancel" {
+			c.view.Pages.RemovePage("modal")
+			return
+		}
+		overwrite := label == "overwrite"
+		resolved := make(map[string]string, len(items))
+		for k, val := range items {
+			resolved[c.resolveImportKey(k)] = val
+		}
+		written, skipped, ierr := c.model.Import(resolved, overwrite)
+		c.view.Pages.RemovePage("modal")
+		if ierr != nil {
+			c.error("Import failed", ierr, false)
+			return
+		}
+		c.updateList()
+		c.info("Imported", fmt.Sprintf("%d written, %d skipped", written, skipped))
+	})
+	c.view.Pages.RemovePage("modal")
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(q, 60, 9), true, true)
 }
 
 func (c *Controller) error(header string, err error, fatal bool) {

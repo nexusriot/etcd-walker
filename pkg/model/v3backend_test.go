@@ -193,6 +193,53 @@ func TestV3RenameDirSibling(t *testing.T) {
 	}
 }
 
+func TestModelImportOverwriteAndSkip(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/cfg/a": "old"})
+	m := &Model{backend: b}
+
+	// skip mode: existing /cfg/a kept, new /cfg/b written.
+	w, s, err := m.Import(map[string]string{"/cfg/a": "new", "/cfg/b": "2"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 1 || s != 1 {
+		t.Errorf("skip mode: written=%d skipped=%d, want 1/1", w, s)
+	}
+	if kv.store["/cfg/a"] != "old" || kv.store["/cfg/b"] != "2" {
+		t.Errorf("skip mode store wrong: %+v", kv.store)
+	}
+
+	// overwrite mode: existing /cfg/a replaced.
+	w, s, err = m.Import(map[string]string{"/cfg/a": "new"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 1 || s != 0 {
+		t.Errorf("overwrite mode: written=%d skipped=%d, want 1/0", w, s)
+	}
+	if kv.store["/cfg/a"] != "new" {
+		t.Errorf("overwrite mode did not replace value: %q", kv.store["/cfg/a"])
+	}
+}
+
+func TestModelImportNormalizesAndSkipsRoot(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	m := &Model{backend: b}
+	w, s, err := m.Import(map[string]string{
+		"/x//y/": "v",
+		"/":      "ignored",
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 1 || s != 1 {
+		t.Errorf("written=%d skipped=%d, want 1/1", w, s)
+	}
+	if kv.store["/x/y"] != "v" {
+		t.Errorf("key not normalized: %+v", kv.store)
+	}
+}
+
 // Renaming a directory into its own subtree must not silently destroy data.
 func TestV3RenameDirIntoOwnSubtree(t *testing.T) {
 	b, kv := newTestBackend(map[string]string{

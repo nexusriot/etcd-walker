@@ -66,6 +66,32 @@ func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.rename
 func (m *Model) RenameKey(oldKey, newKey string) error { return m.backend.renameKey(oldKey, newKey) }
 func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir) }
 
+// Import writes the given key/value pairs. Keys are normalized to absolute
+// paths. When overwrite is false, keys that already exist as a value are
+// skipped (existing directories never block a write). It returns how many
+// keys were written and skipped; on the first write error it returns early
+// with the counts accumulated so far.
+func (m *Model) Import(items map[string]string, overwrite bool) (written, skipped int, err error) {
+	for rawKey, value := range items {
+		key := normPath(rawKey)
+		if key == "/" {
+			skipped++
+			continue
+		}
+		if !overwrite {
+			if n, gerr := m.backend.get(key); gerr == nil && n != nil && !n.IsDir {
+				skipped++
+				continue
+			}
+		}
+		if serr := m.backend.set(key, value); serr != nil {
+			return written, skipped, fmt.Errorf("import %s: %w", key, serr)
+		}
+		written++
+	}
+	return written, skipped, nil
+}
+
 type backend interface {
 	proto() string
 	ls(directory string) ([]*Node, error)
