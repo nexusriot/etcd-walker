@@ -1,0 +1,17 @@
+{
+  "/demo/app/name": "etcd-walker",
+  "/demo/app/version": "0.5.1",
+  "/demo/app/feature_flags/import_enabled": "true",
+  "/demo/app/feature_flags/dark_mode": "false",
+  "/demo/db/host": "127.0.0.1",
+  "/demo/db/port": "5432",
+  "/demo/db/credentials/username": "svc_reader",
+  "/demo/db/credentials/_password": "s3cr3t-do-not-commit",
+  "/demo/services/api/replicas": "3",
+  "/demo/services/api/endpoints": "http://10.0.0.1:8080,http://10.0.0.2:8080",
+  "/demo/services/worker/queue": "jobs",
+  "/demo/notes/multiline": "line one\nline two\nline three",
+  "/demo/notes/unicode": "café — ☕ — 日本語",
+  "/demo/notes/empty": "",
+  "demo/relative/key": "joined onto the current directory when imported"
+}

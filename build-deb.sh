@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.5.1
+version=0.6.0
 arch="${1:-amd64}"
 
 echo "building deb for etcd-walker $version ($arch)"

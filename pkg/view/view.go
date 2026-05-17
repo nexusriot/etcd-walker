@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+W][::-]Export [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -168,6 +168,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+P        Copy path (key/dir)
 		  Ctrl+Y        Copy key value
 		  Ctrl+W        Export current dir keys to JSON file
+		  Ctrl+O        Import keys from a JSON file (file browser)
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		[::b]Editor[::-]
@@ -195,6 +196,26 @@ func (v *View) NewExportInput(dir, defaultPath string) *tview.InputField {
 		SetText(defaultPath)
 	inp.SetBorder(true).SetTitle(fmt.Sprintf(" Export %q keys to JSON file ", dir))
 	return inp
+}
+
+// NewFileBrowser returns an empty list styled for the JSON file picker.
+// The controller populates and re-populates it as the user navigates.
+func (v *View) NewFileBrowser(title string) *tview.List {
+	l := tview.NewList().ShowSecondaryText(false)
+	l.SetBorder(true).
+		SetTitle(title).
+		SetTitleAlign(tview.AlignLeft)
+	l.SetSelectedTextColor(tcell.ColorBlack).
+		SetSelectedBackgroundColor(tcell.ColorYellow)
+	return l
+}
+
+// NewImportModeQ asks how to handle keys that already exist on import.
+func (v *View) NewImportModeQ(details string) *tview.Modal {
+	m := tview.NewModal()
+	m.SetText(details).
+		AddButtons([]string{"overwrite", "skip existing", "cancel"})
+	return m
 }
 
 func (v *View) NewMultilineEditor(title, initial string) *tview.TextArea {
