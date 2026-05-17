@@ -221,7 +221,33 @@ func normPath(p string) string {
 	for strings.Contains(p, "//") {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
+	if p == "/" {
+		return "/"
+	}
 	return strings.TrimRight(p, "/")
+}
+
+// underOrEqual reports whether b is the same directory as a or nested under a.
+func underOrEqual(a, b string) bool {
+	a, b = normPath(a), normPath(b)
+	if a == b {
+		return true
+	}
+	if a == "/" {
+		return true
+	}
+	return strings.HasPrefix(b, a+"/")
+}
+
+// renameDirGuard rejects directory renames whose source and target overlap.
+// Both backends copy the subtree and then delete the source prefix; if the
+// paths are nested, that delete would also wipe the freshly copied data.
+func renameDirGuard(oldDir, newDir string) error {
+	o, n := normPath(oldDir), normPath(newDir)
+	if underOrEqual(o, n) || underOrEqual(n, o) {
+		return fmt.Errorf("cannot rename directory %s to %s: paths overlap (would cause data loss)", o, n)
+	}
+	return nil
 }
 
 func withTrail(p string) string {
@@ -363,6 +389,9 @@ func (b *v3Backend) deldir(key string) error {
 }
 
 func (b *v3Backend) renameDir(oldDir, newDir string) error {
+	if err := renameDirGuard(oldDir, newDir); err != nil {
+		return err
+	}
 	timeout := b.timeout * 4
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
@@ -551,6 +580,9 @@ func (b *v2Backend) deldir(key string) error {
 }
 
 func (b *v2Backend) renameDir(oldDir, newDir string) error {
+	if err := renameDirGuard(oldDir, newDir); err != nil {
+		return err
+	}
 	timeout := b.timeout * 4
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
