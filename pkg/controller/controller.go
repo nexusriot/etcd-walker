@@ -324,6 +324,16 @@ func (c *Controller) fillDetails(mapKey string) {
 	}
 
 	n := val.node
+	// Re-fetch keys from the server so volatile fields (TTL countdown, value)
+	// reflect current state each time the key gets focus instead of the value
+	// cached at list time. Fall back to the cached node on any error (e.g.
+	// injected entries not yet readable).
+	if !n.IsDir {
+		if fresh, err := c.model.Get(n.Name); err == nil && fresh != nil && !fresh.IsDir {
+			n = fresh
+			val.node = fresh
+		}
+	}
 	base := baseOf(n.Name)
 	parent := parentOf(n.Name)
 
