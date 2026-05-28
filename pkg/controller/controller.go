@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
@@ -56,7 +58,7 @@ func NewController(opts model.Options, debug bool) *Controller {
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.6.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.6.5 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
 			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
@@ -343,6 +345,11 @@ func (c *Controller) fillDetails(mapKey string) {
 		fmt.Fprintf(c.view.Details, "  [green]Size:[-] %d bytes\n", bytes)
 		fmt.Fprintf(c.view.Details, "  [green]Lines:[-] %d\n", lines)
 		fmt.Fprintf(c.view.Details, "  [green]SHA-256:[-] %s\n", shortHash(n.Value))
+		if n.TTL > 0 {
+			fmt.Fprintf(c.view.Details, "  [green]TTL:[-] %s\n", formatTTL(n.TTL))
+		} else {
+			fmt.Fprintf(c.view.Details, "  [green]TTL:[-] none\n")
+		}
 
 		const previewLimit = 512
 		if printable {
@@ -514,6 +521,8 @@ func (c *Controller) setInput() {
 			return c.editMultiline()
 		case tcell.KeyCtrlR:
 			return c.rename()
+		case tcell.KeyCtrlT:
+			return c.setTTL()
 		case tcell.KeyCtrlP:
 			return c.copyPath()
 		case tcell.KeyCtrlY:
@@ -534,7 +543,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 27), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 28), true, true)
 			return nil
 
 		case tcell.KeyBackspace2:
@@ -924,6 +933,68 @@ func (c *Controller) rename() *tcell.EventKey {
 	return nil
 }
 
+// setTTL prompts for a time-to-live (in seconds) for the selected key and
+// applies it, re-writing the key with the new lease. Entering 0 clears any
+// existing expiry. Directories are not supported.
+func (c *Controller) setTTL() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+	if mapKey == ".." {
+		return nil
+	}
+	val, ok := c.currentNodes[mapKey]
+	if !ok || val.node == nil {
+		return nil
+	}
+	if val.node.IsDir {
+		c.error("Set TTL", fmt.Errorf("TTL can only be set on keys, not directories"), false)
+		return nil
+	}
+
+	cur := ""
+	if val.node.TTL > 0 {
+		cur = strconv.FormatInt(val.node.TTL, 10)
+	}
+
+	form := c.view.NewTTLForm(fmt.Sprintf("Set TTL: %s", val.node.Name), cur)
+	form.AddButton("Save", func() {
+		raw := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		if raw == "" {
+			raw = "0"
+		}
+		secs, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || secs < 0 {
+			c.view.Pages.RemovePage("modal")
+			c.error("Invalid TTL", fmt.Errorf("enter a non-negative whole number of seconds (0 = no expiry)"), false)
+			return
+		}
+		if err := c.model.SetTTL(val.node.Name, val.node.Value, secs); err != nil {
+			c.view.Pages.RemovePage("modal")
+			c.error("Failed to set TTL", err, false)
+			return
+		}
+		if strings.HasPrefix(baseOf(val.node.Name), "_") {
+			nd := &model.Node{Name: val.node.Name, IsDir: false, Value: val.node.Value, ClusterId: val.node.ClusterId, TTL: secs}
+			c.injectNode(nd)
+		}
+		ordered := c.updateList()
+		target := displayName(baseOf(val.node.Name), false)
+		pos := c.getPosition(target, ordered) + 1
+		c.view.Pages.RemovePage("modal")
+		c.view.List.SetCurrentItem(pos)
+		c.fillDetails(mapKey)
+	})
+	form.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 60, 7), true, true)
+	return nil
+}
+
 func (c *Controller) editMultiline() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -1167,6 +1238,25 @@ func valueStats(v string) (bytes int, lines int, printable bool) {
 	lines = strings.Count(v, "\n") + 1
 	printable = utf8.ValidString(v)
 	return
+}
+
+// formatTTL renders a remaining lifetime in seconds as "1h2m3s (3723s)".
+func formatTTL(secs int64) string {
+	if secs <= 0 {
+		return "none"
+	}
+	d := time.Duration(secs) * time.Second
+	var b strings.Builder
+	if h := d / time.Hour; h > 0 {
+		fmt.Fprintf(&b, "%dh", h)
+		d -= h * time.Hour
+	}
+	if m := d / time.Minute; m > 0 {
+		fmt.Fprintf(&b, "%dm", m)
+		d -= m * time.Minute
+	}
+	fmt.Fprintf(&b, "%ds", d/time.Second)
+	return fmt.Sprintf("%s (%ds)", b.String(), secs)
 }
 
 func shortHash(v string) string {

@@ -28,6 +28,9 @@ type Node struct {
 	ClusterId string
 	IsDir     bool
 	Value     string
+	// TTL is the remaining time-to-live in seconds for the key. 0 means the
+	// key has no expiry (no lease attached in v3 / no TTL set in v2).
+	TTL int64
 }
 
 type Options struct {
@@ -59,6 +62,12 @@ func (m *Model) AuthLabel() string {
 func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
 func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) }
 func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
+
+// SetTTL writes key=value with a time-to-live of ttlSeconds. A ttlSeconds <= 0
+// clears any existing expiry (the key becomes permanent).
+func (m *Model) SetTTL(key, value string, ttlSeconds int64) error {
+	return m.backend.setTTL(key, value, ttlSeconds)
+}
 func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
 func (m *Model) Del(key string) error                  { return m.backend.del(key) }
 func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
@@ -97,6 +106,7 @@ type backend interface {
 	ls(directory string) ([]*Node, error)
 	get(key string) (*Node, error)
 	set(key, value string) error
+	setTTL(key, value string, ttlSeconds int64) error
 	mkdir(directory string) error
 	del(key string) error
 	deldir(key string) error
@@ -235,6 +245,20 @@ func newV3Backend(opts Options) (*v3Backend, error) {
 
 func (b *v3Backend) proto() string { return "v3" }
 
+// ttlForLease returns the remaining seconds for a lease id, or 0 when the
+// lease is absent/expired or cannot be resolved. b.c is nil in unit tests, so
+// callers tolerate a 0 result.
+func (b *v3Backend) ttlForLease(ctx context.Context, lease int64) int64 {
+	if lease == 0 || b.c == nil {
+		return 0
+	}
+	resp, err := b.c.TimeToLive(ctx, clientv3.LeaseID(lease))
+	if err != nil || resp.TTL < 0 {
+		return 0
+	}
+	return resp.TTL
+}
+
 const dirMarker = ".dir"
 
 func normPath(p string) string {
@@ -300,6 +324,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 		isDir     bool
 		hasFile   bool
 		fileValue string
+		lease     int64
 	}
 	children := map[string]*childInfo{}
 
@@ -325,6 +350,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 		} else {
 			ci.hasFile = true
 			ci.fileValue = string(kv.Value)
+			ci.lease = kv.Lease
 		}
 	}
 
@@ -343,7 +369,13 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
 		}
 		if ci.hasFile {
-			nodes = append(nodes, &Node{Name: full, IsDir: false, Value: ci.fileValue, ClusterId: clusterID})
+			nodes = append(nodes, &Node{
+				Name:      full,
+				IsDir:     false,
+				Value:     ci.fileValue,
+				ClusterId: clusterID,
+				TTL:       b.ttlForLease(ctx, ci.lease),
+			})
 		}
 	}
 	return nodes, nil
@@ -366,6 +398,7 @@ func (b *v3Backend) get(key string) (*Node, error) {
 			IsDir:     false,
 			Value:     string(kv.Value),
 			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
+			TTL:       b.ttlForLease(ctx, kv.Lease),
 		}, nil
 	}
 
@@ -389,6 +422,28 @@ func (b *v3Backend) set(key, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	_, err := b.cli.Put(ctx, normPath(key), value)
+	return err
+}
+
+func (b *v3Backend) setTTL(key, value string, ttlSeconds int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	k := normPath(key)
+
+	// Clearing the TTL: a plain Put drops any previously attached lease.
+	if ttlSeconds <= 0 {
+		_, err := b.cli.Put(ctx, k, value)
+		return err
+	}
+
+	if b.c == nil {
+		return fmt.Errorf("lease operations require a live etcd client")
+	}
+	lease, err := b.c.Grant(ctx, ttlSeconds)
+	if err != nil {
+		return fmt.Errorf("grant lease: %w", err)
+	}
+	_, err = b.cli.Put(ctx, k, value, clientv3.WithLease(lease.ID))
 	return err
 }
 
@@ -555,6 +610,7 @@ func (b *v2Backend) ls(directory string) ([]*Node, error) {
 			ClusterId: resp.ClusterID,
 			IsDir:     n.Dir,
 			Value:     n.Value,
+			TTL:       n.TTL,
 		})
 	}
 	return nds, nil
@@ -572,6 +628,7 @@ func (b *v2Backend) get(key string) (*Node, error) {
 		ClusterId: resp.ClusterID,
 		IsDir:     resp.Node.Dir,
 		Value:     resp.Node.Value,
+		TTL:       resp.Node.TTL,
 	}, nil
 }
 
@@ -579,6 +636,17 @@ func (b *v2Backend) set(key, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	_, err := b.api.Set(ctx, normPath(key), value, nil)
+	return err
+}
+
+func (b *v2Backend) setTTL(key, value string, ttlSeconds int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	opts := &clientv2.SetOptions{}
+	if ttlSeconds > 0 {
+		opts.TTL = time.Duration(ttlSeconds) * time.Second
+	}
+	_, err := b.api.Set(ctx, normPath(key), value, opts)
 	return err
 }
 
