@@ -31,6 +31,11 @@ type Node struct {
 	// TTL is the remaining time-to-live in seconds for the key. 0 means the
 	// key has no expiry (no lease attached in v3 / no TTL set in v2).
 	TTL int64
+	// LeaseID is the v3 lease currently attached to the key, or 0 when the key
+	// has no lease. It lets a value edit re-attach the same lease (preserving
+	// the running expiry) and lets setTTL revoke the superseded lease instead
+	// of orphaning it. Always 0 for v2, which has native per-key TTL.
+	LeaseID int64
 }
 
 type Options struct {
@@ -59,20 +64,29 @@ func (m *Model) AuthLabel() string {
 	return m.authLabel
 }
 
-func (m *Model) Ls(directory string) ([]*Node, error)  { return m.backend.ls(directory) }
-func (m *Model) Get(key string) (*Node, error)         { return m.backend.get(key) }
-func (m *Model) Set(key, value string) error           { return m.backend.set(key, value) }
+func (m *Model) Ls(directory string) ([]*Node, error) { return m.backend.ls(directory) }
+func (m *Model) Get(key string) (*Node, error)        { return m.backend.get(key) }
+func (m *Model) Set(key, value string) error          { return m.backend.set(key, value) }
 
 // SetTTL writes key=value with a time-to-live of ttlSeconds. A ttlSeconds <= 0
 // clears any existing expiry (the key becomes permanent).
 func (m *Model) SetTTL(key, value string, ttlSeconds int64) error {
 	return m.backend.setTTL(key, value, ttlSeconds)
 }
-func (m *Model) MkDir(directory string) error          { return m.backend.mkdir(directory) }
-func (m *Model) Del(key string) error                  { return m.backend.del(key) }
-func (m *Model) DelDir(key string) error               { return m.backend.deldir(key) }
-func (m *Model) RenameDir(oldDir, newDir string) error { return m.backend.renameDir(oldDir, newDir) }
-func (m *Model) RenameKey(oldKey, newKey string) error { return m.backend.renameKey(oldKey, newKey) }
+
+// SetKeepTTL writes key=value while preserving the key's existing expiry,
+// instead of dropping it the way a plain Set does. On v3 it re-attaches
+// leaseID (0 = write the key without a lease); on v2 it re-applies ttlSeconds
+// (0 = no expiry). This is what the value editor uses so editing a key no
+// longer silently clears its TTL.
+func (m *Model) SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error {
+	return m.backend.setKeep(key, value, leaseID, ttlSeconds)
+}
+func (m *Model) MkDir(directory string) error                 { return m.backend.mkdir(directory) }
+func (m *Model) Del(key string) error                         { return m.backend.del(key) }
+func (m *Model) DelDir(key string) error                      { return m.backend.deldir(key) }
+func (m *Model) RenameDir(oldDir, newDir string) error        { return m.backend.renameDir(oldDir, newDir) }
+func (m *Model) RenameKey(oldKey, newKey string) error        { return m.backend.renameKey(oldKey, newKey) }
 func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir) }
 
 // Import writes the given key/value pairs. Keys are normalized to absolute
@@ -107,6 +121,7 @@ type backend interface {
 	get(key string) (*Node, error)
 	set(key, value string) error
 	setTTL(key, value string, ttlSeconds int64) error
+	setKeep(key, value string, leaseID, ttlSeconds int64) error
 	mkdir(directory string) error
 	del(key string) error
 	deldir(key string) error
@@ -369,12 +384,17 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
 		}
 		if ci.hasFile {
+			// The list pane does not render TTL, and fillDetails re-reads the
+			// focused key for its live countdown — so resolving the lease here
+			// would be one TimeToLive round-trip per leased child for a value
+			// nothing displays. Carry the cheap lease id (already in the Get
+			// response) and leave the countdown to the on-focus refresh.
 			nodes = append(nodes, &Node{
 				Name:      full,
 				IsDir:     false,
 				Value:     ci.fileValue,
 				ClusterId: clusterID,
-				TTL:       b.ttlForLease(ctx, ci.lease),
+				LeaseID:   ci.lease,
 			})
 		}
 	}
@@ -399,6 +419,7 @@ func (b *v3Backend) get(key string) (*Node, error) {
 			Value:     string(kv.Value),
 			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
 			TTL:       b.ttlForLease(ctx, kv.Lease),
+			LeaseID:   kv.Lease,
 		}, nil
 	}
 
@@ -430,20 +451,54 @@ func (b *v3Backend) setTTL(key, value string, ttlSeconds int64) error {
 	defer cancel()
 	k := normPath(key)
 
-	// Clearing the TTL: a plain Put drops any previously attached lease.
-	if ttlSeconds <= 0 {
+	// Note the lease currently on the key (if any) so we can revoke it once the
+	// key points at its replacement; otherwise every TTL change would orphan a
+	// lease that keeps ticking on the server.
+	var oldLease clientv3.LeaseID
+	if cur, err := b.cli.Get(ctx, k); err == nil && cur.Count > 0 {
+		oldLease = clientv3.LeaseID(cur.Kvs[0].Lease)
+	}
+
+	switch {
+	case ttlSeconds <= 0:
+		// Clearing the TTL: a plain Put detaches any previously attached lease.
+		if _, err := b.cli.Put(ctx, k, value); err != nil {
+			return err
+		}
+	default:
+		if b.c == nil {
+			return fmt.Errorf("lease operations require a live etcd client")
+		}
+		lease, err := b.c.Grant(ctx, ttlSeconds)
+		if err != nil {
+			return fmt.Errorf("grant lease: %w", err)
+		}
+		if _, err := b.cli.Put(ctx, k, value, clientv3.WithLease(lease.ID)); err != nil {
+			return err
+		}
+	}
+
+	// Best-effort cleanup of the superseded lease. The key no longer references
+	// it (the Put above re-pointed it), so revoking only reaps the orphan. This
+	// tool attaches one key per lease, so nothing else is collateral.
+	if oldLease != 0 && b.c != nil {
+		_, _ = b.c.Revoke(ctx, oldLease)
+	}
+	return nil
+}
+
+// setKeep updates the key's value while preserving its current lease, so an
+// ordinary value edit no longer detaches the key's TTL. leaseID 0 means the
+// key has no lease and is written permanently.
+func (b *v3Backend) setKeep(key, value string, leaseID, _ int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	k := normPath(key)
+	if leaseID == 0 {
 		_, err := b.cli.Put(ctx, k, value)
 		return err
 	}
-
-	if b.c == nil {
-		return fmt.Errorf("lease operations require a live etcd client")
-	}
-	lease, err := b.c.Grant(ctx, ttlSeconds)
-	if err != nil {
-		return fmt.Errorf("grant lease: %w", err)
-	}
-	_, err = b.cli.Put(ctx, k, value, clientv3.WithLease(lease.ID))
+	_, err := b.cli.Put(ctx, k, value, clientv3.WithLease(clientv3.LeaseID(leaseID)))
 	return err
 }
 
@@ -640,6 +695,19 @@ func (b *v2Backend) set(key, value string) error {
 }
 
 func (b *v2Backend) setTTL(key, value string, ttlSeconds int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	opts := &clientv2.SetOptions{}
+	if ttlSeconds > 0 {
+		opts.TTL = time.Duration(ttlSeconds) * time.Second
+	}
+	_, err := b.api.Set(ctx, normPath(key), value, opts)
+	return err
+}
+
+// setKeep updates the value while keeping the key's expiry by re-applying the
+// remaining TTL (0 = permanent). v2 has no leases, so leaseID is ignored.
+func (b *v2Backend) setKeep(key, value string, _, ttlSeconds int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	opts := &clientv2.SetOptions{}

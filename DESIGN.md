@@ -55,28 +55,37 @@ etcd-walker/
 │
 ├── pkg/
 │   ├── config/              JSON config loader
-│   │   └── config.go
+│   │   ├── config.go
+│   │   └── config_test.go
 │   ├── model/               etcd abstraction (v2 / v3 behind one iface)
-│   │   └── model.go
+│   │   ├── model.go
+│   │   ├── v3backend_test.go   in-memory fakeKV exercises the v3 backend
+│   │   └── helpers_test.go
 │   ├── controller/          UI state + keybindings + business glue
-│   │   └── controller.go
+│   │   ├── controller.go
+│   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
 │   │   └── view.go
 │   └── util/clip/           clipboard with OSC52 fallback
-│       └── clip.go
+│       ├── clip.go
+│       └── clip_test.go
 │
 ├── resources/               screenshots, icons
+├── examples/                import-sample.json for the JSON import feature
 ├── DEBIAN/                  Debian packaging metadata
-├── build-deb.sh             builds an amd64 .deb
-├── build-deb-arm64.sh       builds an arm64 .deb
+├── Makefile                 cross-build matrix + .deb targets (preferred)
+├── build-deb.sh             builds an amd64/arm64 .deb (legacy helper)
+├── build-deb-arm64.sh       thin wrapper: build-deb.sh arm64
+├── dist/                    Makefile binary build output (git-ignored)
 ├── go.mod / go.sum
 ├── LICENSE
 ├── README.md
 └── DESIGN.md                this document
 ```
 
-The codebase is intentionally small (≈ 2 kLoC) and flat — one file per
-package — so newcomers can read it end-to-end in a single sitting.
+The codebase is intentionally small and flat — one production file per
+package, each with a sibling `_test.go` — so newcomers can read it
+end-to-end in a single sitting.
 
 ---
 
@@ -138,26 +147,46 @@ to branch on protocol.
 
 ```go
 type backend interface {
+    proto() string
     ls(dir string) ([]*Node, error)
     get(path string) (*Node, error)
     set(path, value string) error
-    del(path string) error
+    setTTL(path, value string, ttlSeconds int64) error
+    setKeep(path, value string, leaseID, ttlSeconds int64) error
     mkdir(path string) error
+    del(path string) error
     deldir(path string) error
     renameDir(oldPath, newPath string) error
     renameKey(oldPath, newPath string) error
+    authStatus() (enabled bool, known bool, err error)
     export(dir string) (map[string]string, error)
-    authStatus() string
-    proto() string
 }
 ```
 
 Two implementations satisfy it:
 
-* `v3Backend` — wraps `go.etcd.io/etcd/client/v3` (`clientv3.KV`),
-  speaks gRPC, supports auth and TLS.
+* `v3Backend` — wraps `go.etcd.io/etcd/client/v3`. It holds both a
+  `clientv3.KV` (for get/put/delete/range) and the full `*clientv3.Client`
+  (needed for lease operations and `Auth.AuthStatus`). Speaks gRPC, supports
+  auth and TLS.
 * `v2Backend` — wraps `github.com/coreos/etcd/client` (`clientv2.KeysAPI`),
   speaks HTTP, ignores auth/TLS knobs.
+
+Most exported `Model` methods are 1:1 wrappers over the interface. Three are
+worth calling out:
+
+* `Model.Import(items, overwrite)` — the one operation **not** backed by a
+  single interface method: a key/value bulk write implemented in terms of
+  `get`/`set`, with a normalize-and-skip policy.
+* `Model.SetTTL(key, value, ttlSeconds)` — pass-through to `setTTL`; sets or
+  clears a key's expiry (see §5.5).
+* `Model.SetKeepTTL(key, value, leaseID, ttlSeconds)` — pass-through to
+  `setKeep`; writes a new value while keeping the key's existing expiry
+  (see §5.5).
+
+`authStatus()` returns a `(enabled, known, err)` triple rather than a string
+so the controller can distinguish "auth is off" from "couldn't determine"
+and render the header label (`ON` / `OFF` / `?`) accordingly.
 
 ### 5.2 Protocol selection
 
@@ -191,6 +220,45 @@ gRPC dial options. `TimeoutSeconds` (default 5) becomes the
 `DialTimeout` and the per-request `context.WithTimeout` budget so a
 broken server cannot hang the UI.
 
+### 5.5 TTL / expiry
+
+`Node` carries two expiry fields: `TTL int64` — the remaining time-to-live in
+seconds, where `0` means "no expiry" — and `LeaseID int64` — the v3 lease
+currently attached to the key (`0` = none; always `0` on v2). The two backends
+source them differently because etcd implements expiry differently across the
+protocol versions:
+
+* **v3** has no per-key TTL; expiry is modelled with **leases**. To set a
+  TTL, `setTTL` reads the key's *current* lease, grants a fresh one with
+  `Lease.Grant(ctx, seconds)`, `Put`s the key with `clientv3.WithLease(id)`,
+  and finally `Revoke`s the superseded lease so it does not linger as an
+  orphan that keeps ticking server-side. A `ttlSeconds <= 0` instead does a
+  plain `Put` (detaching any lease, making the key permanent) and then revokes
+  the old lease too. The revoke is best-effort and guarded on `b.c != nil`;
+  because the tool attaches exactly one key per lease, reaping the old lease
+  never takes another key with it.
+  When reading, `get` sees the lease id on the `KeyValue` and resolves the
+  live countdown through `Lease.TimeToLive` (helper `ttlForLease`, tolerant:
+  returns `0` when the lease id is `0`, the lease has expired, or `b.c` is
+  `nil` — the unit tests wire up only the fake `KV`). `ls` deliberately does
+  **not** resolve the countdown: the list pane never renders TTL and the
+  focused key is re-read anyway (§7.3), so paying one `TimeToLive` round-trip
+  per leased child would be wasted work. `ls` carries only the cheap
+  `LeaseID` from the range response.
+* **v2** has native per-key TTL. `setTTL` passes a
+  `clientv2.SetOptions{TTL: …}` (zero duration clears it), and `get`/`ls`
+  copy `Node.TTL` straight from the v2 response; `LeaseID` stays `0`.
+
+A separate `setKeep` (exposed as `Model.SetKeepTTL`) writes a new value while
+**preserving** the existing expiry: v3 re-`Put`s with `WithLease(LeaseID)` so
+the running countdown continues unbroken (plain `Put` when `LeaseID == 0`), and
+v2 re-applies the remaining `TTL`. This is what the value editor uses — see
+§7.4.
+
+Because the v3 TTL is a *countdown*, it changes every second on the server.
+The controller therefore re-reads the focused key on demand rather than
+trusting the value cached at list time — see §7.3.
+
 ---
 
 ## 6. Package: `pkg/view`
@@ -203,8 +271,9 @@ broken server cannot hang the UI.
 * `Pages` — a stack of overlay pages used for modal dialogs.
 * `List` — the left pane: the directory listing.
 * `Details` — the right pane: metadata about the highlighted node.
-* Constructors for the dialogs (create, edit, rename, delete-confirm,
-  search, jump, export, multi-line editor, hotkeys help).
+* Constructors for the dialogs (create, edit, rename, set-TTL,
+  delete-confirm, search, jump, export, JSON import file-browser,
+  import-mode prompt, multi-line editor, hotkeys help).
 
 Key design decisions:
 
@@ -260,13 +329,13 @@ type Controller struct {
 
 * On the global `App`: `Ctrl+Q` quits.
 * On the `List` widget: every other hotkey (`Ctrl+N`, `Delete`,
-  `Ctrl+E`, `Ctrl+R`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`, `Ctrl+J`,
-  `Ctrl+W`, `Ctrl+H`, `Backspace`).
+  `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
+  `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+H`, `Backspace`).
 
 Each hotkey calls a small method (`create`, `delete`, `editMultiline`,
-`rename`, `copyPath`, `copyValue`, `search`, `jump`, `export`) which
-opens the appropriate dialog and, on submission, calls into the model and
-then `updateList()` to refresh the listing.
+`rename`, `setTTL`, `copyPath`, `copyValue`, `search`, `jump`, `export`,
+`importJSON`) which opens the appropriate dialog and, on submission, calls
+into the model and then `updateList()` to refresh the listing.
 
 ### 7.3 Listing rendering
 
@@ -281,15 +350,25 @@ then `updateList()` to refresh the listing.
 6. Bind a selection handler that calls `fillDetails()` whenever the
    highlight moves.
 
-`fillDetails()` shows path, cluster ID, protocol and auth in the header
-area, plus per-node metadata: byte size, line count, SHA-256 of the
-value, and either a 512-char preview or a `<binary>` indicator for
-non-UTF-8 data.
+`fillDetails()` renders the right-hand pane for the highlighted node:
+path info (type, basename, parent, full path, depth), cluster info
+(protocol, cluster id) and, for keys, value info — byte size, line count,
+SHA-256, the **TTL** (`1h2m3s (3723s)` via `formatTTL`, or `none`) and
+either a 512-char preview or a "binary / non-UTF8" notice. For
+directories it instead does a live `Ls` to report child/subdir/key counts.
+
+Because a v3 lease TTL is a live countdown (§5.5), `fillDetails()` re-reads
+the focused **key** from the server with `model.Get` on every selection
+change, replacing the node cached at list time so the TTL and value stay
+current as the user moves the cursor on and off the key. The lookup falls
+back to the cached node on any error (e.g. an injected entry that is not
+yet readable). Directories keep using the cached node plus the live child
+count.
 
 ### 7.4 Mutations
 
-Every mutating action (`create`, `delete`, `rename`, `editMultiline`)
-follows the same pattern:
+Every mutating action (`create`, `delete`, `rename`, `editMultiline`,
+`setTTL`, `importJSON`) follows the same pattern:
 
 1. Open a dialog from `view`.
 2. On `Enter`, validate input and call the matching `model` method.
@@ -299,6 +378,18 @@ follows the same pattern:
 
 Renames are implemented as **copy-then-delete** in the model so they work
 identically on v2 and v3 even though v3 has no native rename.
+
+`setTTL` is keys-only (directories are rejected): the dialog accepts either
+a bare number of seconds or a Go duration string (`1h30m`, `90m`, `45s`),
+parsed by `parseTTLInput` (`0`/empty clears expiry). It re-writes the key
+with its current value via `model.SetTTL`, then refreshes the listing and
+details.
+
+A later value edit (`Ctrl+E`) goes through `model.SetKeepTTL`, which
+re-attaches the key's lease (v3) or re-applies its TTL (v2), so editing a
+value **keeps** the expiry instead of silently dropping it. The controller
+passes the `LeaseID`/`TTL` from the focused node, which `fillDetails` keeps
+fresh by re-reading the key on focus (§7.3).
 
 ---
 
@@ -343,31 +434,50 @@ trace without disturbing the interface.
 
 ### 9.3 Versioning
 
-The user-facing version string is hard-coded in two places:
+The current user-facing version is **0.6.8**, hard-coded in three places
+that must be bumped together when cutting a release:
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
-  (`"Etcd-walker v.0.4.0 …"`).
-* The `version=` variable at the top of `build-deb.sh` /
-  `build-deb-arm64.sh`.
-
-Both must be bumped together when cutting a release.
+  (`"Etcd-walker v.0.6.8 …"`).
+* `VERSION ?= 0.6.8` in the `Makefile` (overridable on the CLI:
+  `make debs VERSION=…`).
+* The `version=` variable at the top of `build-deb.sh` (the legacy helper;
+  `build-deb-arm64.sh` just delegates to it).
 
 ---
 
 ## 10. Build & packaging
 
+The `Makefile` is the primary entry point and encodes the full cross-build
+matrix; the shell scripts remain as thin legacy helpers.
+
+* `make` / `make help` — list every target with the resolved `VERSION`.
+* `make x86_64` / `x86_64-static` / `linux-i686` / `freebsd-x86_64` /
+  `uconsole` / `pizero2w` / `pizero2w-armhf` / `darwin` / `windows` —
+  per-platform binaries written to `dist/` (`-trimpath -ldflags "-s -w"`,
+  `CGO_ENABLED=0` for the static/cross targets). `make all` builds them all.
+  The `uconsole` (ClockworkPi CM4) and `pizero2w` targets are both
+  `linux/arm64`; `pizero2w-armhf` is `linux/arm GOARM=7` for 32-bit Pi OS.
+* `make debs` — `.deb`s for `amd64`, `i386`, `arm64` and `armhf` under
+  `build/`. Each `build_deb` target stages `usr/bin/<app>`, copies the
+  `DEBIAN/` metadata, patches `_version_` and `Architecture:` in
+  `DEBIAN/control`, and runs `dpkg-deb --build`. Override the version with
+  `make debs VERSION=0.0.40`.
+* `make test | test-race | vet | fmt | tidy | run | clean` — the usual
+  developer shortcuts.
+
+Equivalent raw commands, if you prefer not to use the Makefile:
+
 * `go build ./cmd/etcd-walker` — normal dynamic build.
 * `go build -ldflags "-linkmode external -extldflags -static" …` —
   static binary suitable for distroless / scratch containers.
 * `GOOS=linux GOARCH=386 go build …` — 32-bit build.
-* `./build-deb.sh [amd64|arm64]` — assembles a `.deb` under
-  `build/etcd-walker_<version>_<arch>/`, copies the `DEBIAN/` metadata,
-  patches `Architecture:` and `_version_` in `DEBIAN/control`, builds the
-  binary (statically when the host arch matches, with `CGO_ENABLED=0`
-  for cross-builds) and runs `dpkg-deb --build`.
-
-Cross-compilation for arm64 is delegated to a thin
-`build-deb-arm64.sh` wrapper that calls `build-deb.sh arm64`.
+* `./build-deb.sh [amd64|arm64]` — legacy `.deb` helper. It builds the
+  binary statically when the host arch matches (`-linkmode external
+  -extldflags -static`) and with `CGO_ENABLED=0 -ldflags "-s -w"` for
+  cross-builds, then patches `DEBIAN/control` and runs `dpkg-deb`.
+  `build-deb-arm64.sh` is a one-line wrapper that calls `build-deb.sh
+  arm64`.
 
 ---
 

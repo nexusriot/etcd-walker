@@ -132,7 +132,7 @@ func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 // current is pre-filled with the existing remaining TTL ("" when none).
 func (v *View) NewTTLForm(header string, current string) *tview.Form {
 	form := tview.NewForm().
-		AddInputField("TTL seconds (0 = no expiry)", "", 30, nil, nil)
+		AddInputField("TTL — seconds or duration e.g. 1h30m (0 = no expiry)", "", 40, nil, nil)
 	form.GetFormItem(0).(*tview.InputField).SetText(current)
 	form.SetBorder(true)
 	form.SetTitle(header)
@@ -181,7 +181,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+N        Create node or directory
 		  Ctrl+E        Edit value (multiline) / rename dir
 		  Ctrl+R        Rename key or directory
-		  Ctrl+T        Set/clear TTL on a key (seconds)
+		  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
 		  Del           Delete (recursive for dirs)
 		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)

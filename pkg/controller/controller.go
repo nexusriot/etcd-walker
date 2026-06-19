@@ -58,7 +58,7 @@ func NewController(opts model.Options, debug bool) *Controller {
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.6.5 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.6.8 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
 			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
@@ -976,10 +976,10 @@ func (c *Controller) setTTL() *tcell.EventKey {
 		if raw == "" {
 			raw = "0"
 		}
-		secs, perr := strconv.ParseInt(raw, 10, 64)
-		if perr != nil || secs < 0 {
+		secs, perr := parseTTLInput(raw)
+		if perr != nil {
 			c.view.Pages.RemovePage("modal")
-			c.error("Invalid TTL", fmt.Errorf("enter a non-negative whole number of seconds (0 = no expiry)"), false)
+			c.error("Invalid TTL", perr, false)
 			return
 		}
 		if err := c.model.SetTTL(val.node.Name, val.node.Value, secs); err != nil {
@@ -1035,13 +1035,15 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 		case tcell.KeyCtrlS:
 			value := ta.GetText()
 			log.Debugf("Multiline save: %s (%d bytes)", val.node.Name, len(value))
-			if err := c.model.Set(val.node.Name, value); err != nil {
+			// Preserve any expiry: SetKeepTTL re-attaches the v3 lease / re-applies
+			// the v2 TTL so editing a key's value no longer silently drops it.
+			if err := c.model.SetKeepTTL(val.node.Name, value, val.node.LeaseID, val.node.TTL); err != nil {
 				c.view.CloseEditor()
 				c.error("Failed to save value", err, false)
 				return nil
 			}
 			if strings.HasPrefix(baseOf(val.node.Name), "_") {
-				nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId}
+				nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId, TTL: val.node.TTL, LeaseID: val.node.LeaseID}
 				c.injectNode(nd)
 			}
 			c.view.CloseEditor()
@@ -1248,6 +1250,27 @@ func valueStats(v string) (bytes int, lines int, printable bool) {
 	lines = strings.Count(v, "\n") + 1
 	printable = utf8.ValidString(v)
 	return
+}
+
+// parseTTLInput accepts either a bare non-negative number of seconds ("3600")
+// or a Go duration string ("1h30m", "90m", "45s") and returns the TTL in whole
+// seconds. The caller treats 0 (and empty input) as "no expiry". A duration
+// that rounds below one second is rejected so a typo like "500ms" does not
+// silently clear the TTL.
+func parseTTLInput(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	invalid := fmt.Errorf("enter a non-negative number of seconds, or a duration like 1h30m (0 = no expiry)")
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if secs < 0 {
+			return 0, invalid
+		}
+		return secs, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 || (d > 0 && d < time.Second) {
+		return 0, invalid
+	}
+	return int64(d / time.Second), nil
 }
 
 // formatTTL renders a remaining lifetime in seconds as "1h2m3s (3723s)".

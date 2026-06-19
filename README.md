@@ -19,6 +19,10 @@ Grab the latest pre-built binaries / `.deb` packages here:
 - File-explorer style navigation of etcd keys/directories
 - Create / read / update / delete keys and directories
 - Rename keys and directories (including recursive directory rename)
+- Set or clear a key's TTL / expiry (`Ctrl+T`), entered as seconds or a
+  duration like `1h30m`; remaining TTL is shown live in the details pane
+  (v3 via leases, v2 via native key TTL). Editing a key's value preserves
+  its TTL instead of dropping it.
 - Quick search inside the current level (`/` or `Ctrl+S`)
 - Jump to an absolute or relative path (`Ctrl+J`)
 - Multi-line editor for large key values (`Ctrl+E`)
@@ -47,6 +51,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Delete`        | Delete current key/directory (with confirm)  |
 | `Ctrl+E`        | Edit value (multi-line) / rename directory   |
 | `Ctrl+R`        | Rename key or directory                      |
+| `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
 | `Ctrl+S` or `/` | Quick search inside the current level        |
 | `Ctrl+J`        | Jump to absolute or relative path            |
 | `Ctrl+W`        | Export current directory to a JSON file      |
@@ -189,13 +194,31 @@ One-shot connection without a config file:
 Since v0.3.2 `etcd-walker` supports authentication. Authentication is
 **v3 only** — the etcd v2 backend will ignore `username` / `password`.
 
-If the server has auth enabled and the credentials are missing or wrong,
-`etcd-walker` shows the etcd error in-app and the header reports
-`Auth: required` so the misconfiguration is easy to spot.
+The header shows the cluster's auth state as `Auth: ON`, `Auth: OFF`, or
+`Auth: ?` when it could not be determined. If the server has auth enabled
+and the credentials are missing or wrong, `etcd-walker` shows the etcd
+error in-app so the misconfiguration is easy to spot.
 
 ---
 
 ### Building
+
+The repository ships a `Makefile` that wraps the whole cross-build matrix.
+Run `make help` to list every target (it prints the resolved `VERSION`):
+
+```bash
+make help            # list targets
+make x86_64          # linux/amd64 into dist/
+make x86_64-static   # fully static linux/amd64 (CGO off)
+make uconsole        # linux/arm64 (ClockworkPi uConsole CM4)
+make pizero2w        # linux/arm64 (Raspberry Pi Zero 2 W, 64-bit OS)
+make all             # every platform into dist/
+make debs            # .deb packages (amd64 + i386 + arm64 + armhf)
+make test vet fmt    # developer shortcuts
+```
+
+The manual `go build` invocations below are equivalent if you prefer not to
+use the Makefile.
 
 Standard build:
 
@@ -238,7 +261,15 @@ Install the build dependencies once:
 sudo apt-get install git devscripts build-essential lintian upx-ucl golang
 ```
 
-Then run the appropriate script:
+Then build the packages with the Makefile (preferred):
+
+```bash
+make debs                       # amd64 + i386 + arm64 + armhf
+make deb-arm64                  # a single architecture
+make debs VERSION=0.6.6         # override the version
+```
+
+The legacy shell helpers still work and produce an equivalent package:
 
 ```bash
 ./build-deb.sh           # amd64
