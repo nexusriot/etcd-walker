@@ -2,6 +2,51 @@ package controller
 
 import "testing"
 
+func TestParseTTLInput(t *testing.T) {
+	ok := map[string]int64{
+		"0":      0,
+		"3600":   3600,
+		"  90 ":  90,
+		"45s":    45,
+		"90m":    5400,
+		"1h30m":  5400,
+		"2h":     7200,
+		"1500ms": 1, // rounds down to whole seconds
+	}
+	for in, want := range ok {
+		got, err := parseTTLInput(in)
+		if err != nil {
+			t.Errorf("parseTTLInput(%q) errored: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("parseTTLInput(%q) = %d, want %d", in, got, want)
+		}
+	}
+
+	bad := []string{"-1", "-5m", "abc", "1h2x", "500ms"}
+	for _, in := range bad {
+		if got, err := parseTTLInput(in); err == nil {
+			t.Errorf("parseTTLInput(%q) = %d, want error", in, got)
+		}
+	}
+}
+
+func TestFormatTTL(t *testing.T) {
+	cases := map[int64]string{
+		0:    "none",
+		-1:   "none",
+		45:   "45s (45s)",
+		90:   "1m30s (90s)",
+		3723: "1h2m3s (3723s)",
+	}
+	for secs, want := range cases {
+		if got := formatTTL(secs); got != want {
+			t.Errorf("formatTTL(%d) = %q, want %q", secs, got, want)
+		}
+	}
+}
+
 func TestNormAbs(t *testing.T) {
 	cases := map[string]string{
 		"":             "/",

@@ -116,8 +116,8 @@ func TestV3LsSplitsDirsAndFiles(t *testing.T) {
 
 func TestV3GetExactAndDir(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{
-		"/a/b":     "hello",
-		"/dir/x":   "1",
+		"/a/b":      "hello",
+		"/dir/x":    "1",
 		"/dir/.dir": "",
 	})
 	n, err := b.get("/a/b")
@@ -141,11 +141,11 @@ func TestV3GetExactAndDir(t *testing.T) {
 
 func TestV3ExportSkipsDirMarker(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{
-		"/x/a":    "1",
-		"/x/b":    "2",
-		"/x/.dir": "",
+		"/x/a":      "1",
+		"/x/b":      "2",
+		"/x/.dir":   "",
 		"/x/s/.dir": "",
-		"/x/s/c":  "3",
+		"/x/s/c":    "3",
 	})
 	out, err := b.export("/x")
 	if err != nil {
@@ -237,6 +237,56 @@ func TestModelImportNormalizesAndSkipsRoot(t *testing.T) {
 	}
 	if kv.store["/x/y"] != "v" {
 		t.Errorf("key not normalized: %+v", kv.store)
+	}
+}
+
+func TestV3SetKeepWritesValue(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/k": "old"})
+	// leaseID is ignored by fakeKV (it does not model leases), but setKeep must
+	// still write the new value whether or not a lease is supplied.
+	if err := b.setKeep("/k", "new", 7, 0); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/k"] != "new" {
+		t.Errorf("setKeep(lease) value = %q, want new", kv.store["/k"])
+	}
+	if err := b.setKeep("/k", "newer", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/k"] != "newer" {
+		t.Errorf("setKeep(no lease) value = %q, want newer", kv.store["/k"])
+	}
+}
+
+func TestModelSetKeepTTL(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/cfg/a": "1"})
+	m := &Model{backend: b}
+	if err := m.SetKeepTTL("/cfg/a", "2", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/cfg/a"] != "2" {
+		t.Errorf("SetKeepTTL value = %q, want 2", kv.store["/cfg/a"])
+	}
+}
+
+// Clearing a TTL (ttlSeconds <= 0) must just rewrite the value; the b.c guard
+// means no lease/revoke RPCs are attempted when only the fake KV is wired up.
+func TestV3SetTTLClearWritesValue(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/k": "old"})
+	if err := b.setTTL("/k", "fresh", 0); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/k"] != "fresh" {
+		t.Errorf("setTTL clear value = %q, want fresh", kv.store["/k"])
+	}
+}
+
+// Granting a TTL needs a live *clientv3.Client; with only the fake KV wired up
+// (b.c == nil) setTTL must report the limitation rather than panic.
+func TestV3SetTTLGrantRequiresClient(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{"/k": "old"})
+	if err := b.setTTL("/k", "v", 60); err == nil {
+		t.Error("setTTL with positive TTL and nil client should error")
 	}
 }
 

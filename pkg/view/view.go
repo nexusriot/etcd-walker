@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -128,6 +128,24 @@ func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 	return form
 }
 
+// NewTTLForm builds a form to enter a key's time-to-live in seconds.
+// current is pre-filled with the existing remaining TTL ("" when none).
+func (v *View) NewTTLForm(header string, current string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("TTL — seconds or duration e.g. 1h30m (0 = no expiry)", "", 40, nil, nil)
+	form.GetFormItem(0).(*tview.InputField).SetText(current)
+	form.SetBorder(true)
+	form.SetTitle(header)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
 func (v *View) NewSearch() *tview.InputField {
 	search := tview.NewInputField().
 		SetPlaceholder("search").
@@ -163,6 +181,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+N        Create node or directory
 		  Ctrl+E        Edit value (multiline) / rename dir
 		  Ctrl+R        Rename key or directory
+		  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
 		  Del           Delete (recursive for dirs)
 		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)
