@@ -3,6 +3,7 @@ package clip
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -38,19 +39,33 @@ func TestCopyOSC52NilWriter(t *testing.T) {
 	}
 }
 
-func TestCopyOSC52Truncation(t *testing.T) {
+func TestCopyOSC52TooLarge(t *testing.T) {
 	var buf bytes.Buffer
 	big := strings.Repeat("a", 20000)
-	if err := copyOSC52(&buf, big); err != nil {
-		t.Fatal(err)
+	err := copyOSC52(&buf, big)
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("copyOSC52(20k bytes) err = %v, want ErrTooLarge", err)
 	}
-	// payload is truncated to 10k bytes before base64 encoding
+	// Nothing may reach the terminal: a partial/truncated copy is worse
+	// than a clean failure.
+	if buf.Len() != 0 {
+		t.Errorf("copyOSC52 wrote %d bytes despite failing", buf.Len())
+	}
+}
+
+func TestCopyOSC52AtLimit(t *testing.T) {
+	t.Setenv("TMUX", "")
+	var buf bytes.Buffer
+	exact := strings.Repeat("a", maxOSC52Len)
+	if err := copyOSC52(&buf, exact); err != nil {
+		t.Fatalf("copyOSC52 at the limit should succeed: %v", err)
+	}
 	payload := strings.TrimSuffix(strings.TrimPrefix(buf.String(), "\033]52;c;"), "\a")
 	decoded, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 10000 {
-		t.Errorf("decoded len = %d, want 10000", len(decoded))
+	if len(decoded) != maxOSC52Len {
+		t.Errorf("decoded len = %d, want %d", len(decoded), maxOSC52Len)
 	}
 }

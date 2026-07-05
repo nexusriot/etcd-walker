@@ -1,6 +1,28 @@
-etcd-walker.log
-etcd-walker
-build/
+# ---------------------------------------------------------------------------
+# etcd-walker
+# ---------------------------------------------------------------------------
 
+# Compiled binary: repo-root output of `go build` / `build-deb.sh` / `make`.
+# Anchored with a leading slash so it matches ONLY the built binary and NOT
+# the cmd/etcd-walker/ source directory.
+/etcd-walker
 
+# Build & packaging output dirs (Makefile: DIST_DIR / BUILD_DIR).
+/dist/
+/build/
+
+# Go build, test & profiling artifacts.
+*.exe
+*.test
+*.out
+*.prof
+
+# Runtime logs (e.g. etcd-walker.log).
+*.log
+
+# OS / editor cruft.
+.DS_Store
+Thumbs.db
+*.swp
+*~
 .idea/

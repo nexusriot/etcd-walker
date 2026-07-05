@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -14,12 +15,47 @@ import (
 
 // fakeKV is an in-memory clientv3.KV. A Get/Delete is treated as a prefix
 // operation when the resolved Op carries a range end (i.e. WithPrefix was
-// used), otherwise as an exact key operation.
+// used), otherwise as an exact key operation. Leases attached via WithLease
+// are tracked per key so tests can assert lease preservation.
 type fakeKV struct {
-	store map[string]string
+	store  map[string]string
+	leases map[string]int64
 }
 
-func newFakeKV() *fakeKV { return &fakeKV{store: map[string]string{}} }
+func newFakeKV() *fakeKV {
+	return &fakeKV{store: map[string]string{}, leases: map[string]int64{}}
+}
+
+// Fixed revision metadata stamped on every KV the fake returns, so tests can
+// assert the backend maps CreateRevision/ModRevision/Version through.
+const (
+	fakeCreateRev = int64(10)
+	fakeModRev    = int64(20)
+	fakeVersion   = int64(2)
+)
+
+func (f *fakeKV) kv(key string) *mvccpb.KeyValue {
+	return &mvccpb.KeyValue{
+		Key:            []byte(key),
+		Value:          []byte(f.store[key]),
+		Lease:          f.leases[key],
+		CreateRevision: fakeCreateRev,
+		ModRevision:    fakeModRev,
+		Version:        fakeVersion,
+	}
+}
+
+// opLease extracts the lease id a Put would carry. clientv3.Op has no
+// exported accessor for it, so read the unexported field reflectively —
+// kind-specific getters like Int() are allowed on unexported fields.
+func opLease(key, val string, opts []clientv3.OpOption) int64 {
+	op := clientv3.OpPut(key, val, opts...)
+	f := reflect.ValueOf(op).FieldByName("leaseID")
+	if !f.IsValid() {
+		return 0
+	}
+	return f.Int()
+}
 
 func hdr() *etcdserverpb.ResponseHeader {
 	return &etcdserverpb.ResponseHeader{ClusterId: 42}
@@ -37,17 +73,27 @@ func (f *fakeKV) Get(_ context.Context, key string, opts ...clientv3.OpOption) (
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: []byte(k), Value: []byte(f.store[k])})
+			resp.Kvs = append(resp.Kvs, f.kv(k))
 		}
-	} else if v, ok := f.store[key]; ok {
-		resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: []byte(key), Value: []byte(v)})
+	} else if _, ok := f.store[key]; ok {
+		resp.Kvs = append(resp.Kvs, f.kv(key))
+	}
+	if op.IsKeysOnly() { // like real etcd: metadata stays, values are stripped
+		for _, kv := range resp.Kvs {
+			kv.Value = nil
+		}
 	}
 	resp.Count = int64(len(resp.Kvs))
 	return resp, nil
 }
 
-func (f *fakeKV) Put(_ context.Context, key, val string, _ ...clientv3.OpOption) (*clientv3.PutResponse, error) {
+func (f *fakeKV) Put(_ context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error) {
 	f.store[key] = val
+	if l := opLease(key, val, opts); l != 0 {
+		f.leases[key] = l
+	} else {
+		delete(f.leases, key) // a plain Put detaches any lease, like real etcd
+	}
 	return &clientv3.PutResponse{Header: hdr()}, nil
 }
 
@@ -287,6 +333,207 @@ func TestV3SetTTLGrantRequiresClient(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{"/k": "old"})
 	if err := b.setTTL("/k", "v", 60); err == nil {
 		t.Error("setTTL with positive TTL and nil client should error")
+	}
+}
+
+// Renaming a key must carry its lease along so the remaining TTL survives.
+func TestV3RenameKeyPreservesLease(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/old/k": "val"})
+	kv.leases["/old/k"] = 777
+	if err := b.renameKey("/old/k", "/new/k"); err != nil {
+		t.Fatal(err)
+	}
+	if kv.leases["/new/k"] != 777 {
+		t.Errorf("lease not preserved on renameKey: leases=%+v", kv.leases)
+	}
+}
+
+// Renaming a directory must carry each child's lease; keys without a lease
+// must stay lease-free.
+func TestV3RenameDirPreservesLeases(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{
+		"/a/x":     "1",
+		"/a/sub/y": "2",
+	})
+	kv.leases["/a/sub/y"] = 555
+	if err := b.renameDir("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	if kv.leases["/b/sub/y"] != 555 {
+		t.Errorf("lease not preserved on renameDir: leases=%+v", kv.leases)
+	}
+	if l, ok := kv.leases["/b/x"]; ok {
+		t.Errorf("lease %d invented for un-leased key /b/x", l)
+	}
+}
+
+// ls is keys-only by contract: values stay on the server and the details
+// pane re-fetches the focused key. get keeps returning the value.
+func TestV3LsIsKeysOnly(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{
+		"/app/key1": "big-value",
+		"/app/sub/x": "other",
+	})
+	nodes, err := b.ls("/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		if n.Value != "" {
+			t.Errorf("ls should not carry values (keys-only), got %q for %s", n.Value, n.Name)
+		}
+	}
+	n, err := b.get("/app/key1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Value != "big-value" {
+		t.Errorf("get must still return the value, got %q", n.Value)
+	}
+}
+
+func TestV3Probe(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{"/k": "v"})
+	if err := b.probe(); err != nil {
+		t.Fatalf("probe on reachable backend: %v", err)
+	}
+}
+
+// Without a live client (b.c == nil, as in these tests) lease resolution must
+// degrade to "no TTL", never panic.
+func TestTTLForLeaseNilClient(t *testing.T) {
+	b, _ := newTestBackend(nil)
+	if got := b.ttlForLease(context.Background(), 5); got != 0 {
+		t.Errorf("ttlForLease(nil client) = %d, want 0", got)
+	}
+	if got := b.ttlForLease(context.Background(), 0); got != 0 {
+		t.Errorf("ttlForLease(no lease) = %d, want 0", got)
+	}
+}
+
+func TestV3GetReturnsRevisions(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{"/k": "v"})
+	n, err := b.get("/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.CreateRev != fakeCreateRev || n.ModRev != fakeModRev || n.Version != fakeVersion {
+		t.Errorf("revisions not mapped through: %+v, want %d/%d/%d",
+			n, fakeCreateRev, fakeModRev, fakeVersion)
+	}
+}
+
+func TestV3SearchByPath(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{
+		"/app/config/db": "postgres://x",
+		"/app/config/ui": "dark",
+		"/app/other":     "CONFIG in value",
+		"/app/.dir":      "",
+	})
+	nodes, truncated, err := b.search("/app", "CONFIG", false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated {
+		t.Error("unexpected truncation")
+	}
+	got := map[string]bool{}
+	for _, n := range nodes {
+		got[n.Name] = true
+	}
+	// Case-insensitive path match; value-only match excluded; .dir excluded.
+	if !got["/app/config/db"] || !got["/app/config/ui"] {
+		t.Errorf("path matches missing: %v", got)
+	}
+	if got["/app/other"] {
+		t.Errorf("value-only match must not appear when inValues=false: %v", got)
+	}
+}
+
+func TestV3SearchInValues(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{
+		"/app/a": "the SECRET token",
+		"/app/b": "nothing",
+	})
+	nodes, _, err := b.search("/app", "secret", true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "/app/a" {
+		t.Errorf("value search = %+v, want just /app/a", nodes)
+	}
+}
+
+func TestV3SearchTruncates(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{
+		"/x/m1": "", "/x/m2": "", "/x/m3": "", "/x/m4": "",
+	})
+	nodes, truncated, err := b.search("/x", "m", false, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 || !truncated {
+		t.Errorf("limit 2: got %d nodes, truncated=%t; want 2/true", len(nodes), truncated)
+	}
+}
+
+func TestV3CopyKey(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{"/src/k": "val"})
+	kv.leases["/src/k"] = 99
+	if err := b.copyKey("/src/k", "/dst/k"); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/src/k"] != "val" {
+		t.Error("source must be untouched by copy")
+	}
+	if kv.store["/dst/k"] != "val" {
+		t.Errorf("copy value = %q, want val", kv.store["/dst/k"])
+	}
+	if kv.leases["/dst/k"] != 99 {
+		t.Errorf("lease not carried to copy: %+v", kv.leases)
+	}
+	if err := b.copyKey("/missing", "/dst/m"); err == nil {
+		t.Error("copyKey of missing source should error")
+	}
+	if err := b.copyKey("/src/k", "/src/k"); err == nil {
+		t.Error("copyKey onto itself should error")
+	}
+}
+
+func TestV3CopyDir(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{
+		"/a/x":     "1",
+		"/a/sub/y": "2",
+	})
+	kv.leases["/a/sub/y"] = 555
+	if err := b.copyDir("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	if kv.store["/b/x"] != "1" || kv.store["/b/sub/y"] != "2" {
+		t.Errorf("copied tree not intact: %+v", kv.store)
+	}
+	if kv.store["/a/x"] != "1" || kv.store["/a/sub/y"] != "2" {
+		t.Errorf("source tree must be untouched: %+v", kv.store)
+	}
+	if kv.leases["/b/sub/y"] != 555 {
+		t.Errorf("lease not carried to copied key: %+v", kv.leases)
+	}
+	if err := b.copyDir("/a", "/a/inner"); err == nil {
+		t.Error("copyDir into own subtree should be rejected")
+	}
+	if err := b.copyDir("/a/sub", "/a"); err == nil {
+		t.Error("copyDir onto own parent should be rejected")
+	}
+}
+
+func TestIsReservedName(t *testing.T) {
+	if !IsReservedName(".dir") {
+		t.Error("IsReservedName(.dir) should be true")
+	}
+	for _, name := range []string{"dir", ".dirx", "foo", ""} {
+		if IsReservedName(name) {
+			t.Errorf("IsReservedName(%q) should be false", name)
+		}
 	}
 }
 

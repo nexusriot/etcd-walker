@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -132,7 +132,7 @@ func (v *View) NewEditValueForm(header string, value string) *tview.Form {
 // current is pre-filled with the existing remaining TTL ("" when none).
 func (v *View) NewTTLForm(header string, current string) *tview.Form {
 	form := tview.NewForm().
-		AddInputField("TTL — seconds or duration e.g. 1h30m (0 = no expiry)", "", 40, nil, nil)
+		AddInputField("TTL seconds or duration e.g. 1h30m (0 = no expiry)", "", 10, nil, nil)
 	form.GetFormItem(0).(*tview.InputField).SetText(current)
 	form.SetBorder(true)
 	form.SetTitle(header)
@@ -144,6 +144,36 @@ func (v *View) NewTTLForm(header string, current string) *tview.Form {
 		return event
 	})
 	return form
+}
+
+// NewFindForm builds the recursive-search form: substring input plus a
+// checkbox to also match inside values.
+func (v *View) NewFindForm(header string) *tview.Form {
+	form := tview.NewForm().
+		AddInputField("Find (substring, case-insensitive)", "", 20, nil, nil).
+		AddCheckbox("Also search in values", false, func(checked bool) {})
+	form.SetBorder(true)
+	form.SetTitle(header)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewResultsList returns an empty list styled for pickers (e.g. recursive
+// search results). The controller populates it.
+func (v *View) NewResultsList(title string) *tview.List {
+	l := tview.NewList().ShowSecondaryText(false)
+	l.SetBorder(true).
+		SetTitle(title).
+		SetTitleAlign(tview.AlignLeft)
+	l.SetSelectedTextColor(tcell.ColorBlack).
+		SetSelectedBackgroundColor(tcell.ColorYellow)
+	return l
 }
 
 func (v *View) NewSearch() *tview.InputField {
@@ -179,6 +209,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Backspace     Up ([..])
 		[::b]Actions[::-]
 		  Ctrl+N        Create node or directory
+		  Ctrl+D        Duplicate key/dir to a new path
 		  Ctrl+E        Edit value (multiline) / rename dir
 		  Ctrl+R        Rename key or directory
 		  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
@@ -190,6 +221,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+O        Import keys from a JSON file (file browser)
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
+		  Ctrl+F        Find recursively (paths, optionally values)
 		[::b]Editor[::-]
 		  Ctrl+S        Save
 		  Esc/Ctrl+Q    Cancel/Cancel+Quit

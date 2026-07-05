@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -22,14 +23,42 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// modelAPI is the model surface the controller drives. *model.Model
+// satisfies it; tests substitute an in-memory fake.
+type modelAPI interface {
+	ProtocolVersion() string
+	AuthLabel() string
+	Ls(directory string) ([]*model.Node, error)
+	Get(key string) (*model.Node, error)
+	Set(key, value string) error
+	SetTTL(key, value string, ttlSeconds int64) error
+	SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error
+	MkDir(directory string) error
+	Del(key string) error
+	DelDir(key string) error
+	RenameDir(oldDir, newDir string) error
+	RenameKey(oldKey, newKey string) error
+	CopyKey(src, dst string) error
+	CopyDir(srcDir, dstDir string) error
+	Search(dir, query string, inValues bool, limit int) ([]*model.Node, bool, error)
+	Export(dir string) (map[string]string, error)
+	Import(items map[string]string, overwrite bool) (written, skipped int, err error)
+}
+
 type Controller struct {
 	debug        bool
 	view         *view.View
-	model        *model.Model
+	model        modelAPI
 	currentDir   string
 	currentNodes map[string]*Node // mapKey => Node (mapKey is "<basename>|dir" or "<basename>|file")
 	position     map[string]int
 	injected     map[string]map[string]*model.Node
+	// ordered mirrors the display names of the list rows (below "[..]") in the
+	// exact order updateList built them; search() selects rows through it.
+	ordered []string
+	// lastGoodDir is the most recent directory that listed successfully; a
+	// failed listing falls back here instead of aborting the session.
+	lastGoodDir string
 
 	startupErr error
 }
@@ -58,19 +87,24 @@ func NewController(opts model.Options, debug bool) *Controller {
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.6.8 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.7.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
 			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
 	controller := &Controller{
-		debug:      debug,
-		view:       v,
-		model:      m,
-		currentDir: "/",
-		position:   make(map[string]int),
-		injected:   make(map[string]map[string]*model.Node),
-		startupErr: err,
+		debug:       debug,
+		view:        v,
+		currentDir:  "/",
+		lastGoodDir: "/",
+		position:    make(map[string]int),
+		injected:    make(map[string]map[string]*model.Node),
+		startupErr:  err,
+	}
+	// Assign only a real model: a nil *model.Model stored in the interface
+	// would read as non-nil. On startup error Run() never touches the model.
+	if m != nil {
+		controller.model = m
 	}
 	return controller
 }
@@ -148,14 +182,16 @@ func (c *Controller) injectNode(nd *model.Node) {
 	if nd == nil {
 		return
 	}
-	par := parentOf(nd.Name)
+	name := normAbs(nd.Name)
+	if name == "/" {
+		return // root is nobody's child; there is no bucket to put it in
+	}
+	par := parentOf(name)
 	if par != "/" {
 		par += "/"
 	}
 	bucket := c.ensureInjectedBucket(par)
-	fields := strings.FieldsFunc(nd.Name, splitFunc)
-	base := fields[len(fields)-1]
-	mk := makeMapKey(base, nd.IsDir)
+	mk := makeMapKey(baseOf(name), nd.IsDir)
 	bucket[mk] = nd
 	log.Debugf("injected node %s under %s as %s (dir=%t)", nd.Name, par, mk, nd.IsDir)
 }
@@ -165,13 +201,15 @@ func (c *Controller) removeInjected(nd *model.Node) {
 	if nd == nil {
 		return
 	}
-	par := parentOf(nd.Name)
+	name := normAbs(nd.Name)
+	if name == "/" {
+		return
+	}
+	par := parentOf(name)
 	if par != "/" {
 		par += "/"
 	}
-	fields := strings.FieldsFunc(nd.Name, splitFunc)
-	base := fields[len(fields)-1]
-	mk := makeMapKey(base, nd.IsDir)
+	mk := makeMapKey(baseOf(name), nd.IsDir)
 	if bucket, ok := c.injected[par]; ok {
 		delete(bucket, mk)
 		if len(bucket) == 0 {
@@ -235,64 +273,92 @@ func (c *Controller) colorize(base string, isDir bool, label string) string {
 	return label
 }
 
+// orderedEntries returns the map keys and matching display names sorted for
+// the list: directories first, then files, each alphabetical by basename.
+// Sorting must use the basename, not the "<base>|dir" map key — '|' sorts
+// after alphanumerics, so the raw map-key order would put "app2/" before
+// "app/" whenever one name is a prefix of another.
+func orderedEntries(nodes map[string]*Node) (mks, display []string) {
+	type entry struct {
+		mk, base string
+		isDir    bool
+	}
+	var dirs, files []entry
+	for mk, v := range nodes {
+		e := entry{mk: mk, base: baseOf(v.node.Name), isDir: v.node.IsDir}
+		if e.isDir {
+			dirs = append(dirs, e)
+		} else {
+			files = append(files, e)
+		}
+	}
+	byBase := func(s []entry) func(i, j int) bool {
+		return func(i, j int) bool { return s[i].base < s[j].base }
+	}
+	sort.Slice(dirs, byBase(dirs))
+	sort.Slice(files, byBase(files))
+
+	all := append(dirs, files...)
+	mks = make([]string, 0, len(all))
+	display = make([]string, 0, len(all))
+	for _, e := range all {
+		mks = append(mks, e.mk)
+		display = append(display, displayName(e.base, e.isDir))
+	}
+	return mks, display
+}
+
 func (c *Controller) updateList() []string {
 	log.Debugf("updating list")
+	if err := c.makeNodeMap(); err != nil {
+		// A transient listing failure must not kill the session: report it,
+		// then fall back to the last directory that listed cleanly.
+		c.error("Failed to load "+c.currentDir, err, false)
+		if normAbs(c.currentDir) != normAbs(c.lastGoodDir) {
+			c.currentDir = c.lastGoodDir
+			if err2 := c.makeNodeMap(); err2 != nil {
+				c.currentNodes = make(map[string]*Node)
+			}
+		} else {
+			// Nothing to fall back to; show an empty listing rather than
+			// stale entries from another directory.
+			c.currentNodes = make(map[string]*Node)
+		}
+	} else {
+		c.lastGoodDir = c.currentDir
+	}
+
 	c.view.List.Clear()
 	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
-	if err := c.makeNodeMap(); err != nil {
-		c.error("failed to load nodes", err, true)
-	}
 
 	// [..] always on top
 	c.view.List.AddItem("[..]", "..", 0, func() {
 		c.Up()
 	})
 
-	// Collect and split into dirs and files using mapKey suffix.
-	dirKeys := make([]string, 0, len(c.currentNodes))  // mapKey
-	fileKeys := make([]string, 0, len(c.currentNodes)) // mapKey
-	for mk := range c.currentNodes {
-		if strings.HasSuffix(mk, "|dir") {
-			dirKeys = append(dirKeys, mk)
+	mks, display := orderedEntries(c.currentNodes)
+	for idx, mk := range mks {
+		n := c.currentNodes[mk].node
+		base := baseOf(n.Name)
+		if n.IsDir {
+			label := c.colorize(base, true, "📁 "+display[idx])
+			// Use mapKey as secondary text (stable key for actions)
+			c.view.List.AddItem(label, mk, 0, func() {
+				i := c.view.List.GetCurrentItem()
+				_, curMK := c.view.List.GetItemText(i) // secondary text is mapKey
+				curMK = strings.TrimSpace(curMK)
+				if val, ok := c.currentNodes[curMK]; ok && val.node.IsDir {
+					// Save cursor before moving
+					c.position[c.currentDir] = c.view.List.GetCurrentItem()
+					c.Down(baseOf(val.node.Name))
+				}
+			})
 		} else {
-			fileKeys = append(fileKeys, mk)
+			label := c.colorize(base, false, "   "+display[idx])
+			c.view.List.AddItem(label, mk, 0, func() {
+				// no-op; details pane updates via SetChangedFunc
+			})
 		}
-	}
-	sort.Strings(dirKeys)
-	sort.Strings(fileKeys)
-
-	// Directories
-	for _, mk := range dirKeys {
-		n := c.currentNodes[mk].node
-		fields := strings.FieldsFunc(n.Name, splitFunc)
-		base := fields[len(fields)-1]
-		rawLabel := "📁 " + displayName(base, true)
-		label := c.colorize(base, true, rawLabel)
-		// Use mapKey as secondary text (stable key for actions)
-		c.view.List.AddItem(label, mk, 0, func() {
-			i := c.view.List.GetCurrentItem()
-			_, curMK := c.view.List.GetItemText(i) // secondary text is mapKey
-			curMK = strings.TrimSpace(curMK)
-			if val, ok := c.currentNodes[curMK]; ok && val.node.IsDir {
-				// Save cursor before moving
-				c.position[c.currentDir] = c.view.List.GetCurrentItem()
-				fields := strings.FieldsFunc(val.node.Name, splitFunc)
-				base := fields[len(fields)-1]
-				c.Down(base)
-			}
-		})
-	}
-
-	// Files
-	for _, mk := range fileKeys {
-		n := c.currentNodes[mk].node
-		fields := strings.FieldsFunc(n.Name, splitFunc)
-		base := fields[len(fields)-1]
-		rawLabel := "   " + displayName(base, false)
-		label := c.colorize(base, false, rawLabel)
-		c.view.List.AddItem(label, mk, 0, func() {
-			// no-op; details pane updates via SetChangedFunc
-		})
 	}
 
 	// Restore cursor position if we saved it before
@@ -301,18 +367,8 @@ func (c *Controller) updateList() []string {
 		delete(c.position, c.currentDir)
 	}
 
-	ordered := make([]string, 0, len(dirKeys)+len(fileKeys))
-	for _, mk := range dirKeys {
-		n := c.currentNodes[mk].node
-		fs := strings.FieldsFunc(n.Name, splitFunc)
-		ordered = append(ordered, displayName(fs[len(fs)-1], true))
-	}
-	for _, mk := range fileKeys {
-		n := c.currentNodes[mk].node
-		fs := strings.FieldsFunc(n.Name, splitFunc)
-		ordered = append(ordered, displayName(fs[len(fs)-1], false))
-	}
-	return ordered
+	c.ordered = display
+	return display
 }
 
 func (c *Controller) fillDetails(mapKey string) {
@@ -349,10 +405,10 @@ func (c *Controller) fillDetails(mapKey string) {
 	fmt.Fprintf(c.view.Details, "  [green]Cluster ID:[-] %s\n", n.ClusterId)
 
 	if !n.IsDir {
-		bytes, lines, printable := valueStats(n.Value)
+		size, lines, printable := valueStats(n.Value)
 
 		fmt.Fprintf(c.view.Details, "\n[::b]Value info[::-]\n")
-		fmt.Fprintf(c.view.Details, "  [green]Size:[-] %d bytes\n", bytes)
+		fmt.Fprintf(c.view.Details, "  [green]Size:[-] %d bytes\n", size)
 		fmt.Fprintf(c.view.Details, "  [green]Lines:[-] %d\n", lines)
 		fmt.Fprintf(c.view.Details, "  [green]SHA-256:[-] %s\n", shortHash(n.Value))
 		if n.TTL > 0 {
@@ -361,16 +417,33 @@ func (c *Controller) fillDetails(mapKey string) {
 			fmt.Fprintf(c.view.Details, "  [green]TTL:[-] none\n")
 		}
 
+		if n.CreateRev > 0 || n.ModRev > 0 {
+			fmt.Fprintf(c.view.Details, "\n[::b]Revision info[::-]\n")
+			fmt.Fprintf(c.view.Details, "  [green]Create rev:[-] %d\n", n.CreateRev)
+			fmt.Fprintf(c.view.Details, "  [green]Mod rev:[-] %d\n", n.ModRev)
+			if n.Version > 0 {
+				fmt.Fprintf(c.view.Details, "  [green]Version:[-] %d\n", n.Version)
+			}
+		}
+
 		const previewLimit = 512
 		if printable {
-			fmt.Fprintf(c.view.Details, "\n[::b]Preview (%d chars)[::-]\n", previewLimit)
-			if len(n.Value) > previewLimit {
-				fmt.Fprintf(c.view.Details, "%s…\n", n.Value[:previewLimit])
+			shown := n.Value
+			title := fmt.Sprintf("Preview (%d chars)", previewLimit)
+			if pj, ok := prettyJSON(n.Value); ok {
+				shown = pj
+				title = fmt.Sprintf("Preview (JSON, %d chars)", previewLimit)
+			}
+			fmt.Fprintf(c.view.Details, "\n[::b]%s[::-]\n", title)
+			if len(shown) > previewLimit {
+				fmt.Fprintf(c.view.Details, "%s…\n", tview.Escape(shown[:previewLimit]))
 			} else {
-				fmt.Fprintf(c.view.Details, "%s\n", n.Value)
+				fmt.Fprintf(c.view.Details, "%s\n", tview.Escape(shown))
 			}
 		} else {
-			fmt.Fprintf(c.view.Details, "\n[yellow]Binary / non-UTF8 value (preview suppressed)[-]\n")
+			const hexLimit = 256
+			fmt.Fprintf(c.view.Details, "\n[::b]Preview (hex, first %d bytes)[::-]\n", hexLimit)
+			fmt.Fprintf(c.view.Details, "%s", tview.Escape(hexDump(n.Value, hexLimit)))
 		}
 	} else {
 		dirPath := normAbs(n.Name)
@@ -539,6 +612,10 @@ func (c *Controller) setInput() {
 			return c.copyValue()
 		case tcell.KeyCtrlS:
 			return c.search()
+		case tcell.KeyCtrlF:
+			return c.findRecursive()
+		case tcell.KeyCtrlD:
+			return c.duplicate()
 		case tcell.KeyCtrlJ:
 			return c.jump()
 		case tcell.KeyCtrlW:
@@ -553,7 +630,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 28), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 30), true, true)
 			return nil
 
 		case tcell.KeyBackspace2:
@@ -641,21 +718,10 @@ func (c *Controller) Run() error {
 func (c *Controller) search() *tcell.EventKey {
 	search := c.view.NewSearch()
 
-	// Recompute visual ordering to match the list
-	dirNames := []string{}
-	fileNames := []string{}
-	for mk, v := range c.currentNodes {
-		fs := strings.FieldsFunc(v.node.Name, splitFunc)
-		base := fs[len(fs)-1]
-		if strings.HasSuffix(mk, "|dir") {
-			dirNames = append(dirNames, displayName(base, true))
-		} else {
-			fileNames = append(fileNames, displayName(base, false))
-		}
-	}
-	sort.Strings(dirNames)
-	sort.Strings(fileNames)
-	ordered := append(dirNames, fileNames...)
+	// Use the exact ordering the visible list was built with. Recomputing it
+	// here used to sort differently from updateList, landing the cursor on
+	// the wrong row whenever one name was a prefix of another.
+	ordered := c.ordered
 
 	search.SetDoneFunc(func(key tcell.Key) {
 		oldPos := c.view.List.GetCurrentItem()
@@ -700,30 +766,32 @@ func (c *Controller) delete() *tcell.EventKey {
 	}
 
 	if val, ok := c.currentNodes[mapKey]; ok {
-		base := displayName(strings.FieldsFunc(val.node.Name, splitFunc)[len(strings.FieldsFunc(val.node.Name, splitFunc))-1], val.node.IsDir)
-		elem := base
+		elem := displayName(baseOf(val.node.Name), val.node.IsDir)
 		if val.node.IsDir {
 			elem = elem + " (recursive)"
 		}
 		delQ := c.view.NewDeleteQ(elem)
 		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			if buttonLabel == "ok" {
-				if !val.node.IsDir {
-					err = c.model.Del(val.node.Name)
-				} else {
-					err = c.model.DelDir(val.node.Name)
-				}
-				if err != nil {
-					c.view.Pages.RemovePage("modal")
-					c.error("Error deleting node", err, false)
-					return
-				}
-				// Remove from injected cache if present
-				c.removeInjected(val.node)
-				c.view.Details.Clear()
-				c.updateList()
-			}
+			// Drop the confirm dialog first: any modal added below (error or
+			// via updateList) shares the "modal" page name and would be
+			// clobbered by a later remove.
 			c.view.Pages.RemovePage("modal")
+			if buttonLabel != "ok" {
+				return
+			}
+			if !val.node.IsDir {
+				err = c.model.Del(val.node.Name)
+			} else {
+				err = c.model.DelDir(val.node.Name)
+			}
+			if err != nil {
+				c.error("Error deleting node", err, false)
+				return
+			}
+			// Remove from injected cache if present
+			c.removeInjected(val.node)
+			c.view.Details.Clear()
+			c.updateList()
 		})
 		c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
 	}
@@ -731,45 +799,49 @@ func (c *Controller) delete() *tcell.EventKey {
 }
 
 func (c *Controller) create() *tcell.EventKey {
-	pos := 0
-	var err error
 	createForm := c.view.NewCreateForm(fmt.Sprintf("Create Node: %s", c.currentDir))
 	createForm.AddButton("Save", func() {
 		node := strings.TrimSpace(createForm.GetFormItem(0).(*tview.InputField).GetText())
 		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
 		isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
+		c.view.Pages.RemovePage("modal")
 		if node == "" || strings.Contains(node, "/") {
-			c.view.Pages.RemovePage("modal")
 			c.error("Invalid name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
 			return
 		}
-		if node != "" {
-			log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
-			full := normAbs(c.currentDir + node)
-			if !isDir {
-				err = c.model.Set(full, value)
-			} else {
-				err = c.model.MkDir(full)
-			}
-			if err != nil {
-				c.view.Pages.RemovePage("modal")
-				c.error("Error creating node", err, false)
-				return
-			}
-			// If underscore-prefixed, inject so it shows even in v2
-			if strings.HasPrefix(node, "_") {
-				nd := &model.Node{Name: full, IsDir: isDir, Value: value}
-				c.injectNode(nd)
-			}
-			ordered := c.updateList()
-			target := node
-			if isDir {
-				target = node + "/"
-			}
-			pos = c.getPosition(target, ordered) + 1 // +1 for [..]
-			c.view.Pages.RemovePage("modal")
-			c.view.List.SetCurrentItem(pos)
+		if model.IsReservedName(node) {
+			c.error("Invalid name", fmt.Errorf("%q is reserved for internal use", node), false)
+			return
 		}
+		log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
+		full := normAbs(c.currentDir + node)
+		// Refuse to overwrite an existing key or directory silently — the
+		// same guard rename applies.
+		if nd, gerr := c.model.Get(full); gerr == nil && nd != nil {
+			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", full), false)
+			return
+		}
+		var err error
+		if !isDir {
+			err = c.model.Set(full, value)
+		} else {
+			err = c.model.MkDir(full)
+		}
+		if err != nil {
+			c.error("Error creating node", err, false)
+			return
+		}
+		// If underscore-prefixed, inject so it shows even in v2
+		if strings.HasPrefix(node, "_") {
+			nd := &model.Node{Name: full, IsDir: isDir, Value: value}
+			c.injectNode(nd)
+		}
+		ordered := c.updateList()
+		target := node
+		if isDir {
+			target = node + "/"
+		}
+		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1) // +1 for [..]
 	})
 	createForm.AddButton("Quit", func() {
 		c.view.Pages.RemovePage("modal")
@@ -795,10 +867,10 @@ func (c *Controller) edit() *tcell.EventKey {
 			editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
 			editValueForm.AddButton("Save", func() {
 				value := editValueForm.GetFormItem(0).(*tview.InputField).GetText()
+				c.view.Pages.RemovePage("modal")
 				log.Debugf("Editing Node Value: name: %s, value: %s", val.node.Name, value)
 				err = c.model.Set(val.node.Name, value)
 				if err != nil {
-					c.view.Pages.RemovePage("modal")
 					c.error(fmt.Errorf("Failed to edit %s: %w", val.node.Name, err).Error(), err, false)
 					return
 				}
@@ -808,10 +880,8 @@ func (c *Controller) edit() *tcell.EventKey {
 					c.injectNode(nd)
 				}
 				ordered := c.updateList()
-				fs := strings.FieldsFunc(val.node.Name, splitFunc)
-				target := displayName(fs[len(fs)-1], false)
+				target := displayName(baseOf(val.node.Name), false)
 				pos = c.getPosition(target, ordered) + 1
-				c.view.Pages.RemovePage("modal")
 				c.view.List.SetCurrentItem(pos)
 			})
 			editValueForm.AddButton("Quit", func() {
@@ -827,26 +897,23 @@ func (c *Controller) edit() *tcell.EventKey {
 		editDirForm := c.view.NewEditValueForm(fmt.Sprintf("Rename folder: %s", val.node.Name), curBase)
 		editDirForm.AddButton("Save", func() {
 			newName := strings.TrimSpace(editDirForm.GetFormItem(0).(*tview.InputField).GetText())
+			c.view.Pages.RemovePage("modal")
 			if newName == "" || strings.Contains(newName, "/") {
-				c.view.Pages.RemovePage("modal")
 				c.error("Invalid folder name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
 				return
 			}
 			oldPath := val.node.Name
 			newPath := normAbs(c.currentDir + newName)
 			if newPath == oldPath {
-				c.view.Pages.RemovePage("modal")
 				return
 			}
 			if nd, err2 := c.model.Get(newPath); err2 == nil && nd != nil {
-				c.view.Pages.RemovePage("modal")
 				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
 				return
 			}
 			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
 			err = c.model.RenameDir(oldPath, newPath)
 			if err != nil {
-				c.view.Pages.RemovePage("modal")
 				c.error("Failed to rename folder", err, false)
 				return
 			}
@@ -856,7 +923,6 @@ func (c *Controller) edit() *tcell.EventKey {
 			}
 			ordered := c.updateList()
 			pos = c.getPosition(newName+"/", ordered) + 1
-			c.view.Pages.RemovePage("modal")
 			c.view.List.SetCurrentItem(pos)
 		})
 		editDirForm.AddButton("Quit", func() {
@@ -893,20 +959,18 @@ func (c *Controller) rename() *tcell.EventKey {
 	renameForm := c.view.NewEditValueForm(title, curBase)
 	renameForm.AddButton("Save", func() {
 		newName := strings.TrimSpace(renameForm.GetFormItem(0).(*tview.InputField).GetText())
+		c.view.Pages.RemovePage("modal")
 		if newName == "" || strings.Contains(newName, "/") {
-			c.view.Pages.RemovePage("modal")
 			c.error("Invalid name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
 			return
 		}
 		oldPath := val.node.Name
 		newPath := normAbs(c.currentDir + newName)
 		if newPath == oldPath {
-			c.view.Pages.RemovePage("modal")
 			return
 		}
 		// Refuse to overwrite an existing key or directory silently.
 		if nd, err := c.model.Get(newPath); err == nil && nd != nil {
-			c.view.Pages.RemovePage("modal")
 			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
 			return
 		}
@@ -919,7 +983,6 @@ func (c *Controller) rename() *tcell.EventKey {
 			err = c.model.RenameKey(oldPath, newPath)
 		}
 		if err != nil {
-			c.view.Pages.RemovePage("modal")
 			c.error("Failed to rename", err, false)
 			return
 		}
@@ -932,9 +995,7 @@ func (c *Controller) rename() *tcell.EventKey {
 		if val.node.IsDir {
 			target = newName + "/"
 		}
-		pos := c.getPosition(target, ordered) + 1
-		c.view.Pages.RemovePage("modal")
-		c.view.List.SetCurrentItem(pos)
+		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
 	})
 	renameForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
@@ -973,17 +1034,16 @@ func (c *Controller) setTTL() *tcell.EventKey {
 	form := c.view.NewTTLForm(fmt.Sprintf("Set TTL: %s", val.node.Name), cur)
 	form.AddButton("Save", func() {
 		raw := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		c.view.Pages.RemovePage("modal")
 		if raw == "" {
 			raw = "0"
 		}
 		secs, perr := parseTTLInput(raw)
 		if perr != nil {
-			c.view.Pages.RemovePage("modal")
 			c.error("Invalid TTL", perr, false)
 			return
 		}
 		if err := c.model.SetTTL(val.node.Name, val.node.Value, secs); err != nil {
-			c.view.Pages.RemovePage("modal")
 			c.error("Failed to set TTL", err, false)
 			return
 		}
@@ -993,15 +1053,13 @@ func (c *Controller) setTTL() *tcell.EventKey {
 		}
 		ordered := c.updateList()
 		target := displayName(baseOf(val.node.Name), false)
-		pos := c.getPosition(target, ordered) + 1
-		c.view.Pages.RemovePage("modal")
-		c.view.List.SetCurrentItem(pos)
+		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
 		c.fillDetails(mapKey)
 	})
 	form.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 60, 7), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 65, 7), true, true)
 	return nil
 }
 
@@ -1077,7 +1135,9 @@ func (c *Controller) export() *tcell.EventKey {
 	}
 	inp := c.view.NewExportInput(c.currentDir, defaultPath)
 	inp.SetDoneFunc(func(key tcell.Key) {
-		defer c.view.Pages.RemovePage("modal")
+		// Remove the input first: error modals below reuse the "modal" page
+		// name, and a deferred remove would dismiss them instantly.
+		c.view.Pages.RemovePage("modal")
 		if key != tcell.KeyEnter {
 			return
 		}
@@ -1297,6 +1357,58 @@ func shortHash(v string) string {
 	return hex.EncodeToString(h[:8])
 }
 
+// prettyJSON re-indents v when it is a JSON object or array. Scalars are
+// reported as non-JSON so plain numbers/strings keep their raw preview.
+func prettyJSON(v string) (string, bool) {
+	t := strings.TrimSpace(v)
+	if len(t) == 0 || (t[0] != '{' && t[0] != '[') {
+		return "", false
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(t), "", "  "); err != nil {
+		return "", false
+	}
+	return buf.String(), true
+}
+
+// hexDump renders up to max bytes of v xxd-style: offset, 16 hex bytes and a
+// printable-ASCII gutter per row.
+func hexDump(v string, max int) string {
+	b := []byte(v)
+	if len(b) > max {
+		b = b[:max]
+	}
+	var sb strings.Builder
+	for off := 0; off < len(b); off += 16 {
+		end := off + 16
+		if end > len(b) {
+			end = len(b)
+		}
+		row := b[off:end]
+		fmt.Fprintf(&sb, "%08x  ", off)
+		for i := 0; i < 16; i++ {
+			if i < len(row) {
+				fmt.Fprintf(&sb, "%02x ", row[i])
+			} else {
+				sb.WriteString("   ")
+			}
+			if i == 7 {
+				sb.WriteByte(' ')
+			}
+		}
+		sb.WriteString(" |")
+		for _, ch := range row {
+			if ch >= 32 && ch < 127 {
+				sb.WriteByte(ch)
+			} else {
+				sb.WriteByte('.')
+			}
+		}
+		sb.WriteString("|\n")
+	}
+	return sb.String()
+}
+
 func depthOf(path string) int {
 	if path == "/" {
 		return 0
@@ -1307,7 +1419,9 @@ func depthOf(path string) int {
 func (c *Controller) jump() *tcell.EventKey {
 	inp := c.view.NewJump()
 	inp.SetDoneFunc(func(key tcell.Key) {
-		defer c.view.Pages.RemovePage("modal")
+		// Remove the input first: error modals below reuse the "modal" page
+		// name, and a deferred remove would dismiss them instantly.
+		c.view.Pages.RemovePage("modal")
 		if key != tcell.KeyEnter {
 			return
 		}
@@ -1341,48 +1455,173 @@ func (c *Controller) jump() *tcell.EventKey {
 			return
 		}
 
-		c.injectNode(nd)
-
-		if nd.IsDir {
-			c.currentDir = normAbs(nd.Name) + "/"
-			c.Cd(c.currentDir)
-			return
-		}
-
-		parent := parentOf(nd.Name)
-		base := baseOf(nd.Name)
-		if !strings.HasSuffix(parent, "/") {
-			parent += "/"
-		}
-		c.currentDir = parent
-		ordered := c.updateList()
-
-		findIndex := func(name string, list []string) int {
-			for i, v := range list {
-				if v == name {
-					return i
-				}
-			}
-			return -1
-		}
-
-		if pos := findIndex(base, ordered); pos >= 0 {
-			c.view.List.SetCurrentItem(pos + 1) // for [..]
-			i := c.view.List.GetCurrentItem()
-			_, mk := c.view.List.GetItemText(i)
-			c.fillDetails(strings.TrimSpace(mk))
-			return
-		}
-		if pos := findIndex(base+"/", ordered); pos >= 0 {
-			c.view.List.SetCurrentItem(pos + 1)
-			i := c.view.List.GetCurrentItem()
-			_, mk := c.view.List.GetItemText(i)
-			c.fillDetails(strings.TrimSpace(mk))
-			return
-		}
-
-		c.error("Not found", fmt.Errorf("%s", target), false)
+		c.navigateTo(nd)
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
+	return nil
+}
+
+// navigateTo moves the browser to a node: into it when it is a directory,
+// otherwise to its parent with the cursor on the key itself.
+func (c *Controller) navigateTo(nd *model.Node) {
+	c.injectNode(nd)
+
+	if nd.IsDir {
+		dir := normAbs(nd.Name)
+		if dir != "/" {
+			dir += "/"
+		}
+		c.currentDir = dir
+		c.Cd(c.currentDir)
+		return
+	}
+
+	parent := parentOf(nd.Name)
+	if !strings.HasSuffix(parent, "/") {
+		parent += "/"
+	}
+	c.currentDir = parent
+	ordered := c.updateList()
+
+	base := baseOf(nd.Name)
+	for i, v := range ordered {
+		if v == base || v == base+"/" {
+			c.view.List.SetCurrentItem(i + 1) // +1 for [..]
+			idx := c.view.List.GetCurrentItem()
+			_, mk := c.view.List.GetItemText(idx)
+			c.fillDetails(strings.TrimSpace(mk))
+			return
+		}
+	}
+	c.error("Not found", fmt.Errorf("%s", nd.Name), false)
+}
+
+// searchLimit caps recursive-search results so a broad query on a huge tree
+// stays responsive; the picker title says when the cap was hit.
+const searchLimit = 500
+
+// findRecursive prompts for a substring and searches every key under the
+// current directory (paths, optionally values too), then shows the matches
+// in a picker; choosing one navigates to it.
+func (c *Controller) findRecursive() *tcell.EventKey {
+	form := c.view.NewFindForm(fmt.Sprintf("Find under %s", c.currentDir))
+	form.AddButton("Search", func() {
+		query := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		inValues := form.GetFormItem(1).(*tview.Checkbox).IsChecked()
+		c.view.Pages.RemovePage("modal")
+		if query == "" {
+			return
+		}
+		nodes, truncated, err := c.model.Search(c.currentDir, query, inValues, searchLimit)
+		if err != nil {
+			c.error("Search failed", err, false)
+			return
+		}
+		if len(nodes) == 0 {
+			c.info("Find", fmt.Sprintf("No matches for %q under %s", query, c.currentDir))
+			return
+		}
+		c.showFindResults(query, nodes, truncated)
+	})
+	form.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 60, 9), true, true)
+	return nil
+}
+
+func (c *Controller) showFindResults(query string, nodes []*model.Node, truncated bool) {
+	title := fmt.Sprintf(" %d matches for %q ", len(nodes), query)
+	if truncated {
+		title = fmt.Sprintf(" first %d matches for %q (limit reached) ", len(nodes), query)
+	}
+	results := c.view.NewResultsList(title)
+	for _, nd := range nodes {
+		nd := nd
+		results.AddItem(tview.Escape(nd.Name), "", 0, func() {
+			c.view.Pages.RemovePage("modal")
+			c.navigateTo(nd)
+		})
+	}
+	results.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if ev.Key() == tcell.KeyEsc {
+			c.view.Pages.RemovePage("modal")
+			return nil
+		}
+		return ev
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(results, 76, 20), true, true)
+}
+
+// duplicate copies the selected key or directory to a new path entered by
+// the user (absolute, or relative to the current directory). The source is
+// left untouched; TTLs travel with the copy.
+func (c *Controller) duplicate() *tcell.EventKey {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	i := c.view.List.GetCurrentItem()
+	_, mapKey := c.view.List.GetItemText(i)
+	mapKey = strings.TrimSpace(mapKey)
+	if mapKey == ".." {
+		return nil
+	}
+	val, ok := c.currentNodes[mapKey]
+	if !ok || val.node == nil {
+		return nil
+	}
+
+	src := normAbs(val.node.Name)
+	title := fmt.Sprintf("Copy key: %s", src)
+	if val.node.IsDir {
+		title = fmt.Sprintf("Copy folder: %s", src)
+	}
+	form := c.view.NewEditValueForm(title, src+"-copy")
+	form.AddButton("Save", func() {
+		raw := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		c.view.Pages.RemovePage("modal")
+		if raw == "" {
+			c.error("Invalid target", fmt.Errorf("enter a target path (absolute, or relative to %s)", c.currentDir), false)
+			return
+		}
+		var dst string
+		if strings.HasPrefix(raw, "/") {
+			dst = normAbs(raw)
+		} else {
+			dst = normAbs(c.currentDir + raw)
+		}
+		if dst == "/" || dst == src {
+			c.error("Invalid target", fmt.Errorf("cannot copy %s onto itself", src), false)
+			return
+		}
+		if nd, gerr := c.model.Get(dst); gerr == nil && nd != nil {
+			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", dst), false)
+			return
+		}
+		var err error
+		if val.node.IsDir {
+			err = c.model.CopyDir(src, dst)
+		} else {
+			err = c.model.CopyKey(src, dst)
+		}
+		if err != nil {
+			c.error("Failed to copy", err, false)
+			return
+		}
+		if strings.HasPrefix(baseOf(dst), "_") {
+			c.injectNode(&model.Node{Name: dst, IsDir: val.node.IsDir, Value: val.node.Value, ClusterId: val.node.ClusterId})
+		}
+		ordered := c.updateList()
+		if parentOf(dst) == normAbs(c.currentDir) {
+			target := displayName(baseOf(dst), val.node.IsDir)
+			c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
+		} else {
+			c.info("Copied", fmt.Sprintf("%s → %s", src, dst))
+		}
+	})
+	form.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 60, 7), true, true)
 	return nil
 }

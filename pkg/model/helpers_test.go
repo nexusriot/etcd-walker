@@ -39,6 +39,42 @@ func TestWithTrail(t *testing.T) {
 	}
 }
 
+func TestUnderOrEqual(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"/a", "/a", true},
+		{"/a", "/a/b", true},
+		{"/a", "/ab", false}, // sibling with common prefix is NOT nested
+		{"/", "/x", true},
+		{"/a/b", "/a", false},
+	}
+	for _, c := range cases {
+		if got := underOrEqual(c.a, c.b); got != c.want {
+			t.Errorf("underOrEqual(%q, %q) = %t, want %t", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestDirGuards(t *testing.T) {
+	if err := renameDirGuard("/a", "/a/b"); err == nil {
+		t.Error("rename into own subtree must be rejected")
+	}
+	if err := renameDirGuard("/a/b", "/a"); err == nil {
+		t.Error("rename onto own parent must be rejected")
+	}
+	if err := renameDirGuard("/a", "/b"); err != nil {
+		t.Errorf("sibling rename should pass: %v", err)
+	}
+	if err := copyDirGuard("/a", "/a/b"); err == nil {
+		t.Error("copy into own subtree must be rejected")
+	}
+	if err := copyDirGuard("/a", "/a-copy"); err != nil {
+		t.Errorf("copy to prefix-sharing sibling should pass: %v", err)
+	}
+}
+
 func TestIsAuthRequiredErr(t *testing.T) {
 	if isAuthRequiredErr(nil) {
 		t.Error("nil error must not be auth-required")

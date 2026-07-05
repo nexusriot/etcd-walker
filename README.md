@@ -24,8 +24,18 @@ Grab the latest pre-built binaries / `.deb` packages here:
   (v3 via leases, v2 via native key TTL). Editing a key's value preserves
   its TTL instead of dropping it.
 - Quick search inside the current level (`/` or `Ctrl+S`)
+- Recursive find under the current directory (`Ctrl+F`) — case-insensitive
+  substring match on key paths, optionally inside values, with a results
+  picker that jumps straight to the match
+- Duplicate a key or a whole directory subtree to a new path (`Ctrl+D`),
+  TTLs/leases included; the source is left untouched
 - Jump to an absolute or relative path (`Ctrl+J`)
 - Multi-line editor for large key values (`Ctrl+E`)
+- Details pane with size/lines/SHA-256, live TTL, etcd revisions
+  (create/mod revision and version on v3), pretty-printed JSON preview and
+  an xxd-style hex preview for binary values
+- Listings are keys-only on v3 (values are fetched on focus), so browsing
+  huge trees stays light
 - Export the current directory to JSON (`Ctrl+W`)
 - Import keys from a JSON file via a built-in filesystem browser, with
   overwrite / skip-existing modes (`Ctrl+O`)
@@ -48,11 +58,13 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Enter`         | Enter directory                              |
 | `Backspace`     | Go up one directory                          |
 | `Ctrl+N`        | Create new key or directory                  |
+| `Ctrl+D`        | Duplicate key or directory to a new path     |
 | `Delete`        | Delete current key/directory (with confirm)  |
 | `Ctrl+E`        | Edit value (multi-line) / rename directory   |
 | `Ctrl+R`        | Rename key or directory                      |
 | `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
 | `Ctrl+S` or `/` | Quick search inside the current level        |
+| `Ctrl+F`        | Recursive find (paths, optionally values)    |
 | `Ctrl+J`        | Jump to absolute or relative path            |
 | `Ctrl+W`        | Export current directory to a JSON file      |
 | `Ctrl+O`        | Import keys from a JSON file (file browser)   |
@@ -108,8 +120,8 @@ Field reference:
 | `port`            | string  | `2379`      | etcd port                                            |
 | `protocol`        | string  | `auto`      | `v2`, `v3`, or `auto` (try v3 then fall back to v2)  |
 | `debug`           | bool    | `false`     | Enable debug-level logging on stderr                 |
-| `username`        | string  | _empty_     | etcd v3 auth username                                |
-| `password`        | string  | _empty_     | etcd v3 auth password                                |
+| `username`        | string  | _empty_     | etcd auth username (gRPC auth on v3, basic auth on v2) |
+| `password`        | string  | _empty_     | etcd auth password                                   |
 | `tls_enabled`     | bool    | `false`     | Use HTTPS / TLS for etcd v3                          |
 | `tls_ca_file`     | string  | _empty_     | CA cert for verifying the server                     |
 | `tls_cert_file`   | string  | _empty_     | Client certificate for mutual TLS                    |
@@ -191,8 +203,9 @@ One-shot connection without a config file:
 
 ### Authentication
 
-Since v0.3.2 `etcd-walker` supports authentication. Authentication is
-**v3 only** — the etcd v2 backend will ignore `username` / `password`.
+Since v0.3.2 `etcd-walker` supports authentication. Credentials are used by
+both backends — gRPC authentication on v3, HTTP basic auth on v2 — though
+TLS is **v3 only** (the v2 backend always connects over plain HTTP).
 
 The header shows the cluster's auth state as `Auth: ON`, `Auth: OFF`, or
 `Auth: ?` when it could not be determined. If the server has auth enabled

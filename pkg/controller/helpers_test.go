@@ -1,6 +1,12 @@
 package controller
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/nexusriot/etcd-walker/pkg/model"
+)
 
 func TestParseTTLInput(t *testing.T) {
 	ok := map[string]int64{
@@ -184,5 +190,87 @@ func TestGetPosition(t *testing.T) {
 	}
 	if c.getPosition("missing", s) != 0 {
 		t.Errorf("getPosition(missing) = %d, want 0 (fallback)", c.getPosition("missing", s))
+	}
+}
+
+// Jumping to "/" hands injectNode a node named "/"; that used to panic with
+// an index-out-of-range slicing the empty basename.
+func TestInjectNodeRootIsSafe(t *testing.T) {
+	c := &Controller{injected: make(map[string]map[string]*model.Node)}
+	c.injectNode(&model.Node{Name: "/", IsDir: true})
+	if len(c.injected) != 0 {
+		t.Errorf("root must not be injected: %+v", c.injected)
+	}
+	c.removeInjected(&model.Node{Name: "/", IsDir: true}) // must not panic
+}
+
+func TestInjectAndRemoveNode(t *testing.T) {
+	c := &Controller{injected: make(map[string]map[string]*model.Node)}
+	nd := &model.Node{Name: "/a/_b", IsDir: false, Value: "v"}
+	c.injectNode(nd)
+	bucket := c.injected["/a/"]
+	if bucket == nil || bucket["_b|file"] == nil {
+		t.Fatalf("node not injected under /a/: %+v", c.injected)
+	}
+	c.removeInjected(nd)
+	if len(c.injected) != 0 {
+		t.Errorf("bucket not cleaned after removal: %+v", c.injected)
+	}
+}
+
+func TestPrettyJSON(t *testing.T) {
+	if got, ok := prettyJSON(`{"b":1,"a":[2,3]}`); !ok || !strings.Contains(got, "\n  \"b\": 1") {
+		t.Errorf("object not prettified: ok=%t got=%q", ok, got)
+	}
+	if got, ok := prettyJSON(`[1,2]`); !ok || got != "[\n  1,\n  2\n]" {
+		t.Errorf("array not prettified: ok=%t got=%q", ok, got)
+	}
+	if _, ok := prettyJSON(`  {"x": true} `); !ok {
+		t.Error("surrounding whitespace should not defeat detection")
+	}
+	// Non-JSON and scalars keep their raw preview.
+	for _, in := range []string{"", "42", `"str"`, "plain text", "{broken"} {
+		if _, ok := prettyJSON(in); ok {
+			t.Errorf("prettyJSON(%q) should not report JSON", in)
+		}
+	}
+}
+
+func TestHexDump(t *testing.T) {
+	got := hexDump("AB\x00\xff", 256)
+	want := "00000000  41 42 00 ff                                       |AB..|\n"
+	if got != want {
+		t.Errorf("hexDump = %q, want %q", got, want)
+	}
+
+	// Truncation at max bytes; 16 bytes per row.
+	long := strings.Repeat("a", 40)
+	rows := strings.Count(hexDump(long, 32), "\n")
+	if rows != 2 {
+		t.Errorf("hexDump(40 bytes, max 32) rows = %d, want 2", rows)
+	}
+	if hexDump("", 16) != "" {
+		t.Error("hexDump of empty string should be empty")
+	}
+}
+
+// The list must sort by basename, not by the "<base>|dir" map key — '|'
+// sorts after alphanumerics, which used to put "app2/" before "app/" and
+// made search() (which sorted by display name) select the wrong row.
+func TestOrderedEntriesSortsByBasename(t *testing.T) {
+	nodes := map[string]*Node{
+		"app|dir":  {node: &model.Node{Name: "/x/app", IsDir: true}},
+		"app2|dir": {node: &model.Node{Name: "/x/app2", IsDir: true}},
+		"a|file":   {node: &model.Node{Name: "/x/a"}},
+		"ab|file":  {node: &model.Node{Name: "/x/ab"}},
+	}
+	mks, display := orderedEntries(nodes)
+	wantMks := []string{"app|dir", "app2|dir", "a|file", "ab|file"}
+	wantDisplay := []string{"app/", "app2/", "a", "ab"}
+	if !reflect.DeepEqual(mks, wantMks) {
+		t.Errorf("mks = %v, want %v", mks, wantMks)
+	}
+	if !reflect.DeepEqual(display, wantDisplay) {
+		t.Errorf("display = %v, want %v", display, wantDisplay)
 	}
 }

@@ -36,6 +36,13 @@ type Node struct {
 	// the running expiry) and lets setTTL revoke the superseded lease instead
 	// of orphaning it. Always 0 for v2, which has native per-key TTL.
 	LeaseID int64
+	// CreateRev/ModRev are the etcd revisions at which the key was created and
+	// last modified (v3), or the created/modified indexes (v2). Version is the
+	// v3 per-key modification counter; always 0 for v2. All 0 when unknown
+	// (e.g. directory nodes).
+	CreateRev int64
+	ModRev    int64
+	Version   int64
 }
 
 type Options struct {
@@ -89,6 +96,21 @@ func (m *Model) RenameDir(oldDir, newDir string) error        { return m.backend
 func (m *Model) RenameKey(oldKey, newKey string) error        { return m.backend.renameKey(oldKey, newKey) }
 func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir) }
 
+// CopyKey duplicates a single key (value plus lease/TTL) to a new path,
+// leaving the source untouched.
+func (m *Model) CopyKey(src, dst string) error { return m.backend.copyKey(src, dst) }
+
+// CopyDir duplicates a whole subtree (values plus leases/TTLs) under a new
+// prefix, leaving the source untouched. Overlapping source/target is refused.
+func (m *Model) CopyDir(srcDir, dstDir string) error { return m.backend.copyDir(srcDir, dstDir) }
+
+// Search scans every key under dir for a case-insensitive substring match on
+// the full key path — and on the value too when inValues is set. It returns
+// at most limit nodes plus whether the result set was truncated at that cap.
+func (m *Model) Search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
+	return m.backend.search(dir, query, inValues, limit)
+}
+
 // Import writes the given key/value pairs. Keys are normalized to absolute
 // paths. When overwrite is false, keys that already exist as a value are
 // skipped (existing directories never block a write). It returns how many
@@ -117,6 +139,7 @@ func (m *Model) Import(items map[string]string, overwrite bool) (written, skippe
 
 type backend interface {
 	proto() string
+	probe() error
 	ls(directory string) ([]*Node, error)
 	get(key string) (*Node, error)
 	set(key, value string) error
@@ -127,6 +150,9 @@ type backend interface {
 	deldir(key string) error
 	renameDir(oldDir, newDir string) error
 	renameKey(oldKey, newKey string) error
+	copyKey(src, dst string) error
+	copyDir(srcDir, dstDir string) error
+	search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
 	authStatus() (enabled bool, known bool, err error)
 	export(dir string) (map[string]string, error)
 }
@@ -144,7 +170,7 @@ func NewModel(opts Options) (*Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("v3 init failed: %w", err)
 		}
-		if _, err := b3.ls("/"); err != nil {
+		if err := b3.probe(); err != nil {
 			return nil, fmt.Errorf("v3 probe failed: %w", err)
 		}
 
@@ -161,14 +187,14 @@ func NewModel(opts Options) (*Model, error) {
 
 	case "auto":
 		if b3, err := newV3Backend(opts); err == nil {
-			if _, err := b3.ls("/"); err == nil {
+			if err := b3.probe(); err == nil {
 				return &Model{backend: b3}, nil
 			} else if isAuthRequiredErr(err) {
 				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
 		}
 		if b2, err := newV2Backend(opts); err == nil {
-			if _, err := b2.ls("/"); err == nil {
+			if err := b2.probe(); err == nil {
 				return &Model{backend: b2}, nil
 			} else if isAuthRequiredErr(err) {
 				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
@@ -182,7 +208,7 @@ func NewModel(opts Options) (*Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("v2 init failed: %w", err)
 		}
-		if _, err := b2.ls("/"); err != nil {
+		if err := b2.probe(); err != nil {
 			return nil, fmt.Errorf("v2 probe failed: %w", err)
 		}
 		return &Model{backend: b2}, nil
@@ -260,6 +286,16 @@ func newV3Backend(opts Options) (*v3Backend, error) {
 
 func (b *v3Backend) proto() string { return "v3" }
 
+// probe checks reachability (and surfaces auth errors) with a minimal
+// keys-only, limit-1 request instead of pulling the whole keyspace the way
+// ls("/") would.
+func (b *v3Backend) probe() error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	_, err := b.cli.Get(ctx, "/", clientv3.WithPrefix(), clientv3.WithKeysOnly(), clientv3.WithLimit(1))
+	return err
+}
+
 // ttlForLease returns the remaining seconds for a lease id, or 0 when the
 // lease is absent/expired or cannot be resolved. b.c is nil in unit tests, so
 // callers tolerate a 0 result.
@@ -275,6 +311,11 @@ func (b *v3Backend) ttlForLease(ctx context.Context, lease int64) int64 {
 }
 
 const dirMarker = ".dir"
+
+// IsReservedName reports whether a basename is reserved for internal
+// bookkeeping (the v3 directory marker). Creating a key with this name would
+// make it invisible in listings and turn its parent into a phantom directory.
+func IsReservedName(name string) bool { return name == dirMarker }
 
 func normPath(p string) string {
 	if p == "" {
@@ -304,13 +345,26 @@ func underOrEqual(a, b string) bool {
 	return strings.HasPrefix(b, a+"/")
 }
 
+func dirsOverlap(a, b string) bool { return underOrEqual(a, b) || underOrEqual(b, a) }
+
 // renameDirGuard rejects directory renames whose source and target overlap.
 // Both backends copy the subtree and then delete the source prefix; if the
 // paths are nested, that delete would also wipe the freshly copied data.
 func renameDirGuard(oldDir, newDir string) error {
 	o, n := normPath(oldDir), normPath(newDir)
-	if underOrEqual(o, n) || underOrEqual(n, o) {
+	if dirsOverlap(o, n) {
 		return fmt.Errorf("cannot rename directory %s to %s: paths overlap (would cause data loss)", o, n)
+	}
+	return nil
+}
+
+// copyDirGuard rejects copies whose source and target overlap: the copy would
+// land inside the tree being copied (or bury the target's own source),
+// producing a tangled hierarchy nobody intends.
+func copyDirGuard(srcDir, dstDir string) error {
+	s, d := normPath(srcDir), normPath(dstDir)
+	if dirsOverlap(s, d) {
+		return fmt.Errorf("cannot copy directory %s to %s: paths overlap", s, d)
 	}
 	return nil
 }
@@ -327,8 +381,11 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 
+	// Keys-only: a listing only needs names to build the tree level, and the
+	// details pane re-fetches the focused key anyway. Transferring every value
+	// under the prefix made listing large trees painfully heavy.
 	prefix := withTrail(directory)
-	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix())
+	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
 	if err != nil {
 		return nil, err
 	}
@@ -336,10 +393,9 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	clusterID := fmt.Sprintf("%d", resp.Header.GetClusterId())
 
 	type childInfo struct {
-		isDir     bool
-		hasFile   bool
-		fileValue string
-		lease     int64
+		isDir   bool
+		hasFile bool
+		lease   int64
 	}
 	children := map[string]*childInfo{}
 
@@ -364,7 +420,6 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 			ci.isDir = true
 		} else {
 			ci.hasFile = true
-			ci.fileValue = string(kv.Value)
 			ci.lease = kv.Lease
 		}
 	}
@@ -384,15 +439,13 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 			nodes = append(nodes, &Node{Name: full, IsDir: true, ClusterId: clusterID})
 		}
 		if ci.hasFile {
-			// The list pane does not render TTL, and fillDetails re-reads the
-			// focused key for its live countdown — so resolving the lease here
-			// would be one TimeToLive round-trip per leased child for a value
-			// nothing displays. Carry the cheap lease id (already in the Get
-			// response) and leave the countdown to the on-focus refresh.
+			// Value is deliberately left empty (keys-only listing) — the
+			// details pane re-reads the focused key, which is also where the
+			// TTL countdown comes from. Carry the cheap lease id (still
+			// present in keys-only responses) for the on-focus refresh.
 			nodes = append(nodes, &Node{
 				Name:      full,
 				IsDir:     false,
-				Value:     ci.fileValue,
 				ClusterId: clusterID,
 				LeaseID:   ci.lease,
 			})
@@ -420,6 +473,9 @@ func (b *v3Backend) get(key string) (*Node, error) {
 			ClusterId: fmt.Sprintf("%d", exact.Header.GetClusterId()),
 			TTL:       b.ttlForLease(ctx, kv.Lease),
 			LeaseID:   kv.Lease,
+			CreateRev: kv.CreateRevision,
+			ModRev:    kv.ModRevision,
+			Version:   kv.Version,
 		}, nil
 	}
 
@@ -524,32 +580,82 @@ func (b *v3Backend) deldir(key string) error {
 	return err
 }
 
-func (b *v3Backend) renameDir(oldDir, newDir string) error {
-	if err := renameDirGuard(oldDir, newDir); err != nil {
-		return err
-	}
+// treeTimeout stretches the per-op timeout for whole-subtree operations
+// (rename/copy of directories).
+func (b *v3Backend) treeTimeout() time.Duration {
 	timeout := b.timeout * 4
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	return timeout
+}
 
-	oldPfx := withTrail(oldDir)
-	newPfx := withTrail(newDir)
-
+// copyPrefix writes every key under oldPfx to the same relative path under
+// newPfx, re-attaching each key's lease so expiring keys stay expiring. Both
+// prefixes must already carry their trailing slash.
+func (b *v3Backend) copyPrefix(ctx context.Context, oldPfx, newPfx string) error {
 	resp, err := b.cli.Get(ctx, oldPfx, clientv3.WithPrefix())
 	if err != nil {
 		return err
 	}
-
 	for _, kv := range resp.Kvs {
 		newKey := newPfx + strings.TrimPrefix(string(kv.Key), oldPfx)
-		if _, err := b.cli.Put(ctx, newKey, string(kv.Value)); err != nil {
+		var opts []clientv3.OpOption
+		if kv.Lease != 0 {
+			opts = append(opts, clientv3.WithLease(clientv3.LeaseID(kv.Lease)))
+		}
+		if _, err := b.cli.Put(ctx, newKey, string(kv.Value), opts...); err != nil {
 			return err
 		}
 	}
-	_, err = b.cli.Delete(ctx, oldPfx, clientv3.WithPrefix())
+	return nil
+}
+
+func (b *v3Backend) renameDir(oldDir, newDir string) error {
+	if err := renameDirGuard(oldDir, newDir); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.treeTimeout())
+	defer cancel()
+
+	if err := b.copyPrefix(ctx, withTrail(oldDir), withTrail(newDir)); err != nil {
+		return err
+	}
+	_, err := b.cli.Delete(ctx, withTrail(oldDir), clientv3.WithPrefix())
+	return err
+}
+
+func (b *v3Backend) copyDir(srcDir, dstDir string) error {
+	if err := copyDirGuard(srcDir, dstDir); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.treeTimeout())
+	defer cancel()
+	return b.copyPrefix(ctx, withTrail(srcDir), withTrail(dstDir))
+}
+
+func (b *v3Backend) copyKey(src, dst string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
+	defer cancel()
+
+	s, d := normPath(src), normPath(dst)
+	if s == d {
+		return fmt.Errorf("source and target are the same key: %s", s)
+	}
+	resp, err := b.cli.Get(ctx, s)
+	if err != nil {
+		return err
+	}
+	if resp.Count == 0 {
+		return fmt.Errorf("key not found: %s", s)
+	}
+	kv := resp.Kvs[0]
+	// Carry the lease along so the copy expires with the original.
+	var opts []clientv3.OpOption
+	if kv.Lease != 0 {
+		opts = append(opts, clientv3.WithLease(clientv3.LeaseID(kv.Lease)))
+	}
+	_, err = b.cli.Put(ctx, d, string(kv.Value), opts...)
 	return err
 }
 
@@ -565,8 +671,13 @@ func (b *v3Backend) renameKey(oldKey, newKey string) error {
 	if resp.Count == 0 {
 		return fmt.Errorf("key not found: %s", old)
 	}
-	value := string(resp.Kvs[0].Value)
-	if _, err := b.cli.Put(ctx, normPath(newKey), value); err != nil {
+	kv := resp.Kvs[0]
+	// Preserve the key's lease (and thus its remaining TTL) across the rename.
+	var opts []clientv3.OpOption
+	if kv.Lease != 0 {
+		opts = append(opts, clientv3.WithLease(clientv3.LeaseID(kv.Lease)))
+	}
+	if _, err := b.cli.Put(ctx, normPath(newKey), string(kv.Value), opts...); err != nil {
 		return err
 	}
 	_, err = b.cli.Delete(ctx, old)
@@ -597,6 +708,50 @@ func (b *v3Backend) export(dir string) (map[string]string, error) {
 		result[key] = string(kv.Value)
 	}
 	return result, nil
+}
+
+func (b *v3Backend) search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
+	timeout := b.timeout * 10
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	prefix := withTrail(dir)
+	opts := []clientv3.OpOption{clientv3.WithPrefix()}
+	if !inValues {
+		// Path-only search never looks at values; keep the sweep keys-only.
+		opts = append(opts, clientv3.WithKeysOnly())
+	}
+	resp, err := b.cli.Get(ctx, prefix, opts...)
+	if err != nil {
+		return nil, false, err
+	}
+
+	clusterID := fmt.Sprintf("%d", resp.Header.GetClusterId())
+	q := strings.ToLower(query)
+	var out []*Node
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if strings.HasSuffix(key, "/"+dirMarker) {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(key), q) &&
+			!(inValues && strings.Contains(strings.ToLower(string(kv.Value)), q)) {
+			continue
+		}
+		if len(out) >= limit {
+			return out, true, nil
+		}
+		out = append(out, &Node{
+			Name:      normPath(key),
+			Value:     string(kv.Value),
+			ClusterId: clusterID,
+			LeaseID:   kv.Lease,
+		})
+	}
+	return out, false, nil
 }
 
 func (b *v3Backend) authStatus() (bool, bool, error) {
@@ -646,6 +801,13 @@ func newV2Backend(opts Options) (*v2Backend, error) {
 
 func (b *v2Backend) proto() string { return "v2" }
 
+// probe checks reachability with a non-recursive root listing, which v2
+// serves cheaply (single level, no subtree walk).
+func (b *v2Backend) probe() error {
+	_, err := b.ls("/")
+	return err
+}
+
 func (b *v2Backend) ls(directory string) ([]*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
@@ -684,6 +846,8 @@ func (b *v2Backend) get(key string) (*Node, error) {
 		IsDir:     resp.Node.Dir,
 		Value:     resp.Node.Value,
 		TTL:       resp.Node.TTL,
+		CreateRev: int64(resp.Node.CreatedIndex),
+		ModRev:    int64(resp.Node.ModifiedIndex),
 	}, nil
 }
 
@@ -741,52 +905,102 @@ func (b *v2Backend) deldir(key string) error {
 	return err
 }
 
-func (b *v2Backend) renameDir(oldDir, newDir string) error {
-	if err := renameDirGuard(oldDir, newDir); err != nil {
-		return err
-	}
+func (b *v2Backend) treeTimeout() time.Duration {
 	timeout := b.timeout * 4
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	return timeout
+}
 
-	resp, err := b.api.Get(ctx, oldDir, &clientv2.GetOptions{Recursive: true})
+// copyTree replicates the whole subtree at srcDir under dstDir, TTLs
+// included. It always creates dstDir explicitly first — without that an
+// empty source directory would produce nothing at all (and, for rename,
+// then vanish with the delete).
+func (b *v2Backend) copyTree(ctx context.Context, srcDir, dstDir string) error {
+	resp, err := b.api.Get(ctx, srcDir, &clientv2.GetOptions{Recursive: true})
 	if err != nil {
 		return err
 	}
 
-	// Always create the target directory explicitly first.
-	// Without this an empty source directory would simply vanish after the
-	// delete below because v2CopyNodes would never touch newDir at all.
-	if _, err := b.api.Set(ctx, newDir, "",
-		&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
+	mkOpts := &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}
+	if resp.Node.TTL > 0 {
+		mkOpts.TTL = time.Duration(resp.Node.TTL) * time.Second
+	}
+	if _, err := b.api.Set(ctx, dstDir, "", mkOpts); err != nil {
 		return err
 	}
 
-	if err := b.v2CopyNodes(ctx, resp.Node.Nodes, oldDir, newDir); err != nil {
+	return b.v2CopyNodes(ctx, resp.Node.Nodes, srcDir, dstDir)
+}
+
+func (b *v2Backend) renameDir(oldDir, newDir string) error {
+	if err := renameDirGuard(oldDir, newDir); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.treeTimeout())
+	defer cancel()
 
-	_, err = b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
+	if err := b.copyTree(ctx, oldDir, newDir); err != nil {
+		return err
+	}
+	_, err := b.api.Delete(ctx, oldDir, &clientv2.DeleteOptions{Dir: true, Recursive: true})
 	return err
 }
 
-// v2CopyNodes recursively copies nodes from oldDir prefix to newDir prefix.
+func (b *v2Backend) copyDir(srcDir, dstDir string) error {
+	if err := copyDirGuard(srcDir, dstDir); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.treeTimeout())
+	defer cancel()
+	return b.copyTree(ctx, normPath(srcDir), normPath(dstDir))
+}
+
+func (b *v2Backend) copyKey(src, dst string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout*2)
+	defer cancel()
+
+	s, d := normPath(src), normPath(dst)
+	if s == d {
+		return fmt.Errorf("source and target are the same key: %s", s)
+	}
+	resp, err := b.api.Get(ctx, s, nil)
+	if err != nil {
+		return err
+	}
+	// Carry the remaining TTL along so the copy expires with the original.
+	var opts *clientv2.SetOptions
+	if resp.Node.TTL > 0 {
+		opts = &clientv2.SetOptions{TTL: time.Duration(resp.Node.TTL) * time.Second}
+	}
+	_, err = b.api.Set(ctx, d, resp.Node.Value, opts)
+	return err
+}
+
+// v2CopyNodes recursively copies nodes from oldDir prefix to newDir prefix,
+// re-applying each node's remaining TTL so a rename does not silently make
+// expiring entries permanent.
 func (b *v2Backend) v2CopyNodes(ctx context.Context, nodes clientv2.Nodes, oldDir, newDir string) error {
 	for _, n := range nodes {
 		newKey := newDir + strings.TrimPrefix(n.Key, oldDir)
 		if n.Dir {
-			if _, err := b.api.Set(ctx, newKey, "",
-				&clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}); err != nil {
+			opts := &clientv2.SetOptions{Dir: true, PrevExist: clientv2.PrevIgnore}
+			if n.TTL > 0 {
+				opts.TTL = time.Duration(n.TTL) * time.Second
+			}
+			if _, err := b.api.Set(ctx, newKey, "", opts); err != nil {
 				return err
 			}
 			if err := b.v2CopyNodes(ctx, n.Nodes, oldDir, newDir); err != nil {
 				return err
 			}
 		} else {
-			if _, err := b.api.Set(ctx, newKey, n.Value, nil); err != nil {
+			var opts *clientv2.SetOptions
+			if n.TTL > 0 {
+				opts = &clientv2.SetOptions{TTL: time.Duration(n.TTL) * time.Second}
+			}
+			if _, err := b.api.Set(ctx, newKey, n.Value, opts); err != nil {
 				return err
 			}
 		}
@@ -801,7 +1015,12 @@ func (b *v2Backend) renameKey(oldKey, newKey string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := b.api.Set(ctx, normPath(newKey), resp.Node.Value, nil); err != nil {
+	// Preserve the key's remaining TTL across the rename.
+	var opts *clientv2.SetOptions
+	if resp.Node.TTL > 0 {
+		opts = &clientv2.SetOptions{TTL: time.Duration(resp.Node.TTL) * time.Second}
+	}
+	if _, err := b.api.Set(ctx, normPath(newKey), resp.Node.Value, opts); err != nil {
 		return err
 	}
 	_, err = b.api.Delete(ctx, normPath(oldKey), nil)
@@ -836,6 +1055,55 @@ func v2collectKeys(nodes clientv2.Nodes, result map[string]string) {
 			result[n.Key] = n.Value
 		}
 	}
+}
+
+func (b *v2Backend) search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
+	timeout := b.timeout * 10
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	resp, err := b.api.Get(ctx, normPath(dir), &clientv2.GetOptions{Recursive: true, Sort: true})
+	if err != nil {
+		if clientv2.IsKeyNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+
+	q := strings.ToLower(query)
+	var out []*Node
+	truncated := false
+	var walk func(nodes clientv2.Nodes) bool // false = stop, limit reached
+	walk = func(nodes clientv2.Nodes) bool {
+		for _, n := range nodes {
+			if n.Dir {
+				if !walk(n.Nodes) {
+					return false
+				}
+				continue
+			}
+			if !strings.Contains(strings.ToLower(n.Key), q) &&
+				!(inValues && strings.Contains(strings.ToLower(n.Value), q)) {
+				continue
+			}
+			if len(out) >= limit {
+				truncated = true
+				return false
+			}
+			out = append(out, &Node{
+				Name:      n.Key,
+				Value:     n.Value,
+				TTL:       n.TTL,
+				ClusterId: resp.ClusterID,
+			})
+		}
+		return true
+	}
+	walk(resp.Node.Nodes)
+	return out, truncated, nil
 }
 
 func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {

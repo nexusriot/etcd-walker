@@ -51,7 +51,8 @@ loading (`pkg/config`) and clipboard / OSC52 handling
 ```
 etcd-walker/
 ├── cmd/etcd-walker/
-│   └── main.go              entry point: flags + config → Controller
+│   ├── main.go              entry point: flags + config → Controller
+│   └── main_test.go         flag-wrapper semantics
 │
 ├── pkg/
 │   ├── config/              JSON config loader
@@ -60,9 +61,11 @@ etcd-walker/
 │   ├── model/               etcd abstraction (v2 / v3 behind one iface)
 │   │   ├── model.go
 │   │   ├── v3backend_test.go   in-memory fakeKV exercises the v3 backend
+│   │   ├── v2backend_test.go   fake KeysAPI exercises the v2 backend
 │   │   └── helpers_test.go
 │   ├── controller/          UI state + keybindings + business glue
 │   │   ├── controller.go
+│   │   ├── controller_test.go  fakeModel + headless tview drive the flows
 │   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
 │   │   └── view.go
@@ -84,8 +87,9 @@ etcd-walker/
 ```
 
 The codebase is intentionally small and flat — one production file per
-package, each with a sibling `_test.go` — so newcomers can read it
-end-to-end in a single sitting.
+package, almost all with sibling `_test.go` files (only `pkg/view`, pure
+widget construction, has none) — so newcomers can read it end-to-end in a
+single sitting.
 
 ---
 
@@ -148,6 +152,7 @@ to branch on protocol.
 ```go
 type backend interface {
     proto() string
+    probe() error
     ls(dir string) ([]*Node, error)
     get(path string) (*Node, error)
     set(path, value string) error
@@ -158,6 +163,9 @@ type backend interface {
     deldir(path string) error
     renameDir(oldPath, newPath string) error
     renameKey(oldPath, newPath string) error
+    copyKey(src, dst string) error
+    copyDir(srcDir, dstDir string) error
+    search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
     authStatus() (enabled bool, known bool, err error)
     export(dir string) (map[string]string, error)
 }
@@ -170,9 +178,10 @@ Two implementations satisfy it:
   (needed for lease operations and `Auth.AuthStatus`). Speaks gRPC, supports
   auth and TLS.
 * `v2Backend` — wraps `github.com/coreos/etcd/client` (`clientv2.KeysAPI`),
-  speaks HTTP, ignores auth/TLS knobs.
+  speaks HTTP. Username/password are passed through as HTTP basic auth;
+  the TLS knobs are ignored (the endpoint is always `http://`).
 
-Most exported `Model` methods are 1:1 wrappers over the interface. Three are
+Most exported `Model` methods are 1:1 wrappers over the interface. A few are
 worth calling out:
 
 * `Model.Import(items, overwrite)` — the one operation **not** backed by a
@@ -183,6 +192,17 @@ worth calling out:
 * `Model.SetKeepTTL(key, value, leaseID, ttlSeconds)` — pass-through to
   `setKeep`; writes a new value while keeping the key's existing expiry
   (see §5.5).
+* `Model.Search(dir, query, inValues, limit)` — recursive, case-insensitive
+  substring search over full key paths (and values when `inValues`); returns
+  at most `limit` nodes plus a truncation flag. On v3 the sweep is keys-only
+  unless values are being searched.
+* `Model.CopyKey` / `Model.CopyDir` — duplicate a key or a whole subtree,
+  carrying leases (v3) / TTLs (v2) along; overlapping source/target is
+  rejected by `copyDirGuard`. Renames reuse the same copy machinery
+  (`copyPrefix` on v3, `copyTree` on v2) and add the delete.
+* `probe()` — cheap reachability/auth check used by `NewModel`: a keys-only
+  `limit=1` range on v3, a non-recursive root listing on v2 — so startup
+  never pulls the whole keyspace.
 
 `authStatus()` returns a `(enabled, known, err)` triple rather than a string
 so the controller can distinguish "auth is off" from "couldn't determine"
@@ -199,6 +219,10 @@ and render the header label (`ON` / `OFF` / `?`) accordingly.
   fails. The chosen protocol is exposed via `Model.ProtocolVersion()` so
   the controller can show it in the header.
 
+All three arms validate connectivity with the backend's `probe()` (§5.1)
+before returning, so a bad endpoint fails fast at startup instead of on the
+first listing.
+
 ### 5.3 Synthetic directories on v3
 
 etcd v3 has no native concept of a directory: keys are flat. To present a
@@ -208,9 +232,16 @@ hierarchy `etcd-walker` adopts two conventions:
   `/` is rendered as a **synthetic** subdirectory.
 * `mkdir(p)` writes a marker key `p/.dir` so that an "empty directory"
   can exist; the controller filters `.dir` markers out of the user-facing
-  listing and `export()` skips them too.
+  listing and `export()`/`search()` skip them too. `model.IsReservedName`
+  lets the controller refuse creating a key literally named `.dir`, which
+  would otherwise be invisible and make its parent a phantom directory.
 
 This keeps the v2 and v3 user experiences indistinguishable.
+
+`ls` on v3 is **keys-only** (`clientv3.WithKeysOnly`): a listing needs names
+to build the level, and the details pane re-reads the focused key anyway
+(§7.3), so values never cross the wire for browsing. `Node.Value` is empty
+in listings by contract.
 
 ### 5.4 TLS and timeouts
 
@@ -218,15 +249,19 @@ For v3, `Options.TLSEnabled`, `TLSCAFile`, `TLSCertFile`, `TLSKeyFile`
 and `TLSSkipVerify` are folded into a `*tls.Config` and attached to the
 gRPC dial options. `TimeoutSeconds` (default 5) becomes the
 `DialTimeout` and the per-request `context.WithTimeout` budget so a
-broken server cannot hang the UI.
+broken server cannot hang the UI. Whole-subtree operations get stretched
+budgets: directory rename/copy use `4×` (min 20 s, `treeTimeout`), and
+export/search use `10×` (min 30 s).
 
 ### 5.5 TTL / expiry
 
 `Node` carries two expiry fields: `TTL int64` — the remaining time-to-live in
 seconds, where `0` means "no expiry" — and `LeaseID int64` — the v3 lease
-currently attached to the key (`0` = none; always `0` on v2). The two backends
-source them differently because etcd implements expiry differently across the
-protocol versions:
+currently attached to the key (`0` = none; always `0` on v2). It also carries
+revision metadata for the details pane: `CreateRev`/`ModRev` (v3 revisions,
+or the v2 created/modified indexes) and `Version` (the v3 per-key counter,
+always `0` on v2). The two backends source the expiry fields differently
+because etcd implements expiry differently across the protocol versions:
 
 * **v3** has no per-key TTL; expiry is modelled with **leases**. To set a
   TTL, `setTTL` reads the key's *current* lease, grants a fresh one with
@@ -255,6 +290,10 @@ the running countdown continues unbroken (plain `Put` when `LeaseID == 0`), and
 v2 re-applies the remaining `TTL`. This is what the value editor uses — see
 §7.4.
 
+Renames and copies preserve expiry the same way: the v3 copy loop re-attaches
+each key's lease and the v2 copy re-applies each node's remaining TTL, so
+moving or duplicating an expiring key never silently makes it permanent.
+
 Because the v3 TTL is a *countdown*, it changes every second on the server.
 The controller therefore re-reads the focused key on demand rather than
 trusting the value cached at list time — see §7.3.
@@ -272,8 +311,9 @@ trusting the value cached at list time — see §7.3.
 * `List` — the left pane: the directory listing.
 * `Details` — the right pane: metadata about the highlighted node.
 * Constructors for the dialogs (create, edit, rename, set-TTL,
-  delete-confirm, search, jump, export, JSON import file-browser,
-  import-mode prompt, multi-line editor, hotkeys help).
+  delete-confirm, search, recursive-find form, search-results picker, jump,
+  export, JSON import file-browser, import-mode prompt, multi-line editor,
+  hotkeys help).
 
 Key design decisions:
 
@@ -281,9 +321,13 @@ Key design decisions:
   the model. The controller installs all input captures and `done`
   handlers.
 * Dialogs are added to `Pages` and removed when dismissed, so any
-  background list state survives a modal interaction.
-* The full-screen multi-line editor is a separate `Pages` entry rather
-  than a modal so it can use the entire terminal.
+  background list state survives a modal interaction. All dialogs share the
+  page name `"modal"`, so a handler must remove the current dialog **before**
+  showing a follow-up (e.g. an error) — a deferred remove would delete the
+  follow-up instead.
+* The full-screen multi-line editor swaps the application root
+  (`OpenEditor`/`CloseEditor`), hiding the frame and hotkey legend so it can
+  use the entire terminal; it is not a `Pages` modal.
 
 ---
 
@@ -299,15 +343,21 @@ lives.
 type Controller struct {
     debug        bool
     view         *view.View
-    model        *model.Model
+    model        modelAPI                    // *model.Model in production
     currentDir   string
     currentNodes map[string]*Node            // mapKey → Node
     position     map[string]int              // dir path → cursor index
     injected     map[string]map[string]*model.Node
+    ordered      []string                    // display names, list order
+    lastGoodDir  string                      // fallback for failed listings
     startupErr   error
 }
 ```
 
+* `model` — an unexported `modelAPI` interface rather than the concrete
+  `*model.Model`; production wiring is unchanged, but tests drive the
+  controller with an in-memory fake (see `controller_test.go`, which pairs
+  the fake with headless tview widgets).
 * `currentDir` — the path the user is currently looking at.
 * `currentNodes` — keyed by `mapKey` (`"<base>|dir"` or `"<base>|file"`)
   so a key and a directory with the same basename can coexist.
@@ -318,6 +368,12 @@ type Controller struct {
   * keys whose name starts with `_` that some etcd v2 listings hide;
   * just-created keys/dirs that should appear immediately even if the
     listing happens to lag.
+* `ordered` — the display names of the current list rows (below `[..]`) in
+  the exact order `updateList` built them; `search()` resolves the selected
+  name back to a row index through it, guaranteeing the two never disagree.
+* `lastGoodDir` — the most recent directory that listed successfully; a
+  failed listing reports the error and falls back here instead of aborting
+  the session (§9.2).
 * `startupErr` — captured from `model.NewModel`; instead of crashing the
   process the controller renders the error inside the TUI on
   `Run()`, so a bad config produces a friendly screen rather than a stack
@@ -328,34 +384,52 @@ type Controller struct {
 `setInput()` installs two `SetInputCapture` callbacks:
 
 * On the global `App`: `Ctrl+Q` quits.
-* On the `List` widget: every other hotkey (`Ctrl+N`, `Delete`,
+* On the `List` widget: every other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`,
   `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
-  `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+H`, `Backspace`).
+  `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+H`, `Backspace`).
 
-Each hotkey calls a small method (`create`, `delete`, `editMultiline`,
-`rename`, `setTTL`, `copyPath`, `copyValue`, `search`, `jump`, `export`,
-`importJSON`) which opens the appropriate dialog and, on submission, calls
-into the model and then `updateList()` to refresh the listing.
+Each hotkey calls a small method (`create`, `duplicate`, `delete`,
+`editMultiline`, `rename`, `setTTL`, `copyPath`, `copyValue`, `search`,
+`findRecursive`, `jump`, `export`, `importJSON`) which opens the appropriate
+dialog and, on submission, calls into the model and then `updateList()` to
+refresh the listing. `findRecursive` chains two dialogs: the query form,
+then a results picker whose selection hands the node to `navigateTo` — the
+shared helper (also used by `jump`) that enters a directory or selects a key
+in its parent.
 
 ### 7.3 Listing rendering
 
 `updateList()` is the central refresh routine:
 
-1. `model.Ls(currentDir)` — fetch children from etcd.
-2. `makeNodeMap()` — merge that result with `injected[currentDir]`.
-3. Sort: directories first, then keys, both alphabetical.
-4. Push `tview.ListItem`s into the view, applying yellow styling to
+1. `makeNodeMap()` — `model.Ls(currentDir)` merged with
+   `injected[currentDir]` (the server listing wins on collisions). On error
+   the refresh is **non-fatal**: an error modal is shown and the controller
+   falls back to `lastGoodDir` (§9.2); on success `lastGoodDir` advances.
+2. Sort via `orderedEntries`: directories first, then keys, each
+   alphabetical **by basename** — sorting the raw `"<base>|dir"` map keys
+   would order `app2/` before `app/` because `|` sorts after alphanumerics.
+3. Push `tview.ListItem`s into the view, applying yellow styling to
    underscore-prefixed names.
-5. Restore the cursor from `position[currentDir]`.
-6. Bind a selection handler that calls `fillDetails()` whenever the
-   highlight moves.
+4. Restore the cursor from `position[currentDir]`.
+5. Cache the display ordering in `c.ordered` for `search()`.
+
+The selection handler that calls `fillDetails()` on every highlight move is
+installed once in `Run()` via `List.SetChangedFunc`.
 
 `fillDetails()` renders the right-hand pane for the highlighted node:
 path info (type, basename, parent, full path, depth), cluster info
 (protocol, cluster id) and, for keys, value info — byte size, line count,
 SHA-256, the **TTL** (`1h2m3s (3723s)` via `formatTTL`, or `none`) and
-either a 512-char preview or a "binary / non-UTF8" notice. For
-directories it instead does a live `Ls` to report child/subdir/key counts.
+revision info (create/mod revision, plus the per-key version on v3). The
+preview adapts to the value: JSON objects/arrays are re-indented
+(`prettyJSON`), printable text gets a 512-char excerpt, and binary /
+non-UTF8 values get an xxd-style hex dump of the first 256 bytes
+(`hexDump`). All preview text passes through `tview.Escape` so `[…]`
+sequences in values are not eaten as color tags. For directories it instead
+does a live `Ls` to report child/subdir/key counts.
+
+Because v3 listings are keys-only (§5.3), this on-focus re-read is also
+what populates the value in the details pane and in the edit dialogs.
 
 Because a v3 lease TTL is a live countdown (§5.5), `fillDetails()` re-reads
 the focused **key** from the server with `model.Get` on every selection
@@ -367,17 +441,26 @@ count.
 
 ### 7.4 Mutations
 
-Every mutating action (`create`, `delete`, `rename`, `editMultiline`,
-`setTTL`, `importJSON`) follows the same pattern:
+Every mutating action (`create`, `duplicate`, `delete`, `rename`,
+`editMultiline`, `setTTL`, `importJSON`) follows the same pattern:
 
 1. Open a dialog from `view`.
-2. On `Enter`, validate input and call the matching `model` method.
+2. On `Enter`, remove the dialog page first (§6), then validate input and
+   call the matching `model` method.
 3. On error, surface a red modal with the error text — never crash.
 4. On success, update the `injected` cache (so the new state is visible
    even if the server lags), then call `updateList()`.
 
+`create` refuses to overwrite an existing key/directory and rejects the
+reserved `.dir` name (§5.3); `rename` and `duplicate` apply the same
+target-exists guard.
+
 Renames are implemented as **copy-then-delete** in the model so they work
-identically on v2 and v3 even though v3 has no native rename.
+identically on v2 and v3 even though v3 has no native rename; leases/TTLs
+travel with the copied keys (§5.5). `duplicate` (`Ctrl+D`) is the same copy
+step without the delete: it prompts for a target path (absolute or relative
+to the current directory, prefilled `<source>-copy`) and works for single
+keys and whole subtrees.
 
 `setTTL` is keys-only (directories are rejected): the dialog accepts either
 a bare number of seconds or a Go duration string (`1h30m`, `90m`, `45s`),
@@ -407,6 +490,11 @@ fresh by re-reading the key on focus (§7.3).
    `tmux passthrough` (`ESC Ptmux; ESC <inner> ESC \\`) so it reaches the
    outer terminal.
 
+The OSC52 path caps the payload at 10 000 bytes (`maxOSC52Len` — many
+terminals limit the whole escape sequence). Oversized values fail cleanly
+with `ErrTooLarge` instead of silently copying a truncated string; the
+error message names both sizes so the user knows why.
+
 Failures are non-fatal: the controller shows "Copied" / "Copy failed" in
 a small modal and otherwise carries on.
 
@@ -429,17 +517,21 @@ trace without disturbing the interface.
   stderr.
 * **Operational errors** (a failed `set`, a denied `del`) become red
   modal dialogs that the user dismisses and continues.
+* **Listing failures** (e.g. a timeout while entering a directory) are
+  also non-fatal: `updateList` reports the error and falls back to
+  `lastGoodDir` — the last directory that listed successfully — showing an
+  empty level only if even that fallback fails.
 * The process only exits non-zero when `tview` itself fails or the user
   hits `Ctrl+Q`.
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.6.8**, hard-coded in three places
+The current user-facing version is **0.7.0**, hard-coded in three places
 that must be bumped together when cutting a release:
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
-  (`"Etcd-walker v.0.6.8 …"`).
-* `VERSION ?= 0.6.8` in the `Makefile` (overridable on the CLI:
+  (`"Etcd-walker v.0.7.0 …"`).
+* `VERSION ?= 0.7.0` in the `Makefile` (overridable on the CLI:
   `make debs VERSION=…`).
 * The `version=` variable at the top of `build-deb.sh` (the legacy helper;
   `build-deb-arm64.sh` just delegates to it).
