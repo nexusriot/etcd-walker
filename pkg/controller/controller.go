@@ -41,12 +41,12 @@ type modelAPI interface {
 	CopyKey(src, dst string) error
 	CopyDir(srcDir, dstDir string) error
 	Search(dir, query string, inValues bool, limit int) ([]*model.Node, bool, error)
+	History(key string, limit int) ([]*model.Revision, bool, error)
 	Export(dir string) (map[string]string, error)
 	Import(items map[string]string, overwrite bool) (written, skipped int, err error)
 }
 
 type Controller struct {
-	debug        bool
 	view         *view.View
 	model        modelAPI
 	currentDir   string
@@ -69,7 +69,7 @@ type Node struct {
 
 func splitFunc(r rune) bool { return r == '/' }
 
-func NewController(opts model.Options, debug bool) *Controller {
+func NewController(opts model.Options) *Controller {
 	m, err := model.NewModel(opts)
 
 	v := view.NewView()
@@ -87,13 +87,12 @@ func NewController(opts model.Options, debug bool) *Controller {
 	}
 
 	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.7.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
+		fmt.Sprintf("Etcd-walker v.0.8.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
 			opts.Host, opts.Port, tlsTag, headerProto, auth),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
 	controller := &Controller{
-		debug:       debug,
 		view:        v,
 		currentDir:  "/",
 		lastGoodDir: "/",
@@ -606,6 +605,8 @@ func (c *Controller) setInput() {
 			return c.rename()
 		case tcell.KeyCtrlT:
 			return c.setTTL()
+		case tcell.KeyCtrlV:
+			return c.history()
 		case tcell.KeyCtrlP:
 			return c.copyPath()
 		case tcell.KeyCtrlY:
@@ -656,7 +657,7 @@ func (c *Controller) Down(cur string) {
 	}
 	log.Debugf("command: down - current dir: %s, new dir: %s", c.currentDir, newDir)
 	c.currentDir = newDir
-	c.Cd(c.currentDir)
+	c.updateList()
 }
 
 func (c *Controller) Up() {
@@ -671,10 +672,8 @@ func (c *Controller) Up() {
 
 	log.Debugf("command: up - current dir: %s, new dir: %s", c.currentDir, newDir)
 	c.currentDir = newDir
-	c.Cd(c.currentDir)
+	c.updateList()
 }
-
-func (c *Controller) Cd(path string) { c.updateList() }
 
 func (c *Controller) Stop() {
 	log.Debugf("exit...")
@@ -850,89 +849,6 @@ func (c *Controller) create() *tcell.EventKey {
 	return nil
 }
 
-func (c *Controller) edit() *tcell.EventKey {
-	var err error
-	pos := 0
-	i := c.view.List.GetCurrentItem()
-	_, mapKey := c.view.List.GetItemText(i) // secondary is mapKey
-	mapKey = strings.TrimSpace(mapKey)
-
-	if mapKey == ".." {
-		return nil
-	}
-
-	if val, ok := c.currentNodes[mapKey]; ok {
-		// Edit file (value)
-		if !val.node.IsDir {
-			editValueForm := c.view.NewEditValueForm(fmt.Sprintf("Edit: %s", val.node.Name), val.node.Value)
-			editValueForm.AddButton("Save", func() {
-				value := editValueForm.GetFormItem(0).(*tview.InputField).GetText()
-				c.view.Pages.RemovePage("modal")
-				log.Debugf("Editing Node Value: name: %s, value: %s", val.node.Name, value)
-				err = c.model.Set(val.node.Name, value)
-				if err != nil {
-					c.error(fmt.Errorf("Failed to edit %s: %w", val.node.Name, err).Error(), err, false)
-					return
-				}
-				// If underscore, refresh injected value (path unchanged)
-				if strings.HasPrefix(baseOf(val.node.Name), "_") {
-					nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId}
-					c.injectNode(nd)
-				}
-				ordered := c.updateList()
-				target := displayName(baseOf(val.node.Name), false)
-				pos = c.getPosition(target, ordered) + 1
-				c.view.List.SetCurrentItem(pos)
-			})
-			editValueForm.AddButton("Quit", func() {
-				c.view.Pages.RemovePage("modal")
-			})
-			c.view.Pages.AddPage("modal", c.view.ModalEdit(editValueForm, 60, 7), true, true)
-			return nil
-		}
-
-		// Edit directory (rename)
-		fs := strings.FieldsFunc(val.node.Name, splitFunc)
-		curBase := fs[len(fs)-1]
-		editDirForm := c.view.NewEditValueForm(fmt.Sprintf("Rename folder: %s", val.node.Name), curBase)
-		editDirForm.AddButton("Save", func() {
-			newName := strings.TrimSpace(editDirForm.GetFormItem(0).(*tview.InputField).GetText())
-			c.view.Pages.RemovePage("modal")
-			if newName == "" || strings.Contains(newName, "/") {
-				c.error("Invalid folder name", fmt.Errorf("name must be non-empty and must not contain '/'"), false)
-				return
-			}
-			oldPath := val.node.Name
-			newPath := normAbs(c.currentDir + newName)
-			if newPath == oldPath {
-				return
-			}
-			if nd, err2 := c.model.Get(newPath); err2 == nil && nd != nil {
-				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
-				return
-			}
-			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
-			err = c.model.RenameDir(oldPath, newPath)
-			if err != nil {
-				c.error("Failed to rename folder", err, false)
-				return
-			}
-			// Update injected cache if underscore involved
-			if strings.HasPrefix(curBase, "_") || strings.HasPrefix(newName, "_") {
-				c.reinjectRename(oldPath, newPath, true, val.node.ClusterId, "")
-			}
-			ordered := c.updateList()
-			pos = c.getPosition(newName+"/", ordered) + 1
-			c.view.List.SetCurrentItem(pos)
-		})
-		editDirForm.AddButton("Quit", func() {
-			c.view.Pages.RemovePage("modal")
-		})
-		c.view.Pages.AddPage("modal", c.view.ModalEdit(editDirForm, 60, 7), true, true)
-	}
-	return nil
-}
-
 func (c *Controller) rename() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -1078,8 +994,9 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 		return nil
 	}
 	if val.node.IsDir {
-		// edit folder
-		return c.edit()
+		// Directories have no value to edit; Ctrl+E falls through to the
+		// same rename dialog Ctrl+R opens.
+		return c.rename()
 	}
 
 	title := fmt.Sprintf(" Edit (multiline): %s ", val.node.Name)
@@ -1472,7 +1389,7 @@ func (c *Controller) navigateTo(nd *model.Node) {
 			dir += "/"
 		}
 		c.currentDir = dir
-		c.Cd(c.currentDir)
+		c.updateList()
 		return
 	}
 

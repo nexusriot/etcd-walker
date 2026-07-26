@@ -65,7 +65,9 @@ etcd-walker/
 │   │   └── helpers_test.go
 │   ├── controller/          UI state + keybindings + business glue
 │   │   ├── controller.go
+│   │   ├── history.go          revision-history viewer (picker/detail/diff/restore)
 │   │   ├── controller_test.go  fakeModel + headless tview drive the flows
+│   │   ├── history_test.go
 │   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
 │   │   └── view.go
@@ -87,9 +89,10 @@ etcd-walker/
 ```
 
 The codebase is intentionally small and flat — one production file per
-package, almost all with sibling `_test.go` files (only `pkg/view`, pure
-widget construction, has none) — so newcomers can read it end-to-end in a
-single sitting.
+package (plus `controller/history.go`, which keeps the self-contained
+revision-history flow out of the already-large `controller.go`), almost all
+with sibling `_test.go` files (only `pkg/view`, pure widget construction,
+has none) — so newcomers can read it end-to-end in a single sitting.
 
 ---
 
@@ -108,7 +111,7 @@ The boot sequence ([cmd/etcd-walker/main.go](cmd/etcd-walker/main.go)) is:
    defaults.
 5. Apply config-file values, then overlay any explicitly-set CLI flags.
 6. Build a `model.Options` struct and hand it to
-   `controller.NewController(opts, debug)`.
+   `controller.NewController(opts)`.
 7. `ctrl.Run()` enters the tview main loop and blocks until the user
    quits.
 
@@ -166,6 +169,7 @@ type backend interface {
     copyKey(src, dst string) error
     copyDir(srcDir, dstDir string) error
     search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
+    history(key string, limit int) ([]*Revision, bool, error)
     authStatus() (enabled bool, known bool, err error)
     export(dir string) (map[string]string, error)
 }
@@ -196,6 +200,8 @@ worth calling out:
   substring search over full key paths (and values when `inValues`); returns
   at most `limit` nodes plus a truncation flag. On v3 the sweep is keys-only
   unless values are being searched.
+* `Model.History(key, limit)` — the stored versions of a key, newest first
+  (v3 only; see §5.6). Returns `[]*Revision` plus a limit-truncation flag.
 * `Model.CopyKey` / `Model.CopyDir` — duplicate a key or a whole subtree,
   carrying leases (v3) / TTLs (v2) along; overlapping source/target is
   rejected by `copyDirGuard`. Renames reuse the same copy machinery
@@ -206,7 +212,11 @@ worth calling out:
 
 `authStatus()` returns a `(enabled, known, err)` triple rather than a string
 so the controller can distinguish "auth is off" from "couldn't determine"
-and render the header label (`ON` / `OFF` / `?`) accordingly.
+and render the header label (`ON` / `OFF` / `?`) accordingly. Note that
+today only the explicit-`v3` arm of `NewModel` actually calls it — in
+`auto` and `v2` modes `authLabel` is never populated and the header shows
+`?` (and `v2Backend.authStatus`, though implemented and tested, is dead in
+production). Fixing this is on the roadmap (F-2).
 
 ### 5.2 Protocol selection
 
@@ -294,9 +304,41 @@ Renames and copies preserve expiry the same way: the v3 copy loop re-attaches
 each key's lease and the v2 copy re-applies each node's remaining TTL, so
 moving or duplicating an expiring key never silently makes it permanent.
 
+**Sharp edge — shared leases.** Re-attaching the *same* lease means a v3 copy
+shares one lease with its source (and applications outside this tool routinely
+park many keys on one lease). `setTTL`'s clean-up `Revoke` assumes the lease
+belongs to the edited key alone; revoking a shared lease deletes every other
+key attached to it. See finding B-1 in §12 — the fix is to count attached keys
+(`Lease.TimeToLive` with `WithAttachedKeys`) and skip the revoke when the
+lease is shared.
+
 Because the v3 TTL is a *countdown*, it changes every second on the server.
 The controller therefore re-reads the focused key on demand rather than
 trusting the value cached at list time — see §7.3.
+
+### 5.6 Revision history (v3)
+
+etcd v3's MVCC store retains every version of a key until compaction, and
+`history(key, limit)` surfaces that as `[]*Revision{Rev, Version, Value}`,
+newest first. Starting from the current `KeyValue`, the walk repeatedly
+issues `Get(key, WithRev(ModRevision-1))` — the state of the key one write
+earlier — until it reaches the creation (`Version == 1`), collects `limit`
+entries (reported via the returned bool), or hits compacted history
+(`rpctypes.ErrCompacted`, matched tolerantly by `isCompactedErr`), which
+ends the walk *gracefully*: compaction is the natural end of retrievable
+history, not an error. Each step is one round-trip, so the walk runs under
+the stretched 10× timeout like export/search.
+
+The caller can tell why the list ends where it does: the bool means the
+limit was hit; otherwise an oldest entry with `Version > 1` means the rest
+was compacted, and `Version == 1` means the full history is present. The
+walk covers the key's current incarnation only — a deleted-and-recreated
+key starts a fresh history (finding older incarnations would mean scanning
+revisions for the delete, far too expensive for a browsing hotkey).
+
+v2 keeps a per-key `modifiedIndex` but no previous values, so its `history`
+returns a descriptive "requires etcd v3" error which the controller
+surfaces as-is.
 
 ---
 
@@ -341,7 +383,6 @@ lives.
 
 ```go
 type Controller struct {
-    debug        bool
     view         *view.View
     model        modelAPI                    // *model.Model in production
     currentDir   string
@@ -385,17 +426,18 @@ type Controller struct {
 
 * On the global `App`: `Ctrl+Q` quits.
 * On the `List` widget: every other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`,
-  `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
+  `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+V`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
   `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+H`, `Backspace`).
 
 Each hotkey calls a small method (`create`, `duplicate`, `delete`,
-`editMultiline`, `rename`, `setTTL`, `copyPath`, `copyValue`, `search`,
-`findRecursive`, `jump`, `export`, `importJSON`) which opens the appropriate
-dialog and, on submission, calls into the model and then `updateList()` to
-refresh the listing. `findRecursive` chains two dialogs: the query form,
-then a results picker whose selection hands the node to `navigateTo` — the
-shared helper (also used by `jump`) that enters a directory or selects a key
-in its parent.
+`editMultiline`, `rename`, `setTTL`, `history`, `copyPath`, `copyValue`,
+`search`, `findRecursive`, `jump`, `export`, `importJSON`) which opens the
+appropriate dialog and, on submission, calls into the model and then
+`updateList()` to refresh the listing. `findRecursive` chains two dialogs:
+the query form, then a results picker whose selection hands the node to
+`navigateTo` — the shared helper (also used by `jump`) that enters a
+directory or selects a key in its parent. `history` chains up to four
+screens (§7.5).
 
 ### 7.3 Listing rendering
 
@@ -474,6 +516,42 @@ value **keeps** the expiry instead of silently dropping it. The controller
 passes the `LeaseID`/`TTL` from the focused node, which `fillDetails` keeps
 fresh by re-reading the key on focus (§7.3).
 
+### 7.5 Revision history viewer
+
+`Ctrl+V` on a key (directories are refused — they are synthetic and have no
+revisions) opens the history flow, implemented in
+[pkg/controller/history.go](pkg/controller/history.go) as a chain of
+screens that all share the `"modal"` page name and follow the
+remove-before-add rule (§6):
+
+1. **Picker** — one row per stored revision: revision number, per-key
+   version, size, first-line preview (`revPreview`: escaped, trimmed,
+   `(binary)`/`(empty)` placeholders); the newest row is bold-marked
+   `(current)`. The title says when the list was cut by `historyLimit`
+   (100) or by compaction (§5.6). When only one version is stored the
+   picker is skipped in favour of an info modal that says *why* there is
+   nothing to browse (single version vs. compacted history).
+2. **Detail** — revision metadata (revision, version, size/lines, SHA-256,
+   reusing the details-pane helpers) plus the full value: pretty-printed
+   when JSON, hex-dumped when binary. `d` opens the diff, `r` the restore
+   confirmation (offered only for non-current revisions), `Esc` returns to
+   the picker.
+3. **Diff** — a line-based LCS diff (`diffLines`) of the selected revision
+   against the current value, rendered by `renderDiff` with `-`/`+`
+   coloring and long unchanged runs collapsed to `··· N unchanged lines
+   ···` around 3 lines of context. Binary values and values whose line
+   product exceeds `maxDiffCells` (the DP table bound) fall back to a plain
+   notice instead of a diff. The diff compares against `revs[0]` — the
+   current value as of the walk — so the whole flow reasons about one
+   consistent snapshot.
+4. **Restore confirm** — cancel returns to the detail screen; confirm calls
+   `restoreRevision`, which re-reads the key and writes the old value via
+   `SetKeepTTL` with the key's *live* lease/TTL, honouring the same
+   expiry-preservation contract as the value editor (§7.4). If the key
+   vanished in the meantime the restore fails with an error modal instead
+   of writing blindly. On success the listing refreshes with the cursor
+   back on the key and the details pane re-rendered.
+
 ---
 
 ## 8. Package: `pkg/util/clip`
@@ -526,12 +604,12 @@ trace without disturbing the interface.
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.7.0**, hard-coded in three places
+The current user-facing version is **0.8.0**, hard-coded in three places
 that must be bumped together when cutting a release:
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
-  (`"Etcd-walker v.0.7.0 …"`).
-* `VERSION ?= 0.7.0` in the `Makefile` (overridable on the CLI:
+  (`"Etcd-walker v.0.8.0 …"`).
+* `VERSION ?= 0.8.0` in the `Makefile` (overridable on the CLI:
   `make debs VERSION=…`).
 * The `version=` variable at the top of `build-deb.sh` (the legacy helper;
   `build-deb-arm64.sh` just delegates to it).
@@ -589,3 +667,42 @@ Some natural places to extend:
 
 The clean MVC split and the small surface of the `backend` interface are
 the two design constraints worth preserving as the project grows.
+
+A prioritized feature backlog lives in [ROADMAP.md](ROADMAP.md).
+
+---
+
+## 12. Known limitations & open findings (2026-07-26 review)
+
+Findings from the July 2026 code review that are **not yet fixed**, ordered
+by severity. Bugs carry a `B-` id, limitations an `L-` id; the roadmap
+references them.
+
+### Bugs / hazards
+
+| Id  | Where | Issue |
+|-----|-------|-------|
+| B-1 | `model.go` `v3Backend.setTTL` | The post-write `Revoke` of the key's previous lease assumes one-key-per-lease. `copyKey`/`copyDir` deliberately re-attach the source's lease, and external apps commonly attach many keys to one lease — revoking a shared lease **deletes all its other keys**. Guard: resolve the lease with `TimeToLive(..., WithAttachedKeys())` and only revoke when ≤1 key remains attached. |
+| B-2 | `model.go` `NewModel` | Only the explicit `v3` arm calls `authStatus()`; `auto` and `v2` leave `authLabel` empty, so the header shows `Auth: ?` in the default mode. `v2Backend.authStatus` is production-dead code. |
+| B-3 | `model.go` `NewModel` (`auto`) | When the v3 probe fails and the walker falls back to v2, the freshly dialed v3 `*clientv3.Client` is never `Close()`d — its gRPC reconnect loop keeps retrying against the endpoint for the whole session. Same (short-lived) leak when an explicit probe fails. |
+| B-5 | `model.go` `Model.Import` | Import does not apply the `IsReservedName` guard that `create()` applies: a JSON file containing a `…/.dir` key writes the marker directly, silently turning its parent into a phantom directory. |
+| B-6 | `view.go` legend | Cosmetic: the bottom legend styles the search hotkey with `[::]` instead of `[::b]`, so `[/,Ctrl+S]Search` is the only non-bold entry. |
+
+Fixed since the review: **B-4** (2026-07-26) — `edit()` was deleted outright;
+its file branch was unreachable and would have dropped TTLs (it saved via
+`Set`), and its directory branch duplicated `rename()`. `Ctrl+E` on a
+directory now delegates to the same rename dialog as `Ctrl+R`, with a
+regression test pinning the fall-through.
+
+### Accepted limitations
+
+| Id  | Limitation |
+|-----|-----------|
+| L-1 | v3 `ls`/`search`/`export` fetch the full key range in one `Range` (no `WithLimit`+`WithFromKey` pagination). `ls` is keys-only which keeps browsing light, but find/export over millions of keys is slow and memory-hungry. |
+| L-2 | The v2 backend always dials plain `http://`; the TLS options are v3-only (documented in README). |
+| L-3 | v3 keys containing `//` or a trailing `/` are listed at their normalized path; `Get`/`Set` then target the normalized name, so such keys cannot be opened. |
+| L-4 | The `replace google.golang.org/grpc => v1.29.1` pin (needed by the legacy `github.com/coreos/etcd` v2 client, which also drags in the archived `dgrijalva/jwt-go`) holds the whole binary on a June-2020 gRPC. Dropping v2 support is the only clean way out (roadmap F-13). |
+| L-5 | Renames/copies are client-side copy-then-delete loops, not transactions — a failure mid-way leaves a partial target (and, for rename, the intact source). v3 could batch per-key `Txn`s but a whole-tree atomic move doesn't fit in one txn anyway. |
+| L-6 | `fillDetails` issues a live `Ls` per directory-focus and a `Get` (+`TimeToLive` when leased) per key-focus — cursor movement does network round-trips; sluggish on high-latency clusters. |
+| L-7 | OSC52 clipboard fallback refuses payloads > 10 kB (`ErrTooLarge`) rather than truncating. |
+| L-8 | No live refresh: listings only update after an action. A v3 `Watch` on the current prefix is roadmap F-1. |

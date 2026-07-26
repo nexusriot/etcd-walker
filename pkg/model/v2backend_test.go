@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,5 +272,15 @@ func TestV2RenameDirPreservesTTLs(t *testing.T) {
 	}
 	if len(fake.deletes) != 1 || fake.deletes[0] != "/old" {
 		t.Errorf("source dir not deleted: %+v", fake.deletes)
+	}
+}
+
+// v2 keeps no previous key values, so history must fail with a descriptive
+// error instead of pretending an empty history exists.
+func TestV2HistoryUnsupported(t *testing.T) {
+	b := &v2Backend{}
+	_, _, err := b.history("/k", 10)
+	if err == nil || !strings.Contains(err.Error(), "v3") {
+		t.Errorf("history on v2 = %v, want v3-required error", err)
 	}
 }

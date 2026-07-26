@@ -57,7 +57,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -164,6 +164,26 @@ func (v *View) NewFindForm(header string) *tview.Form {
 	return form
 }
 
+// NewHistoryDetail returns a scrollable, color-enabled text pane used by the
+// revision-history viewer for the revision detail and diff screens. The
+// controller fills it and installs the key bindings.
+func (v *View) NewHistoryDetail(title string) *tview.TextView {
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetWrap(true)
+	tv.SetBorder(true)
+	tv.SetTitle(title)
+	tv.SetTitleAlign(tview.AlignLeft)
+	return tv
+}
+
+// NewRestoreQ asks before overwriting the current value with an old revision.
+func (v *View) NewRestoreQ(details string) *tview.Modal {
+	m := tview.NewModal()
+	m.SetText(details).AddButtons([]string{"restore", "cancel"})
+	return m
+}
+
 // NewResultsList returns an empty list styled for pickers (e.g. recursive
 // search results). The controller populates it.
 func (v *View) NewResultsList(title string) *tview.List {
@@ -213,6 +233,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+E        Edit value (multiline) / rename dir
 		  Ctrl+R        Rename key or directory
 		  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
+		  Ctrl+V        Revision history of a key (v3): view/diff/restore
 		  Del           Delete (recursive for dirs)
 		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)

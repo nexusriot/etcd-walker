@@ -183,7 +183,7 @@ func main() {
 		TLSSkipVerify:  tlsSkipVerify,
 		TimeoutSeconds: timeoutSeconds,
 	}
-	ctrl := controller.NewController(opts, debug)
+	ctrl := controller.NewController(opts)
 	if err := ctrl.Run(); err != nil {
 		log.WithError(err).Error("etcd-walker exited with error")
 		os.Exit(1)

@@ -12,12 +12,25 @@ import (
 )
 
 // fakeModel is an in-memory modelAPI: listings and gets are served from maps,
-// mutations are no-ops. Directory keys must carry their trailing slash, the
-// way the controller passes currentDir around.
+// mutations are no-ops (SetKeepTTL records its call so restore tests can
+// assert TTL preservation). Directory keys must carry their trailing slash,
+// the way the controller passes currentDir around.
 type fakeModel struct {
-	nodes map[string][]*model.Node // "/dir/" -> children
-	gets  map[string]*model.Node   // "/dir/key" -> node
-	lsErr map[string]error         // "/dir/" -> forced Ls failure
+	nodes     map[string][]*model.Node     // "/dir/" -> children
+	gets      map[string]*model.Node       // "/dir/key" -> node
+	lsErr     map[string]error             // "/dir/" -> forced Ls failure
+	hist      map[string][]*model.Revision // "/dir/key" -> canned history
+	histTrunc bool
+	histErr   error
+	histCalls int
+
+	setKeepCalls []setKeepCall
+}
+
+type setKeepCall struct {
+	key, value string
+	leaseID    int64
+	ttl        int64
 }
 
 func (f *fakeModel) ProtocolVersion() string { return "v3" }
@@ -37,20 +50,30 @@ func (f *fakeModel) Get(key string) (*model.Node, error) {
 	return nil, fmt.Errorf("not found: %s", key)
 }
 
-func (f *fakeModel) Set(string, string) error                          { return nil }
-func (f *fakeModel) SetTTL(string, string, int64) error                { return nil }
-func (f *fakeModel) SetKeepTTL(string, string, int64, int64) error     { return nil }
-func (f *fakeModel) MkDir(string) error                                { return nil }
-func (f *fakeModel) Del(string) error                                  { return nil }
-func (f *fakeModel) DelDir(string) error                               { return nil }
-func (f *fakeModel) RenameDir(string, string) error                    { return nil }
-func (f *fakeModel) RenameKey(string, string) error                    { return nil }
-func (f *fakeModel) CopyKey(string, string) error                      { return nil }
-func (f *fakeModel) CopyDir(string, string) error                      { return nil }
-func (f *fakeModel) Export(string) (map[string]string, error)          { return nil, nil }
-func (f *fakeModel) Import(map[string]string, bool) (int, int, error)  { return 0, 0, nil }
+func (f *fakeModel) Set(string, string) error           { return nil }
+func (f *fakeModel) SetTTL(string, string, int64) error { return nil }
+func (f *fakeModel) SetKeepTTL(key, value string, leaseID, ttl int64) error {
+	f.setKeepCalls = append(f.setKeepCalls, setKeepCall{key, value, leaseID, ttl})
+	return nil
+}
+func (f *fakeModel) MkDir(string) error                               { return nil }
+func (f *fakeModel) Del(string) error                                 { return nil }
+func (f *fakeModel) DelDir(string) error                              { return nil }
+func (f *fakeModel) RenameDir(string, string) error                   { return nil }
+func (f *fakeModel) RenameKey(string, string) error                   { return nil }
+func (f *fakeModel) CopyKey(string, string) error                     { return nil }
+func (f *fakeModel) CopyDir(string, string) error                     { return nil }
+func (f *fakeModel) Export(string) (map[string]string, error)         { return nil, nil }
+func (f *fakeModel) Import(map[string]string, bool) (int, int, error) { return 0, 0, nil }
 func (f *fakeModel) Search(string, string, bool, int) ([]*model.Node, bool, error) {
 	return nil, false, nil
+}
+func (f *fakeModel) History(key string, limit int) ([]*model.Revision, bool, error) {
+	f.histCalls++
+	if f.histErr != nil {
+		return nil, false, f.histErr
+	}
+	return f.hist[key], f.histTrunc, nil
 }
 
 // newTestController wires a Controller to headless tview widgets (no screen
@@ -306,6 +329,22 @@ func TestColorize(t *testing.T) {
 	}
 	if got := c.colorize("plain", false, "lbl"); got != "lbl" {
 		t.Errorf("plain entry = %q, want unchanged", got)
+	}
+}
+
+// Ctrl+E on a directory must fall through to the rename dialog — the old
+// edit() path (whose file branch was dead code that dropped TTLs) is gone.
+func TestEditMultilineOnDirOpensRenameDialog(t *testing.T) {
+	c := newTestController(&fakeModel{nodes: map[string][]*model.Node{
+		"/": {{Name: "/d", IsDir: true}},
+	}})
+	c.updateList()
+	c.view.List.SetCurrentItem(1) // row 0 is [..]
+
+	c.editMultiline()
+
+	if !c.view.Pages.HasPage("modal") {
+		t.Error("rename dialog should open when Ctrl+E is pressed on a directory")
 	}
 }
 

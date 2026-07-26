@@ -1,6 +1,4 @@
-# ---------------------------------------------------------------------------
 # etcd-walker
-# ---------------------------------------------------------------------------
 
 # Compiled binary: repo-root output of `go build` / `build-deb.sh` / `make`.
 # Anchored with a leading slash so it matches ONLY the built binary and NOT

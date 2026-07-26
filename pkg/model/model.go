@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	// v3 client
 	clientv3 "go.etcd.io/etcd/client/v3"
 	// v2 client
@@ -43,6 +45,16 @@ type Node struct {
 	CreateRev int64
 	ModRev    int64
 	Version   int64
+}
+
+// Revision is one stored version of a key, as returned by History. Rev is
+// the etcd store revision that wrote it (the key's ModRevision at that
+// point), Version the key's per-incarnation change counter (1 = the write
+// that created the key), Value the value as of that write.
+type Revision struct {
+	Rev     int64
+	Version int64
+	Value   string
 }
 
 type Options struct {
@@ -111,6 +123,14 @@ func (m *Model) Search(dir, query string, inValues bool, limit int) ([]*Node, bo
 	return m.backend.search(dir, query, inValues, limit)
 }
 
+// History returns the stored versions of a key, newest first, at most limit
+// entries. The bool reports truncation by the limit; an oldest entry with
+// Version > 1 instead means the rest of the history has been compacted away.
+// v3 only — the v2 store keeps no previous key values.
+func (m *Model) History(key string, limit int) ([]*Revision, bool, error) {
+	return m.backend.history(key, limit)
+}
+
 // Import writes the given key/value pairs. Keys are normalized to absolute
 // paths. When overwrite is false, keys that already exist as a value are
 // skipped (existing directories never block a write). It returns how many
@@ -153,6 +173,7 @@ type backend interface {
 	copyKey(src, dst string) error
 	copyDir(srcDir, dstDir string) error
 	search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
+	history(key string, limit int) ([]*Revision, bool, error)
 	authStatus() (enabled bool, known bool, err error)
 	export(dir string) (map[string]string, error)
 }
@@ -754,6 +775,68 @@ func (b *v3Backend) search(dir, query string, inValues bool, limit int) ([]*Node
 	return out, false, nil
 }
 
+// isCompactedErr reports whether err is etcd's "required revision has been
+// compacted" — the normal end of a history walk on clusters with compaction.
+func isCompactedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, rpctypes.ErrCompacted) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "compacted")
+}
+
+// history walks a key's MVCC past: starting from the current KeyValue it
+// repeatedly fetches the key at ModRevision-1 — the state one write earlier —
+// collecting versions newest-first. The walk ends at the key's creation
+// (Version == 1), at limit entries (truncated = true), or where compaction
+// has erased older revisions (returned without error: it IS the end of the
+// retrievable history). One round-trip per revision, so the whole walk runs
+// under the stretched export/search-style timeout. Only the key's current
+// incarnation is covered — a delete+recreate starts a fresh history.
+func (b *v3Backend) history(key string, limit int) ([]*Revision, bool, error) {
+	timeout := b.timeout * 10
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if limit < 1 {
+		limit = 1
+	}
+	k := normPath(key)
+	resp, err := b.cli.Get(ctx, k)
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.Count == 0 {
+		return nil, false, fmt.Errorf("key not found: %s", k)
+	}
+
+	kv := resp.Kvs[0]
+	revs := []*Revision{{Rev: kv.ModRevision, Version: kv.Version, Value: string(kv.Value)}}
+
+	for kv.Version > 1 && len(revs) < limit {
+		prev, err := b.cli.Get(ctx, k, clientv3.WithRev(kv.ModRevision-1))
+		if err != nil {
+			if isCompactedErr(err) {
+				break
+			}
+			return nil, false, err
+		}
+		if prev.Count == 0 {
+			// Version promised an older write but the server has none —
+			// treat like compaction and return what was gathered.
+			break
+		}
+		kv = prev.Kvs[0]
+		revs = append(revs, &Revision{Rev: kv.ModRevision, Version: kv.Version, Value: string(kv.Value)})
+	}
+	return revs, kv.Version > 1 && len(revs) >= limit, nil
+}
+
 func (b *v3Backend) authStatus() (bool, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1104,6 +1187,12 @@ func (b *v2Backend) search(dir, query string, inValues bool, limit int) ([]*Node
 	}
 	walk(resp.Node.Nodes)
 	return out, truncated, nil
+}
+
+// history is v3-only: the v2 store keeps a per-key modifiedIndex but no
+// previous values, so there is nothing to walk.
+func (b *v2Backend) history(string, int) ([]*Revision, bool, error) {
+	return nil, false, fmt.Errorf("revision history requires etcd v3 (the v2 store does not retain previous key values)")
 }
 
 func (b *v2Backend) authStatus() (enabled bool, known bool, err error) {

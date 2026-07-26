@@ -10,6 +10,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -20,10 +21,46 @@ import (
 type fakeKV struct {
 	store  map[string]string
 	leases map[string]int64
+	// hist holds optional per-key revision history (oldest → newest) served
+	// to exact-key Gets; a Get with WithRev(r) returns the newest entry with
+	// rev <= r, the way real MVCC reads behave.
+	hist map[string][]fakeRev
+	// compactRev makes Gets below this revision fail with ErrCompacted,
+	// modelling a compacted cluster.
+	compactRev int64
+}
+
+type fakeRev struct {
+	rev, version int64
+	value        string
 }
 
 func newFakeKV() *fakeKV {
-	return &fakeKV{store: map[string]string{}, leases: map[string]int64{}}
+	return &fakeKV{
+		store:  map[string]string{},
+		leases: map[string]int64{},
+		hist:   map[string][]fakeRev{},
+	}
+}
+
+// seedHistory installs a revision history for key and mirrors the newest
+// value into the flat store so listings and plain gets stay coherent.
+func seedHistory(kv *fakeKV, key string, entries ...fakeRev) {
+	kv.hist[key] = entries
+	kv.store[key] = entries[len(entries)-1].value
+}
+
+// kvAt materializes one historical entry; CreateRevision is the
+// incarnation's first stored revision.
+func (f *fakeKV) kvAt(key string, e fakeRev) *mvccpb.KeyValue {
+	return &mvccpb.KeyValue{
+		Key:            []byte(key),
+		Value:          []byte(e.value),
+		Lease:          f.leases[key],
+		CreateRevision: f.hist[key][0].rev,
+		ModRevision:    e.rev,
+		Version:        e.version,
+	}
 }
 
 // Fixed revision metadata stamped on every KV the fake returns, so tests can
@@ -74,6 +111,20 @@ func (f *fakeKV) Get(_ context.Context, key string, opts ...clientv3.OpOption) (
 		sort.Strings(keys)
 		for _, k := range keys {
 			resp.Kvs = append(resp.Kvs, f.kv(k))
+		}
+	} else if entries, ok := f.hist[key]; ok && len(entries) > 0 {
+		if rev := op.Rev(); rev > 0 {
+			if f.compactRev > 0 && rev < f.compactRev {
+				return nil, rpctypes.ErrCompacted
+			}
+			for i := len(entries) - 1; i >= 0; i-- {
+				if entries[i].rev <= rev {
+					resp.Kvs = append(resp.Kvs, f.kvAt(key, entries[i]))
+					break
+				}
+			}
+		} else {
+			resp.Kvs = append(resp.Kvs, f.kvAt(key, entries[len(entries)-1]))
 		}
 	} else if _, ok := f.store[key]; ok {
 		resp.Kvs = append(resp.Kvs, f.kv(key))
@@ -371,7 +422,7 @@ func TestV3RenameDirPreservesLeases(t *testing.T) {
 // pane re-fetches the focused key. get keeps returning the value.
 func TestV3LsIsKeysOnly(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{
-		"/app/key1": "big-value",
+		"/app/key1":  "big-value",
 		"/app/sub/x": "other",
 	})
 	nodes, err := b.ls("/app")
@@ -534,6 +585,98 @@ func TestIsReservedName(t *testing.T) {
 		if IsReservedName(name) {
 			t.Errorf("IsReservedName(%q) should be false", name)
 		}
+	}
+}
+
+func TestV3HistoryWalksNewestFirst(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/k",
+		fakeRev{rev: 5, version: 1, value: "a"},
+		fakeRev{rev: 8, version: 2, value: "b"},
+		fakeRev{rev: 12, version: 3, value: "c"},
+	)
+	m := &Model{backend: b}
+	revs, truncated, err := m.History("/k", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated {
+		t.Error("full walk must not report truncation")
+	}
+	wantRevs := []int64{12, 8, 5}
+	wantVals := []string{"c", "b", "a"}
+	if len(revs) != 3 {
+		t.Fatalf("revs = %+v, want 3 entries", revs)
+	}
+	for i, r := range revs {
+		if r.Rev != wantRevs[i] || r.Value != wantVals[i] || r.Version != int64(3-i) {
+			t.Errorf("revs[%d] = %+v, want rev=%d version=%d value=%q",
+				i, r, wantRevs[i], 3-i, wantVals[i])
+		}
+	}
+}
+
+func TestV3HistoryHonorsLimit(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/k",
+		fakeRev{rev: 5, version: 1, value: "a"},
+		fakeRev{rev: 8, version: 2, value: "b"},
+		fakeRev{rev: 12, version: 3, value: "c"},
+	)
+	revs, truncated, err := b.history("/k", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revs) != 2 || revs[0].Rev != 12 || revs[1].Rev != 8 {
+		t.Fatalf("limited walk = %+v, want revs 12,8", revs)
+	}
+	if !truncated {
+		t.Error("hitting the limit with older versions left must report truncation")
+	}
+}
+
+// Compaction ends the walk gracefully: the collected newest revisions come
+// back without error and without a truncation flag; the caller detects the
+// cut from the oldest entry's Version > 1.
+func TestV3HistoryStopsAtCompaction(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/k",
+		fakeRev{rev: 5, version: 1, value: "a"},
+		fakeRev{rev: 8, version: 2, value: "b"},
+		fakeRev{rev: 12, version: 3, value: "c"},
+	)
+	kv.compactRev = 8 // reads below rev 8 fail like a compacted cluster
+	revs, truncated, err := b.history("/k", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated {
+		t.Error("compaction cut must not report limit-truncation")
+	}
+	if len(revs) != 2 || revs[0].Rev != 12 || revs[1].Rev != 8 {
+		t.Fatalf("compacted walk = %+v, want revs 12,8", revs)
+	}
+	if revs[len(revs)-1].Version != 2 {
+		t.Errorf("oldest version = %d, want 2 (compaction marker)", revs[len(revs)-1].Version)
+	}
+}
+
+func TestV3HistorySingleVersion(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/k", fakeRev{rev: 7, version: 1, value: "only"})
+	revs, truncated, err := b.history("/k", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revs) != 1 || truncated || revs[0].Value != "only" || revs[0].Version != 1 {
+		t.Errorf("single-version history = %+v truncated=%t, want one v1 entry", revs, truncated)
+	}
+}
+
+func TestV3HistoryMissingKey(t *testing.T) {
+	b, _ := newTestBackend(nil)
+	if _, _, err := b.history("/nope", 10); err == nil {
+		t.Error("history of a missing key should error")
 	}
 }
 

@@ -23,6 +23,12 @@ Grab the latest pre-built binaries / `.deb` packages here:
   duration like `1h30m`; remaining TTL is shown live in the details pane
   (v3 via leases, v2 via native key TTL). Editing a key's value preserves
   its TTL instead of dropping it.
+- Revision history for keys on etcd v3 (`Ctrl+V`): browse a key's stored
+  MVCC revisions newest-first, inspect any old value (JSON pretty-print /
+  hex for binary), see a colored line-diff against the current value, and
+  restore an old value in one keystroke — the key's live TTL/lease is
+  preserved. How far back it reaches depends on the cluster's compaction
+  policy; v2 has no value history.
 - Quick search inside the current level (`/` or `Ctrl+S`)
 - Recursive find under the current directory (`Ctrl+F`) — case-insensitive
   substring match on key paths, optionally inside values, with a results
@@ -63,6 +69,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+E`        | Edit value (multi-line) / rename directory   |
 | `Ctrl+R`        | Rename key or directory                      |
 | `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
+| `Ctrl+V`        | Revision history of a key (v3): view / diff / restore |
 | `Ctrl+S` or `/` | Quick search inside the current level        |
 | `Ctrl+F`        | Recursive find (paths, optionally values)    |
 | `Ctrl+J`        | Jump to absolute or relative path            |
@@ -212,6 +219,31 @@ The header shows the cluster's auth state as `Auth: ON`, `Auth: OFF`, or
 and the credentials are missing or wrong, `etcd-walker` shows the etcd
 error in-app so the misconfiguration is easy to spot.
 
+> Note: the auth state is currently only probed when the protocol is set to
+> `v3` explicitly; in `auto` and `v2` modes the header always shows `Auth: ?`.
+
+---
+
+### Limitations
+
+- **Shared v3 leases and `Ctrl+T`**: changing a key's TTL re-writes the key
+  on a fresh lease and then revokes the lease the key previously used. If
+  that lease is shared — because the key was duplicated with `Ctrl+D`
+  (copies re-attach the source's lease), or because it was created by an
+  application that parks many keys on one lease — revoking it **deletes
+  every other key still attached to it**. Until a shared-lease guard lands
+  (see [ROADMAP.md](ROADMAP.md)), avoid `Ctrl+T` on keys your own
+  applications lease.
+- The v2 backend always connects over plain HTTP — the TLS options apply
+  to v3 only.
+- v3 listings, recursive find and export fetch their whole key range in a
+  single request (listings are keys-only, which keeps browsing light, but
+  a find/export over a huge keyspace can be slow and memory-hungry).
+- Clipboard: when only the OSC52 fallback is available, values larger than
+  10 kB are refused rather than silently truncated.
+- v3 keys containing `//` or a trailing `/` are displayed at their
+  normalized path and cannot be opened or edited.
+
 ---
 
 ### Building
@@ -335,4 +367,5 @@ Then point `etcd-walker` at it:
 ### Architecture
 
 For an in-depth look at the project's internal structure, package layout
-and design decisions, see [DESIGN.md](DESIGN.md).
+and design decisions, see [DESIGN.md](DESIGN.md). Planned features and the
+open findings from the latest code review live in [ROADMAP.md](ROADMAP.md).

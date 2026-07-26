@@ -1,7 +1,4 @@
-# ---------------------------------------------------------------------------
-# etcd-walker Makefile
-#
-# Cross-build targets + Debian packaging.
+# etcd-walker Makefile — cross-build targets + Debian packaging.
 #
 # Supported build types:
 #
@@ -19,12 +16,11 @@
 #   deb-amd64  deb-i386  deb-arm64  deb-armhf   ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.40
-# ---------------------------------------------------------------------------
 
 APP        := etcd-walker
 PKG        := ./cmd/etcd-walker
 GO         ?= go
-VERSION    ?= 0.7.0
+VERSION    ?= 0.8.0
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist
