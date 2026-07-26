@@ -18,6 +18,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/rivo/tview v0.42.0
 	github.com/sirupsen/logrus v1.8.1
+	go.etcd.io/etcd/api/v3 v3.5.21
 	go.etcd.io/etcd/client/v3 v3.5.21
 	go.uber.org/zap v1.19.1
 )
@@ -47,7 +48,6 @@ require (
 	github.com/soheilhy/cmux v0.1.5 // indirect
 	github.com/tmc/grpc-websocket-proxy v0.0.0-20220101234140-673ab2c3ae75 // indirect
 	github.com/xiang90/probing v0.0.0-20221125231312-a49e3df8f510 // indirect
-	go.etcd.io/etcd/api/v3 v3.5.21 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.21 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
