@@ -129,7 +129,7 @@ func TestValueStats(t *testing.T) {
 		in string
 		w  want
 	}{
-		{"", want{0, 1, true}},
+		{"", want{0, 0, true}}, // an empty value has no lines
 		{"abc", want{3, 1, true}},
 		{"a\nb", want{3, 2, true}},
 		{"a\nb\n", want{4, 3, true}},
@@ -188,8 +188,13 @@ func TestGetPosition(t *testing.T) {
 	if c.getPosition("b", s) != 1 {
 		t.Errorf("getPosition(b) = %d, want 1", c.getPosition("b", s))
 	}
-	if c.getPosition("missing", s) != 0 {
-		t.Errorf("getPosition(missing) = %d, want 0 (fallback)", c.getPosition("missing", s))
+	// A miss must be distinguishable from index 0, or callers silently move the
+	// cursor to the first row when they meant "leave it alone".
+	if c.getPosition("missing", s) != -1 {
+		t.Errorf("getPosition(missing) = %d, want -1", c.getPosition("missing", s))
+	}
+	if c.getPosition("a", s) != 0 {
+		t.Errorf("getPosition(a) = %d, want 0", c.getPosition("a", s))
 	}
 }
 

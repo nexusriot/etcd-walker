@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/nexusriot/etcd-walker/pkg/model"
+	"github.com/rivo/tview"
 )
 
 func TestHistoryOpensPickerForKey(t *testing.T) {
@@ -196,5 +197,161 @@ func TestRenderDiffKeepsShortContext(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered diff missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// O-2: a huge printable value must not be rendered in full — it stalls the
+// draw — but it has to stay reachable via [f].
+func TestRevisionDetailCapsLargeValue(t *testing.T) {
+	big := strings.Repeat("x", historyValueLimit*2) + "TAIL"
+	nd := &model.Node{Name: "/k"}
+	revs := []*model.Revision{{Rev: 9, Version: 2, Value: big}}
+
+	c := newTestController(&fakeModel{})
+	c.showRevisionDetail(nd, revs, 0, false, false)
+
+	capped := frontPage(c).(*tview.TextView).GetText(true)
+	if strings.Contains(capped, "TAIL") {
+		t.Error("value rendered in full despite the cap")
+	}
+	if !strings.Contains(capped, "press [f] to show the whole value") {
+		t.Errorf("no [f] affordance advertised:\n%s", capped[:200])
+	}
+	if !strings.Contains(capped, "first") {
+		t.Error("header should say the value is truncated")
+	}
+
+	// [f] re-renders uncapped.
+	c.showRevisionDetail(nd, revs, 0, false, true)
+	full := frontPage(c).(*tview.TextView).GetText(true)
+	if !strings.Contains(full, "TAIL") {
+		t.Error("full view still truncated the value")
+	}
+}
+
+// A value that fits is shown whole, with no [f] noise.
+func TestRevisionDetailShowsSmallValueWhole(t *testing.T) {
+	c := newTestController(&fakeModel{})
+	c.showRevisionDetail(&model.Node{Name: "/k"}, []*model.Revision{{Rev: 9, Value: "short"}}, 0, false, false)
+
+	got := frontPage(c).(*tview.TextView).GetText(true)
+	if !strings.Contains(got, "short") {
+		t.Error("small value missing")
+	}
+	if strings.Contains(got, "press [f]") {
+		t.Error("[f] advertised for a value that is not truncated")
+	}
+}
+
+// O-3: the diff must compare against the key as it is now, not against the
+// picker's snapshot of "newest", which goes stale the moment anyone writes.
+func TestRevisionDiffUsesLiveCurrentValue(t *testing.T) {
+	f := &fakeModel{
+		gets: map[string]*model.Node{
+			"/k": {Name: "/k", Value: "live\n", ModRev: 42},
+		},
+	}
+	revs := []*model.Revision{
+		{Rev: 12, Version: 2, Value: "snapshot\n"}, // stale "newest"
+		{Rev: 5, Version: 1, Value: "old\n"},
+	}
+	c := newTestController(f)
+
+	c.showRevisionDiff(&model.Node{Name: "/k"}, revs, 1, false)
+
+	got := frontPage(c).(*tview.TextView).GetText(true)
+	if !strings.Contains(got, "live") {
+		t.Errorf("diff did not use the live value:\n%s", got)
+	}
+	if strings.Contains(got, "snapshot") {
+		t.Errorf("diff used the stale revs[0] snapshot:\n%s", got)
+	}
+	if !strings.Contains(got, "42") {
+		t.Errorf("diff should label the current side with the live revision:\n%s", got)
+	}
+	if !strings.Contains(got, "changed since this history was read") {
+		t.Errorf("a drifted key should be called out:\n%s", got)
+	}
+}
+
+// When nothing moved, the diff should not cry wolf.
+func TestRevisionDiffQuietWhenUnchanged(t *testing.T) {
+	f := &fakeModel{
+		gets: map[string]*model.Node{"/k": {Name: "/k", Value: "new\n", ModRev: 12}},
+	}
+	revs := []*model.Revision{
+		{Rev: 12, Version: 2, Value: "new\n"},
+		{Rev: 5, Version: 1, Value: "old\n"},
+	}
+	c := newTestController(f)
+
+	c.showRevisionDiff(&model.Node{Name: "/k"}, revs, 1, false)
+
+	got := frontPage(c).(*tview.TextView).GetText(true)
+	if strings.Contains(got, "changed since this history was read") {
+		t.Errorf("spurious drift warning:\n%s", got)
+	}
+}
+
+// A key that vanished while the history screen was open must not diff against
+// a stale snapshot and pretend it is current.
+func TestRevisionDiffErrorsWhenKeyGone(t *testing.T) {
+	c := newTestController(&fakeModel{}) // Get always fails
+	revs := []*model.Revision{
+		{Rev: 12, Value: "new"},
+		{Rev: 5, Value: "old"},
+	}
+
+	c.showRevisionDiff(&model.Node{Name: "/gone"}, revs, 1, false)
+
+	if !c.view.Pages.HasPage("modal") {
+		t.Fatal("expected an error modal")
+	}
+	if tv, ok := frontPage(c).(*tview.TextView); ok {
+		t.Errorf("a diff was rendered anyway:\n%s", tv.GetText(true))
+	}
+}
+
+// B-13: tview parses "[d]"/"[Esc]" in titles and text as colour tags and
+// swallows them, so unescaped hotkey hints render as blanks. Every history
+// screen advertises its keys in the title, so pin that they survive.
+func TestHistoryHintsSurviveColorTagParsing(t *testing.T) {
+	c := newTestController(&fakeModel{
+		gets: map[string]*model.Node{"/k": {Name: "/k", Value: "live", ModRev: 12}},
+	})
+	revs := []*model.Revision{
+		{Rev: 12, Version: 2, Value: "new"},
+		{Rev: 5, Version: 1, Value: "old"},
+	}
+	nd := &model.Node{Name: "/k"}
+
+	// rendered mimics what tview prints: titles go through the same colour-tag
+	// parser as body text.
+	rendered := func(title string) string {
+		tv := tview.NewTextView().SetDynamicColors(true)
+		tv.SetText(title)
+		return tv.GetText(true)
+	}
+
+	c.showRevisionDetail(nd, revs, 1, false, false)
+	got := rendered(frontPage(c).(*tview.TextView).GetTitle())
+	for _, key := range []string{"[r]", "[d]", "[Esc]"} {
+		if !strings.Contains(got, key) {
+			t.Errorf("detail title lost %s: %q", key, got)
+		}
+	}
+
+	c.showRevisionDiff(nd, revs, 1, false)
+	got = rendered(frontPage(c).(*tview.TextView).GetTitle())
+	if !strings.Contains(got, "[Esc]") {
+		t.Errorf("diff title lost [Esc]: %q", got)
+	}
+
+	// The body's [f] affordance has to survive the same parser.
+	big := []*model.Revision{{Rev: 9, Value: strings.Repeat("x", historyValueLimit*2)}}
+	c.showRevisionDetail(nd, big, 0, false, false)
+	body := frontPage(c).(*tview.TextView).GetText(true)
+	if !strings.Contains(body, "[f]") {
+		t.Errorf("body lost the [f] hint: %q", body)
 	}
 }

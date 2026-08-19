@@ -18,6 +18,12 @@ const historyLimit = 100
 // historyHexLimit bounds the hex dump shown for binary revision values.
 const historyHexLimit = 1024
 
+// historyValueLimit bounds the printable value shown on the revision detail
+// screen. It is far larger than the details pane's 512-byte preview — this is
+// a dedicated screen — but still bounded so a multi-megabyte value cannot
+// stall the draw. 'f' re-renders without the cap.
+const historyValueLimit = 8192
+
 // history opens the revision-history flow for the focused key (v3 only —
 // the model returns a descriptive error on v2). Directories are refused:
 // they are synthetic and have no revisions of their own.
@@ -60,12 +66,13 @@ func (c *Controller) history() *tcell.EventKey {
 // showHistoryPicker lists a key's revisions newest-first; choosing one opens
 // the detail screen.
 func (c *Controller) showHistoryPicker(nd *model.Node, revs []*model.Revision, truncated bool) {
-	title := fmt.Sprintf(" %d revisions of %s ", len(revs), nd.Name)
+	name := tview.Escape(nd.Name) // titles are colour-tag parsed like any text
+	title := fmt.Sprintf(" %d revisions of %s ", len(revs), name)
 	switch {
 	case truncated:
-		title = fmt.Sprintf(" newest %d revisions of %s (limit reached) ", len(revs), nd.Name)
+		title = fmt.Sprintf(" newest %d revisions of %s (limit reached) ", len(revs), name)
 	case revs[len(revs)-1].Version > 1:
-		title = fmt.Sprintf(" %d revisions of %s (older compacted) ", len(revs), nd.Name)
+		title = fmt.Sprintf(" %d revisions of %s (older compacted) ", len(revs), name)
 	}
 
 	list := c.view.NewResultsList(title)
@@ -78,7 +85,7 @@ func (c *Controller) showHistoryPicker(nd *model.Node, revs []*model.Revision, t
 		}
 		list.AddItem(label, "", 0, func() {
 			c.view.Pages.RemovePage("modal")
-			c.showRevisionDetail(nd, revs, idx, truncated)
+			c.showRevisionDetail(nd, revs, idx, truncated, false)
 		})
 	}
 	list.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
@@ -110,22 +117,52 @@ func revPreview(v string) string {
 	return tview.Escape(v)
 }
 
-// showRevisionDetail renders one revision: metadata plus the full value
-// (hex for binary). 'r' restores it, 'd' diffs it against the current value,
-// Esc returns to the picker.
-func (c *Controller) showRevisionDetail(nd *model.Node, revs []*model.Revision, idx int, truncated bool) {
+// showRevisionDetail renders one revision: metadata plus its value (hex for
+// binary). Large values are capped — a multi-megabyte value rendered in full
+// stalls the draw — and 'f' re-opens the screen uncapped. 'r' restores the
+// revision, 'd' diffs it against the current value, Esc returns to the picker.
+func (c *Controller) showRevisionDetail(nd *model.Node, revs []*model.Revision, idx int, truncated, full bool) {
 	r := revs[idx]
-	hint := "[d] diff vs current · [Esc] back"
-	if idx > 0 {
-		hint = "[r] restore · " + hint
-	}
-	tv := c.view.NewHistoryDetail(fmt.Sprintf(" %s @ rev %d — %s ", nd.Name, r.Rev, hint))
 
+	// Work out what the value pane will show first: the hint line advertises
+	// [f] only when something is actually being held back.
 	size, lines, printable := valueStats(r.Value)
+	shown, title := r.Value, "Value"
+	if printable {
+		if pj, ok := prettyJSON(r.Value); ok {
+			shown, title = pj, "Value (JSON)"
+		}
+	}
+	hexLimit := historyHexLimit
+	if full {
+		hexLimit = len(r.Value)
+	}
+	cut, clipped := shown, false
+	if !full && printable {
+		cut, clipped = truncateBytes(shown, historyValueLimit)
+	}
+	if !printable {
+		clipped = !full && len(r.Value) > historyHexLimit
+	}
+
+	// tview reads "[d]" as a colour tag and swallows it — in titles as much as
+	// in text — so every bracketed hotkey hint has to be escaped or it renders
+	// as a blank. tview.Escape turns "[d]" into the literal-bracket form.
+	hint := tview.Escape("[d] diff vs current · [Esc] back")
+	// The 'r' binding still runs the policy guard, which refuses in read-only
+	// mode; advertising it there would just invite a refusal modal.
+	if idx > 0 && !c.policy.ReadOnly {
+		hint = tview.Escape("[r] restore · ") + hint
+	}
+	if clipped {
+		hint = tview.Escape("[f] full value · ") + hint
+	}
+	tv := c.view.NewHistoryDetail(fmt.Sprintf(" %s @ rev %d — %s ", tview.Escape(nd.Name), r.Rev, hint))
+
 	fmt.Fprintf(tv, "[::b]Revision info[::-]\n")
 	fmt.Fprintf(tv, "  [green]Key:[-] %s\n", nd.Name)
 	if idx == 0 {
-		fmt.Fprintf(tv, "  [green]Revision:[-] %d (current)\n", r.Rev)
+		fmt.Fprintf(tv, "  [green]Revision:[-] %d (newest known)\n", r.Rev)
 	} else {
 		fmt.Fprintf(tv, "  [green]Revision:[-] %d\n", r.Rev)
 	}
@@ -133,17 +170,19 @@ func (c *Controller) showRevisionDetail(nd *model.Node, revs []*model.Revision, 
 	fmt.Fprintf(tv, "  [green]Size:[-] %d bytes · [green]Lines:[-] %d\n", size, lines)
 	fmt.Fprintf(tv, "  [green]SHA-256:[-] %s\n", shortHash(r.Value))
 
-	if printable {
-		shown := r.Value
-		title := "Value"
-		if pj, ok := prettyJSON(r.Value); ok {
-			shown = pj
-			title = "Value (JSON)"
-		}
-		fmt.Fprintf(tv, "\n[::b]%s[::-]\n%s\n", title, tview.Escape(shown))
-	} else {
-		fmt.Fprintf(tv, "\n[::b]Value (hex, first %d bytes)[::-]\n%s", historyHexLimit,
-			tview.Escape(hexDump(r.Value, historyHexLimit)))
+	more := fmt.Sprintf("[gray]press %s to show the whole value[-]", tview.Escape("[f]"))
+	switch {
+	case printable && clipped:
+		fmt.Fprintf(tv, "\n[::b]%s (first %d of %d bytes)[::-]\n%s…\n\n%s\n",
+			title, len(cut), len(shown), tview.Escape(cut), more)
+	case printable:
+		fmt.Fprintf(tv, "\n[::b]%s[::-]\n%s\n", title, tview.Escape(cut))
+	case clipped:
+		fmt.Fprintf(tv, "\n[::b]Value (hex, first %d of %d bytes)[::-]\n%s\n%s\n",
+			hexLimit, len(r.Value), tview.Escape(hexDump(r.Value, hexLimit)), more)
+	default:
+		fmt.Fprintf(tv, "\n[::b]Value (hex, %d bytes)[::-]\n%s", len(r.Value),
+			tview.Escape(hexDump(r.Value, hexLimit)))
 	}
 
 	tv.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
@@ -151,6 +190,13 @@ func (c *Controller) showRevisionDetail(nd *model.Node, revs []*model.Revision, 
 		case ev.Key() == tcell.KeyEsc:
 			c.view.Pages.RemovePage("modal")
 			c.showHistoryPicker(nd, revs, truncated)
+			return nil
+		case ev.Key() == tcell.KeyRune && (ev.Rune() == 'f' || ev.Rune() == 'F'):
+			if !clipped {
+				return nil // nothing is being held back
+			}
+			c.view.Pages.RemovePage("modal")
+			c.showRevisionDetail(nd, revs, idx, truncated, true)
 			return nil
 		case ev.Key() == tcell.KeyRune && (ev.Rune() == 'd' || ev.Rune() == 'D'):
 			c.view.Pages.RemovePage("modal")
@@ -179,7 +225,7 @@ func (c *Controller) confirmRestore(nd *model.Node, revs []*model.Revision, idx 
 	q.SetDoneFunc(func(_ int, label string) {
 		c.view.Pages.RemovePage("modal")
 		if label != "restore" {
-			c.showRevisionDetail(nd, revs, idx, truncated)
+			c.showRevisionDetail(nd, revs, idx, truncated, false)
 			return
 		}
 		c.restoreRevision(nd, r)
@@ -197,23 +243,50 @@ func (c *Controller) restoreRevision(nd *model.Node, r *model.Revision) {
 		c.error("Restore failed", fmt.Errorf("re-reading %s: %w", nd.Name, err), false)
 		return
 	}
-	if err := c.model.SetKeepTTL(nd.Name, r.Value, cur.LeaseID, cur.TTL); err != nil {
-		c.error("Restore failed", err, false)
-		return
-	}
-	ordered := c.updateList()
-	target := displayName(baseOf(nd.Name), false)
-	c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
-	c.fillDetails(makeMapKey(baseOf(nd.Name), false))
-	c.info("Restored", fmt.Sprintf("%s reverted to rev %d value", nd.Name, r.Rev))
+	// A restore is a write like any other, and it reaches here without passing
+	// the main list's key bindings, so it needs the policy guard of its own.
+	c.guarded(guard{action: "restore", paths: []string{nd.Name}, do: func() {
+		if err := c.model.SetKeepTTL(nd.Name, r.Value, cur.LeaseID, cur.TTL); err != nil {
+			c.error("Restore failed", err, false)
+			return
+		}
+		ordered := c.updateList()
+		target := displayName(baseOf(nd.Name), false)
+		c.selectRow(target, ordered)
+		c.fillDetails(makeMapKey(baseOf(nd.Name), false))
+		c.info(c.writeHeader("Restored"), fmt.Sprintf("%s reverted to rev %d value", nd.Name, r.Rev))
+	}})
 }
 
 // showRevisionDiff renders a line diff of the selected revision against the
 // current value (minus = selected revision, plus = current).
 func (c *Controller) showRevisionDiff(nd *model.Node, revs []*model.Revision, idx int, truncated bool) {
-	r, cur := revs[idx], revs[0]
+	r := revs[idx]
+
+	// Diff against the key as it is *now*, re-read here, rather than against
+	// revs[0]. That entry is a snapshot from when History ran, so calling it
+	// "current" stops being true the moment anyone else writes the key — and
+	// this screen is exactly where someone decides whether to restore.
+	cur, err := c.model.Get(nd.Name)
+	if err != nil {
+		c.error("Diff failed", fmt.Errorf("re-reading %s: %w", nd.Name, err), false)
+		return
+	}
+	if cur == nil || cur.IsDir {
+		c.error("Diff failed", fmt.Errorf("%s is no longer a key", nd.Name), false)
+		return
+	}
+
+	note := ""
+	if cur.ModRev != revs[0].Rev {
+		note = fmt.Sprintf("[yellow]note: the key changed since this history was read (rev %d → %d)[-]\n\n",
+			revs[0].Rev, cur.ModRev)
+	}
+
 	tv := c.view.NewHistoryDetail(fmt.Sprintf(
-		" diff %s: rev %d → current (rev %d) — [Esc] back ", nd.Name, r.Rev, cur.Rev))
+		" diff %s: rev %d → current (rev %d) — %s ",
+		tview.Escape(nd.Name), r.Rev, cur.ModRev, tview.Escape("[Esc] back")))
+	fmt.Fprint(tv, note)
 
 	switch {
 	case !utf8.ValidString(r.Value) || !utf8.ValidString(cur.Value):
@@ -230,7 +303,7 @@ func (c *Controller) showRevisionDiff(nd *model.Node, revs []*model.Revision, id
 			fmt.Fprintf(tv, "no differences — the value at rev %d is identical to the current value\n", r.Rev)
 		default:
 			fmt.Fprintf(tv, "[red]--- rev %d[-]  [green]+++ current (rev %d)[-]  ([red]-%d[-] / [green]+%d[-] lines)\n\n",
-				r.Rev, cur.Rev, minus, plus)
+				r.Rev, cur.ModRev, minus, plus)
 			fmt.Fprint(tv, renderDiff(ops))
 		}
 	}
@@ -238,7 +311,7 @@ func (c *Controller) showRevisionDiff(nd *model.Node, revs []*model.Revision, id
 	tv.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		if ev.Key() == tcell.KeyEsc {
 			c.view.Pages.RemovePage("modal")
-			c.showRevisionDetail(nd, revs, idx, truncated)
+			c.showRevisionDetail(nd, revs, idx, truncated, false)
 			return nil
 		}
 		return ev

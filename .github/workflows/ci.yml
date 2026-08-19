@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod so CI cannot drift from the module.
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./pkg)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            gofmt -d ./cmd ./pkg
+            exit 1
+          fi
+
+      - name: go vet
+        # The tagged run matters: plain `go vet ./...` skips files behind
+        # //go:build integration, so a broken integration test would otherwise
+        # only surface in the job that needs a live etcd.
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+
+      - name: staticcheck
+        # The tree is clean as of 2026-08-19, so this gates dead code, unused
+        # parameters and unreachable branches rather than reporting a backlog.
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./... -count=1
+
+      - name: test -race
+        run: go test ./... -race -count=1
+
+      - name: coverage
+        run: |
+          go test ./... -coverprofile=coverage.out -covermode=atomic
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  cross-build:
+    name: cross-build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      # The README advertises these targets and the Makefile ships them, so a
+      # build break on one of them should fail here rather than at release time.
+      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
+
+  etcd-integration:
+    name: integration (real etcd)
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+        ports:
+          - 2379:2379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      # The suite fails rather than skips when etcd is unreachable — in CI a
+      # missing cluster must not look like a pass — so wait for it first.
+      - name: wait for etcd
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:2379/version >/dev/null 2>&1; then
+              echo "etcd is up: $(curl -fsS http://127.0.0.1:2379/version)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "etcd did not become ready in 30s"; exit 1
+
+      # The unit suite runs against fakes; this exercises the real v3 client —
+      # the layer where lease, revision and prefix semantics actually live.
+      - name: integration tests
+        run: go test ./... -tags=integration -run Integration -count=1 -v
+        env:
+          ETCD_WALKER_TEST_ENDPOINT: 127.0.0.1:2379

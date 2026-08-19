@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -143,6 +144,14 @@ func (m *Model) Import(items map[string]string, overwrite bool) (written, skippe
 			skipped++
 			continue
 		}
+		// Same guard create() applies interactively: a `.dir` key is the
+		// internal directory marker, invisible in listings, and writing one
+		// would turn its parent into a phantom directory. Export omits these,
+		// so skipping keeps an export/import round-trip faithful.
+		if IsReservedName(path.Base(key)) {
+			skipped++
+			continue
+		}
 		if !overwrite {
 			if n, gerr := m.backend.get(key); gerr == nil && n != nil && !n.IsDir {
 				skipped++
@@ -192,31 +201,30 @@ func NewModel(opts Options) (*Model, error) {
 			return nil, fmt.Errorf("v3 init failed: %w", err)
 		}
 		if err := b3.probe(); err != nil {
+			b3.close()
 			return nil, fmt.Errorf("v3 probe failed: %w", err)
 		}
 
-		label := "?"
-		if en, known, _ := b3.authStatus(); known {
-			if en {
-				label = "ON"
-			} else {
-				label = "OFF"
-			}
-		}
-
-		return &Model{backend: b3, authLabel: label}, nil
+		return &Model{backend: b3, authLabel: authLabelOf(b3)}, nil
 
 	case "auto":
 		if b3, err := newV3Backend(opts); err == nil {
-			if err := b3.probe(); err == nil {
-				return &Model{backend: b3}, nil
-			} else if isAuthRequiredErr(err) {
-				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
+			perr := b3.probe()
+			switch {
+			case perr == nil:
+				return &Model{backend: b3, authLabel: authLabelOf(b3)}, nil
+			case isAuthRequiredErr(perr):
+				b3.close()
+				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", perr)
+			default:
+				// Unreachable over v3; drop the client before trying v2 so its
+				// reconnect loop does not run for the rest of the session.
+				b3.close()
 			}
 		}
 		if b2, err := newV2Backend(opts); err == nil {
 			if err := b2.probe(); err == nil {
-				return &Model{backend: b2}, nil
+				return &Model{backend: b2, authLabel: authLabelOf(b2)}, nil
 			} else if isAuthRequiredErr(err) {
 				return nil, fmt.Errorf("etcd auth is enabled; provide --username/--password (or set them in config). Original: %w", err)
 			}
@@ -232,12 +240,41 @@ func NewModel(opts Options) (*Model, error) {
 		if err := b2.probe(); err != nil {
 			return nil, fmt.Errorf("v2 probe failed: %w", err)
 		}
-		return &Model{backend: b2}, nil
+		return &Model{backend: b2, authLabel: authLabelOf(b2)}, nil
 	}
+}
+
+// authReporter is the one piece of backend authLabelOf needs.
+type authReporter interface {
+	authStatus() (enabled bool, known bool, err error)
+}
+
+// authLabelOf renders the header's Auth field for a connected backend.
+// "?" means the server did not tell us either way.
+func authLabelOf(b authReporter) string {
+	enabled, known, _ := b.authStatus()
+	switch {
+	case !known:
+		return "?"
+	case enabled:
+		return "ON"
+	default:
+		return "OFF"
+	}
+}
+
+// lessor is the slice of clientv3.Lease the walker actually uses. Narrowing
+// it keeps the field injectable in tests (*clientv3.Client satisfies it
+// through its embedded Lease).
+type lessor interface {
+	Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error)
+	Revoke(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error)
+	TimeToLive(ctx context.Context, id clientv3.LeaseID, opts ...clientv3.LeaseOption) (*clientv3.LeaseTimeToLiveResponse, error)
 }
 
 type v3Backend struct {
 	cli     clientv3.KV
+	lessor  lessor
 	c       *clientv3.Client
 	timeout time.Duration
 }
@@ -302,10 +339,19 @@ func newV3Backend(opts Options) (*v3Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &v3Backend{cli: clientv3.NewKV(c), c: c, timeout: timeout}, nil
+	return &v3Backend{cli: clientv3.NewKV(c), lessor: c, c: c, timeout: timeout}, nil
 }
 
 func (b *v3Backend) proto() string { return "v3" }
+
+// close releases the underlying gRPC client. Callers that abandon a backend
+// (a failed probe, an auto-mode fallback to v2) must call it, otherwise the
+// client's reconnect loop keeps hammering the endpoint for the whole session.
+func (b *v3Backend) close() {
+	if b != nil && b.c != nil {
+		_ = b.c.Close()
+	}
+}
 
 // probe checks reachability (and surfaces auth errors) with a minimal
 // keys-only, limit-1 request instead of pulling the whole keyspace the way
@@ -318,13 +364,13 @@ func (b *v3Backend) probe() error {
 }
 
 // ttlForLease returns the remaining seconds for a lease id, or 0 when the
-// lease is absent/expired or cannot be resolved. b.c is nil in unit tests, so
-// callers tolerate a 0 result.
+// lease is absent/expired or cannot be resolved. b.lessor is nil in unit
+// tests, so callers tolerate a 0 result.
 func (b *v3Backend) ttlForLease(ctx context.Context, lease int64) int64 {
-	if lease == 0 || b.c == nil {
+	if lease == 0 || b.lessor == nil {
 		return 0
 	}
-	resp, err := b.c.TimeToLive(ctx, clientv3.LeaseID(lease))
+	resp, err := b.lessor.TimeToLive(ctx, clientv3.LeaseID(lease))
 	if err != nil || resp.TTL < 0 {
 		return 0
 	}
@@ -543,10 +589,10 @@ func (b *v3Backend) setTTL(key, value string, ttlSeconds int64) error {
 			return err
 		}
 	default:
-		if b.c == nil {
+		if b.lessor == nil {
 			return fmt.Errorf("lease operations require a live etcd client")
 		}
-		lease, err := b.c.Grant(ctx, ttlSeconds)
+		lease, err := b.lessor.Grant(ctx, ttlSeconds)
 		if err != nil {
 			return fmt.Errorf("grant lease: %w", err)
 		}
@@ -555,13 +601,41 @@ func (b *v3Backend) setTTL(key, value string, ttlSeconds int64) error {
 		}
 	}
 
-	// Best-effort cleanup of the superseded lease. The key no longer references
-	// it (the Put above re-pointed it), so revoking only reaps the orphan. This
-	// tool attaches one key per lease, so nothing else is collateral.
-	if oldLease != 0 && b.c != nil {
-		_, _ = b.c.Revoke(ctx, oldLease)
+	// Best-effort cleanup of the superseded lease, but only once we can prove
+	// nothing else still hangs off it: leases are shared (copyKey/copyDir
+	// re-attach the source's lease, and external writers routinely park many
+	// keys on one), and revoking a shared lease deletes every attached key.
+	if oldLease != 0 {
+		b.revokeIfOrphaned(ctx, oldLease, k)
 	}
 	return nil
+}
+
+// revokeIfOrphaned revokes lease only when key was its last attachment. The
+// caller has already re-pointed key at its replacement lease, so an orphaned
+// lease reports no attached keys; anything else means a live sibling would be
+// deleted along with it. Any uncertainty (no lessor, failed lookup) leaves the
+// lease alone — a leaked lease expires on its own, a wrongly revoked one takes
+// data with it.
+func (b *v3Backend) revokeIfOrphaned(ctx context.Context, lease clientv3.LeaseID, key string) {
+	if b.lessor == nil {
+		return
+	}
+	resp, err := b.lessor.TimeToLive(ctx, lease, clientv3.WithAttachedKeys())
+	if err != nil || resp == nil {
+		return
+	}
+	if resp.TTL < 0 {
+		return // already expired or revoked; nothing left to reap
+	}
+	for _, attached := range resp.Keys {
+		// key itself may still show up on a stale read; any *other* key means
+		// the lease is shared.
+		if string(attached) != key {
+			return
+		}
+	}
+	_, _ = b.lessor.Revoke(ctx, lease)
 }
 
 // setKeep updates the key's value while preserving its current lease, so an
@@ -838,6 +912,9 @@ func (b *v3Backend) history(key string, limit int) ([]*Revision, bool, error) {
 }
 
 func (b *v3Backend) authStatus() (bool, bool, error) {
+	if b.c == nil {
+		return false, false, fmt.Errorf("auth status requires a live etcd client")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 

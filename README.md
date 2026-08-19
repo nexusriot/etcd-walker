@@ -52,6 +52,27 @@ Grab the latest pre-built binaries / `.deb` packages here:
 - Authentication (etcd v3, username + password)
 - Full TLS / mTLS support (CA, client cert/key, optional skip-verify)
 - Hidden / underscore-prefixed key support, highlighted in yellow
+- **Read-only sessions** (`-read-only`): every mutating action is refused
+  with an explanation and the header turns yellow with `[READ-ONLY]`. The
+  value editor still opens, disabled, so you can read a value in full
+- **Protected prefixes** (`-protect /registry`): writes on or under a
+  protected path require the prefix's basename to be typed out first.
+  Covers every write route — create, delete, rename, TTL, save, copy,
+  import and revision-restore — including bulk imports where a single
+  protected target gates the whole batch
+- **Session journal** (`Ctrl+A`): every change the session made, listed in
+  order and exportable as an `etcdctl` script (or copied to the clipboard).
+  Operations etcdctl cannot reproduce from what was recorded — renames,
+  copies, TTLs — are emitted as clearly-marked comments rather than as
+  commands that would do the wrong thing
+- **Dry-run mode** (`-dry-run`): changes are recorded in the journal but
+  never sent to the cluster. Rehearse against production, review the
+  script, then run it deliberately
+- Deleting a directory requires typing its name — a recursive delete is a
+  single unrecoverable range delete, not something a stray Enter should do
+- Failed refreshes are visible, never silent: when the on-focus re-read of
+  a key fails, the details pane says so and the row is greyed and marked
+  `(cached)`, so a stale value is never mistaken for a live one
 - Optional JSON config file (`/etc/etcd-walker/config.json`)
 - Configurable per-operation timeout
 
@@ -65,7 +86,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Backspace`     | Go up one directory                          |
 | `Ctrl+N`        | Create new key or directory                  |
 | `Ctrl+D`        | Duplicate key or directory to a new path     |
-| `Delete`        | Delete current key/directory (with confirm)  |
+| `Delete`        | Delete a key (confirm) or directory (type its name) |
 | `Ctrl+E`        | Edit value (multi-line) / rename directory   |
 | `Ctrl+R`        | Rename key or directory                      |
 | `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
@@ -75,6 +96,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+J`        | Jump to absolute or relative path            |
 | `Ctrl+W`        | Export current directory to a JSON file      |
 | `Ctrl+O`        | Import keys from a JSON file (file browser)   |
+| `Ctrl+A`        | Session journal — review / export as etcdctl  |
 | `Ctrl+P`        | Copy current path to clipboard               |
 | `Ctrl+Y`        | Copy current key value to clipboard          |
 | `Ctrl+H`        | Show in-app hotkeys help                     |
@@ -115,7 +137,11 @@ Full schema (every field is optional):
   "tls_key_file":  "/etc/etcd-walker/client.key",
   "tls_skip_verify": false,
 
-  "timeout_seconds": 5
+  "timeout_seconds": 5,
+
+  "read_only": false,
+  "dry_run": false,
+  "protected_prefixes": ["/registry"]
 }
 ```
 
@@ -135,6 +161,9 @@ Field reference:
 | `tls_key_file`    | string  | _empty_     | Client private key for mutual TLS                    |
 | `tls_skip_verify` | bool    | `false`     | Skip server cert validation (insecure)               |
 | `timeout_seconds` | int     | `5`         | Per-operation timeout against etcd (`0` → 5)         |
+| `read_only`       | bool    | `false`     | Refuse every mutating action for the session         |
+| `dry_run`         | bool    | `false`     | Record changes in the journal without performing them |
+| `protected_prefixes` | []string | _empty_  | Prefixes needing a typed confirmation before any write; `"/"` protects everything |
 
 #### Command-line flags
 
@@ -151,11 +180,46 @@ Field reference:
 -tls-key string            path to client key file (mTLS)
 -tls-skip-verify bool      skip server certificate verification (insecure)
 -timeout string            etcd operation timeout in seconds
+-read-only bool            refuse every mutating action for this session
+-dry-run bool              record changes without performing them
+-protect string            comma-separated prefixes needing a typed
+                           confirmation before any write (e.g. /registry)
 -debug bool                enable debug logging
 ```
 
 Flags that are explicitly set on the command line always win over the
 config file. Flags that are omitted leave the config file value untouched.
+
+Boolean flags take the usual Go forms — `-read-only` on its own turns the
+setting on, and `-read-only=false` turns it off again, which is how you
+override a `"read_only": true` in the config file for one session.
+`-protect` replaces the configured `protected_prefixes` rather than adding
+to them, so a session's protection can always be read off its command line.
+
+##### Browsing production safely
+
+```bash
+etcd-walker -host prod-etcd -read-only
+```
+
+Nothing can be changed; the header says so. To stay editable everywhere
+except the paths that would take the cluster down:
+
+```bash
+etcd-walker -host prod-etcd -protect /registry,/vault
+```
+
+A write anywhere under `/registry` then asks you to type `registry` before
+it goes through — including one buried in a bulk import.
+
+To rehearse a change set before committing to it:
+
+```bash
+etcd-walker -host prod-etcd -dry-run
+```
+
+Make the edits as usual, press `Ctrl+A` to review exactly what would have
+happened, and export it as a script to run once you are satisfied.
 
 #### Configuration examples
 
@@ -226,16 +290,17 @@ error in-app so the misconfiguration is easy to spot.
 
 ### Limitations
 
-- **Shared v3 leases and `Ctrl+T`**: changing a key's TTL re-writes the key
-  on a fresh lease and then revokes the lease the key previously used. If
-  that lease is shared — because the key was duplicated with `Ctrl+D`
-  (copies re-attach the source's lease), or because it was created by an
-  application that parks many keys on one lease — revoking it **deletes
-  every other key still attached to it**. Until a shared-lease guard lands
-  (see [ROADMAP.md](ROADMAP.md)), avoid `Ctrl+T` on keys your own
-  applications lease.
 - The v2 backend always connects over plain HTTP — the TLS options apply
   to v3 only.
+- No live refresh: the listing updates after an action, not when the
+  cluster changes underneath you. Re-enter a directory to re-read it.
+- Moving the cursor costs a round trip — the details pane re-reads the
+  focused key each time — so scrolling a large directory over a slow link
+  is sluggish. A failed re-read is always reported, never silently cached.
+- Renames and copies are client-side copy-then-delete loops, not
+  transactions: a failure part-way leaves a partial target.
+- Concurrent edits are last-write-wins. Two people editing the same key
+  will not notice each other; the second save overwrites the first.
 - v3 listings, recursive find and export fetch their whole key range in a
   single request (listings are keys-only, which keeps browsing light, but
   a find/export over a huge keyspace can be slow and memory-hungry).
@@ -243,6 +308,33 @@ error in-app so the misconfiguration is easy to spot.
   10 kB are refused rather than silently truncated.
 - v3 keys containing `//` or a trailing `/` are displayed at their
   normalized path and cannot be opened or edited.
+
+---
+
+### Testing
+
+```bash
+make test           # unit suite (hermetic: no network, no terminal)
+make test-race      # same, under the race detector
+make cover          # total statement coverage
+```
+
+There is also an integration suite that runs against a **real etcd** — lease
+sharing, revision history and prefix boundaries are server semantics that a
+mock cannot prove:
+
+```bash
+make test-integration
+```
+
+It defaults to `127.0.0.1:2379` and takes `ETCD_WALKER_TEST_ENDPOINT`,
+`ETCD_WALKER_TEST_USER` and `ETCD_WALKER_TEST_PASSWORD` from the
+environment. Everything it writes goes under a unique `/etcd-walker-it/…`
+prefix and is removed afterwards.
+
+CI runs the unit suite (plus `-race`), a gofmt/vet check, cross-builds for
+linux amd64/arm64 and freebsd, and the integration suite against an etcd
+service container on every push and pull request.
 
 ---
 

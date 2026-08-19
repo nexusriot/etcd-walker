@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
@@ -366,7 +367,7 @@ func TestModelSetKeepTTL(t *testing.T) {
 	}
 }
 
-// Clearing a TTL (ttlSeconds <= 0) must just rewrite the value; the b.c guard
+// Clearing a TTL (ttlSeconds <= 0) must just rewrite the value; the lessor guard
 // means no lease/revoke RPCs are attempted when only the fake KV is wired up.
 func TestV3SetTTLClearWritesValue(t *testing.T) {
 	b, kv := newTestBackend(map[string]string{"/k": "old"})
@@ -378,8 +379,8 @@ func TestV3SetTTLClearWritesValue(t *testing.T) {
 	}
 }
 
-// Granting a TTL needs a live *clientv3.Client; with only the fake KV wired up
-// (b.c == nil) setTTL must report the limitation rather than panic.
+// Granting a TTL needs a live lessor; with only the fake KV wired up
+// (b.lessor == nil) setTTL must report the limitation rather than panic.
 func TestV3SetTTLGrantRequiresClient(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{"/k": "old"})
 	if err := b.setTTL("/k", "v", 60); err == nil {
@@ -450,7 +451,7 @@ func TestV3Probe(t *testing.T) {
 	}
 }
 
-// Without a live client (b.c == nil, as in these tests) lease resolution must
+// Without a live lessor (b.lessor == nil, as in these tests) lease resolution must
 // degrade to "no TTL", never panic.
 func TestTTLForLeaseNilClient(t *testing.T) {
 	b, _ := newTestBackend(nil)
@@ -694,5 +695,321 @@ func TestV3RenameDirIntoOwnSubtree(t *testing.T) {
 			t.Fatal("renameDir(/a -> /a/child) wiped the store: data loss")
 		}
 		t.Fatalf("renameDir into own subtree should be rejected, got success with store=%+v", kv.store)
+	}
+}
+
+// fakeLessor is an in-memory lessor backed by a fakeKV's per-key lease map, so
+// TimeToLive(WithAttachedKeys) reports exactly the keys the store still points
+// at that lease — the state setTTL inspects after re-pointing its own key.
+// Revokes are recorded rather than applied so tests can assert what the
+// backend *tried* to reap.
+type fakeLessor struct {
+	kv     *fakeKV
+	ttl    map[clientv3.LeaseID]int64 // remaining TTL; <0 means already gone
+	ttlErr error
+
+	granted []int64
+	revoked []clientv3.LeaseID
+	nextID  clientv3.LeaseID
+}
+
+func newFakeLessor(kv *fakeKV) *fakeLessor {
+	return &fakeLessor{kv: kv, ttl: map[clientv3.LeaseID]int64{}, nextID: 1000}
+}
+
+func (f *fakeLessor) Grant(_ context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
+	f.granted = append(f.granted, ttl)
+	f.nextID++
+	return &clientv3.LeaseGrantResponse{ID: f.nextID, TTL: ttl}, nil
+}
+
+func (f *fakeLessor) Revoke(_ context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
+	f.revoked = append(f.revoked, id)
+	return &clientv3.LeaseRevokeResponse{}, nil
+}
+
+func (f *fakeLessor) TimeToLive(_ context.Context, id clientv3.LeaseID, opts ...clientv3.LeaseOption) (*clientv3.LeaseTimeToLiveResponse, error) {
+	if f.ttlErr != nil {
+		return nil, f.ttlErr
+	}
+	remaining := int64(60)
+	if v, ok := f.ttl[id]; ok {
+		remaining = v
+	}
+	resp := &clientv3.LeaseTimeToLiveResponse{ID: id, TTL: remaining}
+	// Real etcd only fills Keys when WithAttachedKeys was requested. The option
+	// is an opaque func over an unexported struct, so approximate it by opt
+	// count: a caller that stops asking gets an empty key set, which is exactly
+	// the regression this pins (an empty set reads as "orphaned" → revoke).
+	if len(opts) == 0 {
+		return resp, nil
+	}
+	var keys []string
+	for k, l := range f.kv.leases {
+		if clientv3.LeaseID(l) == id {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		resp.Keys = append(resp.Keys, []byte(k))
+	}
+	return resp, nil
+}
+
+// leasedBackend wires a fake lessor to the backend and seeds per-key leases.
+func leasedBackend(seed map[string]string, leases map[string]int64) (*v3Backend, *fakeKV, *fakeLessor) {
+	b, kv := newTestBackend(seed)
+	for k, l := range leases {
+		kv.leases[k] = l
+	}
+	ls := newFakeLessor(kv)
+	b.lessor = ls
+	return b, kv, ls
+}
+
+// B-1: Ctrl+D duplicates re-attach the source's lease, so two keys can share
+// one. Changing the TTL on either must not revoke that lease — a revoke
+// deletes every key attached to it, silently destroying the sibling.
+func TestV3SetTTLKeepsSharedLease(t *testing.T) {
+	b, kv, ls := leasedBackend(
+		map[string]string{"/k": "v", "/copy": "v"},
+		map[string]int64{"/k": 42, "/copy": 42},
+	)
+
+	if err := b.setTTL("/k", "v2", 120); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.revoked) != 0 {
+		t.Errorf("revoked shared lease(s) %v; /copy would have been deleted", ls.revoked)
+	}
+	if _, ok := kv.store["/copy"]; !ok {
+		t.Error("sibling key /copy disappeared")
+	}
+	if kv.leases["/copy"] != 42 {
+		t.Errorf("sibling lease changed: %d, want 42", kv.leases["/copy"])
+	}
+}
+
+// Clearing the TTL takes the other branch of setTTL (plain Put, no grant) and
+// must apply the same sharing guard.
+func TestV3SetTTLClearKeepsSharedLease(t *testing.T) {
+	b, _, ls := leasedBackend(
+		map[string]string{"/k": "v", "/copy": "v"},
+		map[string]int64{"/k": 42, "/copy": 42},
+	)
+
+	if err := b.setTTL("/k", "v2", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.revoked) != 0 {
+		t.Errorf("clearing a TTL revoked shared lease(s) %v", ls.revoked)
+	}
+}
+
+// The flip side of B-1: a lease nothing else uses must still be reaped, or
+// every TTL change would orphan a lease that keeps ticking server-side.
+func TestV3SetTTLRevokesOrphanedLease(t *testing.T) {
+	b, _, ls := leasedBackend(
+		map[string]string{"/k": "v"},
+		map[string]int64{"/k": 42},
+	)
+
+	if err := b.setTTL("/k", "v2", 120); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.revoked) != 1 || ls.revoked[0] != 42 {
+		t.Errorf("revoked = %v, want [42]", ls.revoked)
+	}
+}
+
+// When the lease cannot be resolved we must not guess: a leaked lease expires
+// on its own, a wrongly revoked one takes data with it.
+func TestV3SetTTLKeepsLeaseWhenLookupFails(t *testing.T) {
+	b, _, ls := leasedBackend(
+		map[string]string{"/k": "v"},
+		map[string]int64{"/k": 42},
+	)
+	ls.ttlErr = errors.New("etcdserver: request timed out")
+
+	if err := b.setTTL("/k", "v2", 120); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.revoked) != 0 {
+		t.Errorf("revoked %v despite an unresolvable lease", ls.revoked)
+	}
+}
+
+// A lease the server already dropped reports TTL < 0; revoking it is pointless.
+func TestV3SetTTLSkipsExpiredLease(t *testing.T) {
+	b, _, ls := leasedBackend(
+		map[string]string{"/k": "v"},
+		map[string]int64{"/k": 42},
+	)
+	ls.ttl[42] = -1
+
+	if err := b.setTTL("/k", "v2", 120); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.revoked) != 0 {
+		t.Errorf("revoked already-expired lease %v", ls.revoked)
+	}
+}
+
+// A stale read may still list the edited key itself against the old lease;
+// that alone does not make the lease shared.
+func TestRevokeIfOrphanedToleratesSelfAttachment(t *testing.T) {
+	b, kv, ls := leasedBackend(
+		map[string]string{"/k": "v"},
+		map[string]int64{"/k": 42},
+	)
+	// Leave /k pointing at 42 so TimeToLive reports it as still attached.
+	kv.leases["/k"] = 42
+
+	b.revokeIfOrphaned(context.Background(), 42, "/k")
+	if len(ls.revoked) != 1 || ls.revoked[0] != 42 {
+		t.Errorf("revoked = %v, want [42]", ls.revoked)
+	}
+}
+
+// B-5: a JSON file carrying a `.dir` marker must be skipped, not written —
+// writing one turns its parent into a phantom directory. Export omits markers,
+// so skipping keeps an export/import round-trip faithful.
+func TestModelImportSkipsReservedDirMarker(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	m := &Model{backend: b}
+
+	w, s, err := m.Import(map[string]string{
+		"/cfg/.dir": "",
+		"/cfg/real": "v",
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 1 || s != 1 {
+		t.Errorf("written=%d skipped=%d, want 1/1", w, s)
+	}
+	if _, ok := kv.store["/cfg/.dir"]; ok {
+		t.Errorf("import wrote the reserved marker key: %+v", kv.store)
+	}
+	if kv.store["/cfg/real"] != "v" {
+		t.Errorf("import dropped a legitimate key: %+v", kv.store)
+	}
+}
+
+// B-3: abandoning a backend must be safe even when no real client was dialed.
+func TestV3CloseWithoutClient(t *testing.T) {
+	b, _ := newTestBackend(nil)
+	b.close()                 // b.c == nil
+	(*v3Backend)(nil).close() // and a nil backend
+}
+
+// B-2: the header's Auth field is rendered from authStatus for every protocol
+// arm, not just explicit v3.
+func TestAuthLabelOf(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled bool
+		known   bool
+		err     error
+		want    string
+	}{
+		{"enabled", true, true, nil, "ON"},
+		{"disabled", false, true, nil, "OFF"},
+		{"unknown", false, false, errors.New("boom"), "?"},
+		{"unknown wins over enabled", true, false, nil, "?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := authLabelOf(stubAuth{enabled: tc.enabled, known: tc.known, err: tc.err})
+			if got != tc.want {
+				t.Errorf("authLabelOf = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+type stubAuth struct {
+	enabled bool
+	known   bool
+	err     error
+}
+
+func (s stubAuth) authStatus() (bool, bool, error) { return s.enabled, s.known, s.err }
+
+// v3Backend.authStatus needs a live client; without one it must report
+// "unknown" rather than panic on the nil Auth field.
+func TestV3AuthStatusWithoutClient(t *testing.T) {
+	b, _ := newTestBackend(nil)
+	if _, known, err := b.authStatus(); known || err == nil {
+		t.Errorf("authStatus(nil client) = known:%v err:%v, want false/non-nil", known, err)
+	}
+	if got := authLabelOf(b); got != "?" {
+		t.Errorf("authLabelOf(nil client) = %q, want ?", got)
+	}
+}
+
+// mkdir materialises an empty directory by writing the reserved marker key,
+// which is what makes a childless directory visible in a listing at all.
+func TestV3MkdirWritesMarker(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	if err := b.mkdir("/app/empty"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := kv.store["/app/empty/.dir"]; !ok {
+		t.Errorf("marker key not written: %+v", kv.store)
+	}
+	// A trailing slash must not produce a doubled separator.
+	if err := b.mkdir("/app/other/"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := kv.store["/app/other/.dir"]; !ok {
+		t.Errorf("trailing-slash mkdir wrote the wrong key: %+v", kv.store)
+	}
+}
+
+func TestV3DelRemovesOnlyTheKey(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{
+		"/a":     "1",
+		"/ab":    "2",
+		"/a/sub": "3",
+	})
+	if err := b.del("/a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, gone := kv.store["/a"]; gone {
+		t.Error("/a was not deleted")
+	}
+	for _, keep := range []string{"/ab", "/a/sub"} {
+		if _, ok := kv.store[keep]; !ok {
+			t.Errorf("del(/a) also removed %s — it must delete one key, not a range", keep)
+		}
+	}
+}
+
+// deldir is the most destructive operation in the tool: one prefix DeleteRange
+// with no undo. Pin the boundary — a sibling that merely shares a string
+// prefix must survive.
+func TestV3DeldirDeletesSubtreeOnly(t *testing.T) {
+	b, kv := newTestBackend(map[string]string{
+		"/app/.dir":     "",
+		"/app/k":        "1",
+		"/app/sub/deep": "2",
+		"/application":  "3", // shares the "/app" prefix but is NOT under it
+		"/appstore/x":   "4",
+		"/other":        "5",
+	})
+	if err := b.deldir("/app"); err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []string{"/app/.dir", "/app/k", "/app/sub/deep"} {
+		if _, ok := kv.store[gone]; ok {
+			t.Errorf("%s survived the recursive delete", gone)
+		}
+	}
+	for _, keep := range []string{"/application", "/appstore/x", "/other"} {
+		if _, ok := kv.store[keep]; !ok {
+			t.Errorf("deldir(/app) destroyed %s — prefix boundary not respected", keep)
+		}
 	}
 }

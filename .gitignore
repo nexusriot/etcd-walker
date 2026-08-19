@@ -24,3 +24,6 @@ Thumbs.db
 *.swp
 *~
 .idea/
+
+# coverage output from `make cover` / CI
+coverage.out

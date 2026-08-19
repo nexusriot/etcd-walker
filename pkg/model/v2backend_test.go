@@ -284,3 +284,91 @@ func TestV2HistoryUnsupported(t *testing.T) {
 		t.Errorf("history on v2 = %v, want v3-required error", err)
 	}
 }
+
+// The v2 mutators had no coverage at all: v2 expresses expiry as a native
+// per-key TTL, so these SetOptions are the whole feature on that protocol.
+func TestV2SetWritesPlainValue(t *testing.T) {
+	api := &fakeKeysAPI{gets: map[string]*clientv2.Response{}}
+	b := &v2Backend{api: api, timeout: time.Second}
+
+	if err := b.set("/k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.sets) != 1 {
+		t.Fatalf("sets = %+v, want one", api.sets)
+	}
+	got := api.sets[0]
+	if got.key != "/k" || got.value != "v" {
+		t.Errorf("set wrote %q=%q", got.key, got.value)
+	}
+	if got.opts != nil && got.opts.TTL != 0 {
+		t.Errorf("plain set attached a TTL: %v", got.opts.TTL)
+	}
+}
+
+func TestV2SetTTLAppliesAndClears(t *testing.T) {
+	api := &fakeKeysAPI{gets: map[string]*clientv2.Response{}}
+	b := &v2Backend{api: api, timeout: time.Second}
+
+	if err := b.setTTL("/k", "v", 90); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.sets[0].opts.TTL; got != 90*time.Second {
+		t.Errorf("setTTL(90) wrote TTL %v, want 90s", got)
+	}
+
+	// Zero must clear the expiry, not leave the old one running.
+	if err := b.setTTL("/k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.sets[1].opts.TTL; got != 0 {
+		t.Errorf("setTTL(0) wrote TTL %v, want 0 (permanent)", got)
+	}
+}
+
+// setKeep is what the value editor uses; on v2 it must re-apply the remaining
+// TTL so editing a value does not silently make the key permanent.
+func TestV2SetKeepReappliesTTL(t *testing.T) {
+	api := &fakeKeysAPI{gets: map[string]*clientv2.Response{}}
+	b := &v2Backend{api: api, timeout: time.Second}
+
+	if err := b.setKeep("/k", "new", 0, 45); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.sets[0].opts.TTL; got != 45*time.Second {
+		t.Errorf("setKeep kept TTL %v, want 45s", got)
+	}
+	if err := b.setKeep("/k", "new", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.sets[1].opts.TTL; got != 0 {
+		t.Errorf("setKeep on a permanent key wrote TTL %v, want 0", got)
+	}
+}
+
+func TestV2MkdirDelDeldir(t *testing.T) {
+	api := &fakeKeysAPI{gets: map[string]*clientv2.Response{}}
+	b := &v2Backend{api: api, timeout: time.Second}
+
+	if err := b.mkdir("/d"); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.sets) != 1 || api.sets[0].opts == nil || !api.sets[0].opts.Dir {
+		t.Errorf("mkdir did not request a directory: %+v", api.sets)
+	}
+	if err := b.del("/k"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.deldir("/d"); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.deletes) != 2 || api.deletes[0] != "/k" || api.deletes[1] != "/d" {
+		t.Errorf("deletes = %v, want [/k /d]", api.deletes)
+	}
+}
+
+func TestV2Proto(t *testing.T) {
+	if got := (&v2Backend{}).proto(); got != "v2" {
+		t.Errorf("proto = %q, want v2", got)
+	}
+}

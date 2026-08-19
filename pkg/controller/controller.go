@@ -46,9 +46,64 @@ type modelAPI interface {
 	Import(items map[string]string, overwrite bool) (written, skipped int, err error)
 }
 
+// Policy is the session's safety configuration: what may be changed at all,
+// and which paths demand extra deliberation before they are. It is deliberately
+// enforced in the controller rather than the model — it describes what this
+// session is allowed to do, not what the cluster supports.
+type Policy struct {
+	// ReadOnly refuses every mutating action outright.
+	ReadOnly bool
+	// ProtectedPrefixes are paths whose subtrees need a typed confirmation
+	// before any write. A bare "/" protects the whole keyspace.
+	ProtectedPrefixes []string
+	// DryRun records what each mutation would do without performing it, so a
+	// change can be rehearsed against the real cluster and reviewed from the
+	// session journal before being run for real.
+	DryRun bool
+}
+
+// protects reports the protected prefix covering path, if any. A prefix covers
+// itself and everything beneath it, but not siblings that merely share a
+// string prefix: "/reg" does not protect "/registry".
+func (p Policy) protects(path string) (string, bool) {
+	target := normAbs(path)
+	for _, raw := range p.ProtectedPrefixes {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		pfx := normAbs(raw)
+		if pfx == "/" || target == pfx || strings.HasPrefix(target, pfx+"/") {
+			return pfx, true
+		}
+	}
+	return "", false
+}
+
+// guard describes one policy-gated mutation.
+type guard struct {
+	// action names the operation for the refusal/confirmation text ("delete").
+	action string
+	// paths are everything the operation writes to; the whole operation is
+	// gated if any of them is protected.
+	paths []string
+	// confirmWord, when set, demands a typed confirmation even for unprotected
+	// paths — recursive deletes use it. A protected path supersedes it so the
+	// user is never asked to type two different words for one action.
+	confirmWord string
+	// do performs the mutation once the policy allows it.
+	do func()
+	// onCancel runs when a protected confirmation is declined. Optional; the
+	// value editor uses it to hand the user back their unsaved text.
+	onCancel func()
+}
+
 type Controller struct {
-	view         *view.View
-	model        modelAPI
+	view   *view.View
+	model  modelAPI
+	policy Policy
+	// journal records every mutation this session made, for review or export
+	// as an etcdctl script. Written by the journalling model decorator.
+	journal      *Journal
 	currentDir   string
 	currentNodes map[string]*Node // mapKey => Node (mapKey is "<basename>|dir" or "<basename>|file")
 	position     map[string]int
@@ -65,11 +120,51 @@ type Controller struct {
 
 type Node struct {
 	node *model.Node
+	// stale records that the last on-focus refresh of this node failed, so
+	// what is displayed came from the listing cache rather than the server.
+	// v3 listings are keys-only, which makes a silently cached value actively
+	// dangerous — see DESIGN §12 B-7.
+	stale bool
 }
 
 func splitFunc(r rune) bool { return r == '/' }
 
-func NewController(opts model.Options) *Controller {
+// appVersion is the user-facing version. DESIGN §9.3: it is duplicated in the
+// Makefile and build-deb.sh, and all three must move together until F-3 lands.
+const appVersion = "0.9.0"
+
+// headerText renders the frame's status line and the colour that goes with it.
+// It is separated from NewController so it can be tested without dialling a
+// cluster — and it needs testing, because every bracketed tag here has to be
+// escaped or tview's colour parser eats it (DESIGN §12 B-13; the unescaped
+// "[TLS]" was invisible for exactly that reason).
+func headerText(opts model.Options, proto, auth string, policy Policy) (string, tcell.Color) {
+	tlsTag := ""
+	if opts.TLSEnabled {
+		tlsTag = " " + tview.Escape("[TLS]")
+	}
+
+	// The safety mode belongs in the header: it is the one thing the user must
+	// not have to remember about the session they are in.
+	color := tcell.ColorGreen
+	mode := ""
+	if n := len(policy.ProtectedPrefixes); n > 0 {
+		mode = fmt.Sprintf("  |  protected: %d", n)
+	}
+	if policy.DryRun {
+		mode = "  |  " + tview.Escape("[DRY-RUN]") + mode
+		color = tcell.ColorAqua
+	}
+	if policy.ReadOnly {
+		mode = "  |  " + tview.Escape("[READ-ONLY]") + mode
+		color = tcell.ColorYellow
+	}
+
+	return fmt.Sprintf("Etcd-walker v.%s (on %s:%s%s)  –  protocol: %s  |  Auth: %s%s",
+		appVersion, opts.Host, opts.Port, tlsTag, proto, auth, mode), color
+}
+
+func NewController(opts model.Options, policy Policy) *Controller {
 	m, err := model.NewModel(opts)
 
 	v := view.NewView()
@@ -81,19 +176,13 @@ func NewController(opts model.Options) *Controller {
 		auth = m.AuthLabel()
 	}
 
-	tlsTag := ""
-	if opts.TLSEnabled {
-		tlsTag = " [TLS]"
-	}
-
-	v.Frame.AddText(
-		fmt.Sprintf("Etcd-walker v.0.8.0 (on %s:%s%s)  –  protocol: %s  |  Auth: %s",
-			opts.Host, opts.Port, tlsTag, headerProto, auth),
-		true, tview.AlignCenter, tcell.ColorGreen,
-	)
+	text, headerColor := headerText(opts, headerProto, auth, policy)
+	v.Frame.AddText(text, true, tview.AlignCenter, headerColor)
 
 	controller := &Controller{
 		view:        v,
+		policy:      policy,
+		journal:     &Journal{dryRun: policy.DryRun},
 		currentDir:  "/",
 		lastGoodDir: "/",
 		position:    make(map[string]int),
@@ -102,8 +191,10 @@ func NewController(opts model.Options) *Controller {
 	}
 	// Assign only a real model: a nil *model.Model stored in the interface
 	// would read as non-nil. On startup error Run() never touches the model.
+	// Every mutation goes through the journalling decorator, which is also
+	// what makes dry-run work — it records instead of writing.
 	if m != nil {
-		controller.model = m
+		controller.model = newJournaling(m, controller.journal, policy.DryRun)
 	}
 	return controller
 }
@@ -225,6 +316,42 @@ func (c *Controller) reinjectRename(oldName, newName string, isDir bool, cluster
 	c.injectNode(newN)
 }
 
+// The three helpers below record a mutation this session just performed in the
+// local injected cache. They are no-ops under dry-run: nothing reached the
+// cluster, so faking the row would show a key that does not exist (or hide one
+// that still does) — exactly the ghost-row class of bug B-8. Navigation keeps
+// calling injectNode directly, because a jumped-to key really is on the server.
+
+func (c *Controller) injectWritten(nd *model.Node) {
+	if c.policy.DryRun {
+		return
+	}
+	c.injectNode(nd)
+}
+
+func (c *Controller) removeWritten(nd *model.Node) {
+	if c.policy.DryRun {
+		return
+	}
+	c.removeInjected(nd)
+}
+
+func (c *Controller) reinjectWritten(oldName, newName string, isDir bool, clusterID, value string) {
+	if c.policy.DryRun {
+		return
+	}
+	c.reinjectRename(oldName, newName, isDir, clusterID, value)
+}
+
+// writeHeader labels a success modal honestly: under dry-run the reported
+// change was recorded in the journal, not made.
+func (c *Controller) writeHeader(header string) string {
+	if c.policy.DryRun {
+		return header + " (dry run — not written)"
+	}
+	return header
+}
+
 func (c *Controller) makeNodeMap() error {
 	log.Debugf("updating node map started")
 	m := make(map[string]*Node)
@@ -235,9 +362,10 @@ func (c *Controller) makeNodeMap() error {
 		return err
 	}
 	for _, n := range list {
-		rawName := n.Name
-		fields := strings.FieldsFunc(strings.TrimSpace(rawName), splitFunc)
-		base := fields[len(fields)-1]
+		// baseOf, not FieldsFunc(...)[len-1]: the latter panics on a name that
+		// splits into nothing (""), and baseOf is what every other call site
+		// uses, so the map key matches the one actions look up.
+		base := baseOf(n.Name)
 		mapKey := makeMapKey(base, n.IsDir)
 		cNode := Node{node: n}
 		m[mapKey] = &cNode
@@ -264,12 +392,44 @@ func (c *Controller) makeNodeMap() error {
 	return nil
 }
 
-func (c *Controller) colorize(base string, isDir bool, label string) string {
+func (c *Controller) colorize(base, label string) string {
 	// Highlight entries that start with '_' in yellow
 	if strings.HasPrefix(base, "_") {
 		return "[yellow]" + label + "[-]"
 	}
 	return label
+}
+
+// setStale records whether a node's last refresh failed and, when that changed,
+// re-renders its row in place so the list reflects it immediately rather than
+// waiting for the next full rebuild.
+func (c *Controller) setStale(mapKey string, entry *Node, stale bool) {
+	if entry.stale == stale {
+		return
+	}
+	entry.stale = stale
+	for i := 0; i < c.view.List.GetItemCount(); i++ {
+		if _, sec := c.view.List.GetItemText(i); strings.TrimSpace(sec) == mapKey {
+			c.view.List.SetItemText(i, c.rowLabel(entry, displayName(baseOf(entry.node.Name), entry.node.IsDir)), mapKey)
+			return
+		}
+	}
+}
+
+// rowLabel renders one list row. A node whose last refresh failed is greyed
+// out and tagged, so the list itself shows that what is on screen is cached
+// rather than live — the details pane says the same thing at length.
+func (c *Controller) rowLabel(entry *Node, display string) string {
+	n := entry.node
+	prefix := "   "
+	if n.IsDir {
+		prefix = "📁 "
+	}
+	label := prefix + display
+	if entry.stale {
+		return "[gray]" + label + "  (cached)[-]"
+	}
+	return c.colorize(baseOf(n.Name), label)
 }
 
 // orderedEntries returns the map keys and matching display names sorted for
@@ -337,10 +497,9 @@ func (c *Controller) updateList() []string {
 
 	mks, display := orderedEntries(c.currentNodes)
 	for idx, mk := range mks {
-		n := c.currentNodes[mk].node
-		base := baseOf(n.Name)
-		if n.IsDir {
-			label := c.colorize(base, true, "📁 "+display[idx])
+		entry := c.currentNodes[mk]
+		label := c.rowLabel(entry, display[idx])
+		if entry.node.IsDir {
 			// Use mapKey as secondary text (stable key for actions)
 			c.view.List.AddItem(label, mk, 0, func() {
 				i := c.view.List.GetCurrentItem()
@@ -353,7 +512,6 @@ func (c *Controller) updateList() []string {
 				}
 			})
 		} else {
-			label := c.colorize(base, false, "   "+display[idx])
 			c.view.List.AddItem(label, mk, 0, func() {
 				// no-op; details pane updates via SetChangedFunc
 			})
@@ -382,11 +540,26 @@ func (c *Controller) fillDetails(mapKey string) {
 	// Re-fetch keys from the server so volatile fields (TTL countdown, value)
 	// reflect current state each time the key gets focus instead of the value
 	// cached at list time. Fall back to the cached node on any error (e.g.
-	// injected entries not yet readable).
+	// injected entries not yet readable) — but record that we did, because a
+	// cached v3 node has no value at all and silently showing one as if it were
+	// live is what made B-7 destructive.
 	if !n.IsDir {
-		if fresh, err := c.model.Get(n.Name); err == nil && fresh != nil && !fresh.IsDir {
+		refreshErr := error(nil)
+		fresh, err := c.model.Get(n.Name)
+		switch {
+		case err != nil:
+			refreshErr = err
+		case fresh == nil || fresh.IsDir:
+			refreshErr = fmt.Errorf("%s is no longer a key", n.Name)
+		default:
 			n = fresh
 			val.node = fresh
+		}
+		c.setStale(mapKey, val, refreshErr != nil)
+		if refreshErr != nil {
+			fmt.Fprintf(c.view.Details, "[red]⚠ cached — could not refresh from the server[-]\n")
+			fmt.Fprintf(c.view.Details, "[red]  %s[-]\n", tview.Escape(refreshErr.Error()))
+			fmt.Fprintf(c.view.Details, "[red]  values below may be out of date or incomplete[-]\n\n")
 		}
 	}
 	base := baseOf(n.Name)
@@ -434,10 +607,10 @@ func (c *Controller) fillDetails(mapKey string) {
 				title = fmt.Sprintf("Preview (JSON, %d chars)", previewLimit)
 			}
 			fmt.Fprintf(c.view.Details, "\n[::b]%s[::-]\n", title)
-			if len(shown) > previewLimit {
-				fmt.Fprintf(c.view.Details, "%s…\n", tview.Escape(shown[:previewLimit]))
+			if cut, truncated := truncateBytes(shown, previewLimit); truncated {
+				fmt.Fprintf(c.view.Details, "%s…\n", tview.Escape(cut))
 			} else {
-				fmt.Fprintf(c.view.Details, "%s\n", tview.Escape(shown))
+				fmt.Fprintf(c.view.Details, "%s\n", tview.Escape(cut))
 			}
 		} else {
 			const hexLimit = 256
@@ -485,13 +658,89 @@ func (c *Controller) fillDetails(mapKey string) {
 
 }
 
+// getPosition returns the index of element in slice, or -1 when it is absent.
+// Callers must check: treating "missing" as index 0 used to silently move the
+// cursor to the first row — a search that matched nothing looked like a hit.
 func (c *Controller) getPosition(element string, slice []string) int {
 	for k, v := range slice {
 		if element == v {
 			return k
 		}
 	}
-	return 0
+	return -1
+}
+
+// selectRow moves the cursor to the list row showing target (accounting for
+// the "[..]" entry at the top). A target that is not in the list leaves the
+// cursor where it is.
+func (c *Controller) selectRow(target string, ordered []string) {
+	if pos := c.getPosition(target, ordered); pos >= 0 {
+		c.view.List.SetCurrentItem(pos + 1) // +1 for [..]
+	}
+}
+
+// guarded runs g.do subject to the session policy: refused outright in
+// read-only mode, gated behind a typed confirmation when any target path lies
+// under a protected prefix, and run immediately otherwise.
+//
+// Every mutation funnels through here rather than through a check at the key
+// bindings alone, so a path that reaches a write by another route (the
+// revision-restore flow, say) is still covered.
+func (c *Controller) guarded(g guard) {
+	if c.policy.ReadOnly {
+		c.refuseReadOnly(g.action)
+		return
+	}
+	for _, p := range g.paths {
+		if prefix, ok := c.policy.protects(p); ok {
+			c.confirmTyped(
+				fmt.Sprintf("%s is protected — type %s to %s (Esc cancels)", prefix, baseOf(prefix), g.action),
+				baseOf(prefix), g.do, g.onCancel)
+			return
+		}
+	}
+	if g.confirmWord != "" {
+		c.confirmTyped(
+			fmt.Sprintf("%s — type %s to confirm (Esc cancels)", g.action, g.confirmWord),
+			g.confirmWord, g.do, g.onCancel)
+		return
+	}
+	g.do()
+}
+
+// refuseReadOnly explains why nothing happened.
+func (c *Controller) refuseReadOnly(action string) {
+	c.info("Read-only session", fmt.Sprintf(
+		"%s is disabled. Restart without -read-only (or set read_only:false) to make changes.", action))
+}
+
+// confirmTyped runs do only once want has been typed out verbatim. Used both
+// for protected prefixes (where want is the prefix's basename, which keeps the
+// prompt honest for bulk writes and names the boundary crossed) and for
+// recursive deletes (where it is the directory's own name).
+func (c *Controller) confirmTyped(prompt, want string, do, onCancel func()) {
+	inp := c.view.NewTypedConfirm(prompt)
+	inp.SetDoneFunc(func(key tcell.Key) {
+		// Drop this dialog before anything below adds its own: modals share
+		// the "modal" page name.
+		c.view.Pages.RemovePage("modal")
+		if key != tcell.KeyEnter || strings.TrimSpace(inp.GetText()) != want {
+			// When a caller takes the screen back — the value editor re-opens
+			// with the user's unsaved text — do NOT also queue a notice. The
+			// editor swaps the application root, so a modal added to Pages here
+			// is hidden behind it and then resurfaces when the editor closes,
+			// drawn over a list that already has the focus. The re-opened
+			// editor is feedback enough.
+			if onCancel != nil {
+				onCancel()
+				return
+			}
+			c.info("Cancelled", "not confirmed — nothing was changed")
+			return
+		}
+		do()
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 76, 5), true, true)
 }
 
 func (c *Controller) info(header, details string) {
@@ -502,8 +751,8 @@ func (c *Controller) info(header, details string) {
 	c.view.Pages.AddPage("modal-info", c.view.ModalEdit(m, 60, 7), true, true)
 }
 
-func (c *Controller) copied(header, details string) {
-	m := c.view.NewCopiedMessageQ(header, details)
+func (c *Controller) copied(details string) {
+	m := c.view.NewCopiedMessageQ(details)
 	m.SetDoneFunc(func(int, string) {
 		c.view.Pages.RemovePage("modal-info")
 	})
@@ -524,7 +773,7 @@ func (c *Controller) copyPath() *tcell.EventKey {
 			c.error("Clipboard error", err, false)
 			return nil
 		}
-		c.copied("Copied", "Directory path copied")
+		c.copied("Directory path copied")
 		return nil
 	}
 
@@ -539,7 +788,7 @@ func (c *Controller) copyPath() *tcell.EventKey {
 	}
 	if err := clip.Copy(text); err != nil {
 		if errors.Is(err, clip.ErrNoClipboard) {
-			c.error("Clipboard error", fmt.Errorf("No clipboard available. Tip: use a terminal that supports OSC52 (iTerm2, many modern terminals), or run inside tmux with allow-passthrough"), false)
+			c.error("Clipboard error", fmt.Errorf("no clipboard available — use a terminal that supports OSC52 (iTerm2 and most modern terminals), or run inside tmux with allow-passthrough"), false)
 			return nil
 		}
 		c.error("Clipboard error", err, false)
@@ -547,9 +796,9 @@ func (c *Controller) copyPath() *tcell.EventKey {
 	}
 
 	if val.node.IsDir {
-		c.copied("Copied", "Directory path copied")
+		c.copied("Directory path copied")
 	} else {
-		c.copied("Copied", "Key path copied")
+		c.copied("Key path copied")
 	}
 	return nil
 }
@@ -579,8 +828,21 @@ func (c *Controller) copyValue() *tcell.EventKey {
 		c.error("Clipboard error", err, false)
 		return nil
 	}
-	c.copied("Copied", "Key value copied")
+	c.copied("Key value copied")
 	return nil
+}
+
+// mutatingKeys are the list bindings that change cluster state, mapped to the
+// verb used in a read-only refusal. Ctrl+E is absent on purpose: it opens the
+// value editor, which doubles as the only way to read a value in full, so it
+// opens disabled instead of being blocked.
+var mutatingKeys = map[tcell.Key]string{
+	tcell.KeyCtrlN:  "create",
+	tcell.KeyDelete: "delete",
+	tcell.KeyCtrlR:  "rename",
+	tcell.KeyCtrlT:  "setting a TTL",
+	tcell.KeyCtrlD:  "duplicate",
+	tcell.KeyCtrlO:  "import",
 }
 
 func (c *Controller) setInput() {
@@ -593,6 +855,14 @@ func (c *Controller) setInput() {
 		return event
 	})
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// Refuse mutating bindings up front in a read-only session, so the
+		// dialog never opens rather than opening and then refusing. The guard
+		// inside each handler is still the authority — this only saves the
+		// user a pointless form.
+		if action, ok := mutatingKeys[event.Key()]; ok && c.policy.ReadOnly {
+			c.refuseReadOnly(action)
+			return nil
+		}
 		switch event.Key() {
 
 		case tcell.KeyCtrlN:
@@ -623,6 +893,8 @@ func (c *Controller) setInput() {
 			return c.export()
 		case tcell.KeyCtrlO:
 			return c.importJSON()
+		case tcell.KeyCtrlA:
+			return c.showJournal()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
 
@@ -726,8 +998,9 @@ func (c *Controller) search() *tcell.EventKey {
 		oldPos := c.view.List.GetCurrentItem()
 		value := strings.TrimSpace(search.GetText())
 		pos := c.getPosition(value, ordered)
-		// +1 because of the top "[..]" entry
-		if pos+1 != oldPos && key == tcell.KeyEnter {
+		// +1 because of the top "[..]" entry. A miss (pos < 0) leaves the
+		// cursor alone rather than yanking it to the first row.
+		if pos >= 0 && pos+1 != oldPos && key == tcell.KeyEnter {
 			c.view.List.SetCurrentItem(pos + 1)
 		}
 		c.view.Pages.RemovePage("modal")
@@ -764,36 +1037,54 @@ func (c *Controller) delete() *tcell.EventKey {
 		return nil
 	}
 
-	if val, ok := c.currentNodes[mapKey]; ok {
-		elem := displayName(baseOf(val.node.Name), val.node.IsDir)
-		if val.node.IsDir {
-			elem = elem + " (recursive)"
-		}
-		delQ := c.view.NewDeleteQ(elem)
-		delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			// Drop the confirm dialog first: any modal added below (error or
-			// via updateList) shares the "modal" page name and would be
-			// clobbered by a later remove.
-			c.view.Pages.RemovePage("modal")
-			if buttonLabel != "ok" {
-				return
-			}
-			if !val.node.IsDir {
-				err = c.model.Del(val.node.Name)
-			} else {
-				err = c.model.DelDir(val.node.Name)
-			}
-			if err != nil {
-				c.error("Error deleting node", err, false)
-				return
-			}
-			// Remove from injected cache if present
-			c.removeInjected(val.node)
-			c.view.Details.Clear()
-			c.updateList()
-		})
-		c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
+	val, ok := c.currentNodes[mapKey]
+	if !ok {
+		return nil
 	}
+
+	doDelete := func() {
+		if !val.node.IsDir {
+			err = c.model.Del(val.node.Name)
+		} else {
+			err = c.model.DelDir(val.node.Name)
+		}
+		if err != nil {
+			c.error("Error deleting node", err, false)
+			return
+		}
+		// Remove from injected cache if present
+		c.removeWritten(val.node)
+		c.view.Details.Clear()
+		c.updateList()
+	}
+
+	// A recursive delete is the most destructive thing this tool can do — a
+	// single DeleteRange over a fat prefix, with no undo. It gets a
+	// type-the-name confirmation rather than a bare ok/cancel that a stray
+	// Enter can dismiss. A protected path supersedes the word (see guarded),
+	// so the user is never asked to type two different things for one delete.
+	if val.node.IsDir {
+		c.guarded(guard{
+			action:      fmt.Sprintf("delete %s and everything under it", val.node.Name),
+			paths:       []string{val.node.Name},
+			confirmWord: baseOf(val.node.Name),
+			do:          doDelete,
+		})
+		return nil
+	}
+
+	delQ := c.view.NewDeleteQ(displayName(baseOf(val.node.Name), false))
+	delQ.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		// Drop the confirm dialog first: any modal added below (error or
+		// via updateList) shares the "modal" page name and would be
+		// clobbered by a later remove.
+		c.view.Pages.RemovePage("modal")
+		if buttonLabel != "ok" {
+			return
+		}
+		c.guarded(guard{action: "delete", paths: []string{val.node.Name}, do: doDelete})
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 20, 7), true, true)
 	return nil
 }
 
@@ -814,33 +1105,35 @@ func (c *Controller) create() *tcell.EventKey {
 		}
 		log.Debugf("Creating Node: name: %s, isDir: %t, value: %s", node, isDir, value)
 		full := normAbs(c.currentDir + node)
-		// Refuse to overwrite an existing key or directory silently — the
-		// same guard rename applies.
-		if nd, gerr := c.model.Get(full); gerr == nil && nd != nil {
-			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", full), false)
-			return
-		}
-		var err error
-		if !isDir {
-			err = c.model.Set(full, value)
-		} else {
-			err = c.model.MkDir(full)
-		}
-		if err != nil {
-			c.error("Error creating node", err, false)
-			return
-		}
-		// If underscore-prefixed, inject so it shows even in v2
-		if strings.HasPrefix(node, "_") {
-			nd := &model.Node{Name: full, IsDir: isDir, Value: value}
-			c.injectNode(nd)
-		}
-		ordered := c.updateList()
-		target := node
-		if isDir {
-			target = node + "/"
-		}
-		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1) // +1 for [..]
+		c.guarded(guard{action: "create", paths: []string{full}, do: func() {
+			// Refuse to overwrite an existing key or directory silently — the
+			// same guard rename applies.
+			if nd, gerr := c.model.Get(full); gerr == nil && nd != nil {
+				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", full), false)
+				return
+			}
+			var err error
+			if !isDir {
+				err = c.model.Set(full, value)
+			} else {
+				err = c.model.MkDir(full)
+			}
+			if err != nil {
+				c.error("Error creating node", err, false)
+				return
+			}
+			// If underscore-prefixed, inject so it shows even in v2
+			if strings.HasPrefix(node, "_") {
+				nd := &model.Node{Name: full, IsDir: isDir, Value: value}
+				c.injectWritten(nd)
+			}
+			ordered := c.updateList()
+			target := node
+			if isDir {
+				target = node + "/"
+			}
+			c.selectRow(target, ordered)
+		}})
 	})
 	createForm.AddButton("Quit", func() {
 		c.view.Pages.RemovePage("modal")
@@ -864,8 +1157,7 @@ func (c *Controller) rename() *tcell.EventKey {
 		return nil
 	}
 
-	fs := strings.FieldsFunc(val.node.Name, splitFunc)
-	curBase := fs[len(fs)-1]
+	curBase := baseOf(val.node.Name)
 
 	title := fmt.Sprintf("Rename key: %s", val.node.Name)
 	if val.node.IsDir {
@@ -885,33 +1177,37 @@ func (c *Controller) rename() *tcell.EventKey {
 		if newPath == oldPath {
 			return
 		}
-		// Refuse to overwrite an existing key or directory silently.
-		if nd, err := c.model.Get(newPath); err == nil && nd != nil {
-			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
-			return
-		}
-		var err error
-		if val.node.IsDir {
-			log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
-			err = c.model.RenameDir(oldPath, newPath)
-		} else {
-			log.Debugf("Renaming key: %s -> %s", oldPath, newPath)
-			err = c.model.RenameKey(oldPath, newPath)
-		}
-		if err != nil {
-			c.error("Failed to rename", err, false)
-			return
-		}
-		// Update injected cache if underscore-prefixed names are involved
-		if strings.HasPrefix(curBase, "_") || strings.HasPrefix(newName, "_") {
-			c.reinjectRename(oldPath, newPath, val.node.IsDir, val.node.ClusterId, val.node.Value)
-		}
-		ordered := c.updateList()
-		target := newName
-		if val.node.IsDir {
-			target = newName + "/"
-		}
-		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
+		// A rename both removes the old path and writes the new one, so either
+		// side being protected gates the whole operation.
+		c.guarded(guard{action: "rename", paths: []string{oldPath, newPath}, do: func() {
+			// Refuse to overwrite an existing key or directory silently.
+			if nd, err := c.model.Get(newPath); err == nil && nd != nil {
+				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
+				return
+			}
+			var err error
+			if val.node.IsDir {
+				log.Debugf("Renaming directory: %s -> %s", oldPath, newPath)
+				err = c.model.RenameDir(oldPath, newPath)
+			} else {
+				log.Debugf("Renaming key: %s -> %s", oldPath, newPath)
+				err = c.model.RenameKey(oldPath, newPath)
+			}
+			if err != nil {
+				c.error("Failed to rename", err, false)
+				return
+			}
+			// Update injected cache if underscore-prefixed names are involved
+			if strings.HasPrefix(curBase, "_") || strings.HasPrefix(newName, "_") {
+				c.reinjectWritten(oldPath, newPath, val.node.IsDir, val.node.ClusterId, val.node.Value)
+			}
+			ordered := c.updateList()
+			target := newName
+			if val.node.IsDir {
+				target = newName + "/"
+			}
+			c.selectRow(target, ordered)
+		}})
 	})
 	renameForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
@@ -959,18 +1255,34 @@ func (c *Controller) setTTL() *tcell.EventKey {
 			c.error("Invalid TTL", perr, false)
 			return
 		}
-		if err := c.model.SetTTL(val.node.Name, val.node.Value, secs); err != nil {
-			c.error("Failed to set TTL", err, false)
+		// SetTTL rewrites the key, so it needs the *current* value: the cached
+		// one is empty on v3 until fillDetails fetches it, and stale after any
+		// concurrent write. Re-read immediately before the write — this also
+		// stops a TTL change from resurrecting a key deleted in the meantime.
+		fresh, gerr := c.model.Get(val.node.Name)
+		if gerr != nil {
+			c.error("Failed to set TTL", fmt.Errorf("re-reading %s: %w", val.node.Name, gerr), false)
 			return
 		}
-		if strings.HasPrefix(baseOf(val.node.Name), "_") {
-			nd := &model.Node{Name: val.node.Name, IsDir: false, Value: val.node.Value, ClusterId: val.node.ClusterId, TTL: secs}
-			c.injectNode(nd)
+		if fresh == nil || fresh.IsDir {
+			c.error("Failed to set TTL", fmt.Errorf("%s is no longer a key", val.node.Name), false)
+			return
 		}
-		ordered := c.updateList()
-		target := displayName(baseOf(val.node.Name), false)
-		c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
-		c.fillDetails(mapKey)
+		val.node = fresh
+		c.guarded(guard{action: "set TTL", paths: []string{val.node.Name}, do: func() {
+			if err := c.model.SetTTL(val.node.Name, val.node.Value, secs); err != nil {
+				c.error("Failed to set TTL", err, false)
+				return
+			}
+			if strings.HasPrefix(baseOf(val.node.Name), "_") {
+				nd := &model.Node{Name: val.node.Name, IsDir: false, Value: val.node.Value, ClusterId: val.node.ClusterId, TTL: secs}
+				c.injectWritten(nd)
+			}
+			ordered := c.updateList()
+			target := displayName(baseOf(val.node.Name), false)
+			c.selectRow(target, ordered)
+			c.fillDetails(mapKey)
+		}})
 	})
 	form.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
@@ -999,8 +1311,42 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 		return c.rename()
 	}
 
+	// Never edit the cached value: v3 listings are keys-only, so a node starts
+	// out with an empty Value, and fillDetails' on-focus refresh swallows its
+	// own Get error. Opening the editor on that empty string and saving would
+	// silently wipe the key, so re-read it here and refuse to edit what we
+	// cannot read.
+	fresh, gerr := c.model.Get(val.node.Name)
+	if gerr != nil {
+		c.error("Cannot edit", fmt.Errorf("re-reading %s: %w", val.node.Name, gerr), false)
+		return nil
+	}
+	if fresh == nil || fresh.IsDir {
+		c.error("Cannot edit", fmt.Errorf("%s is no longer a key", val.node.Name), false)
+		return nil
+	}
+	val.node = fresh
+
+	c.openValueEditor(val, val.node.Value)
+	return nil
+}
+
+// openValueEditor puts the full-screen value editor on screen, seeded with
+// initial. It is re-entrant so a declined protected-path confirmation can hand
+// the user back exactly what they had typed instead of discarding it.
+//
+// In a read-only session the editor still opens — it is the only way to read a
+// value past the details pane's preview cap — but disabled, and saving is
+// refused by the policy guard regardless.
+func (c *Controller) openValueEditor(val *Node, initial string) {
 	title := fmt.Sprintf(" Edit (multiline): %s ", val.node.Name)
-	ta := c.view.NewMultilineEditor(title, val.node.Value)
+	if c.policy.ReadOnly {
+		title = fmt.Sprintf(" View (read-only): %s ", val.node.Name)
+	}
+	ta := c.view.NewMultilineEditor(title, initial)
+	if c.policy.ReadOnly {
+		ta.SetDisabled(true)
+	}
 
 	// Inside editor:
 	//   Ctrl+S = save
@@ -1010,26 +1356,33 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 		case tcell.KeyCtrlS:
 			value := ta.GetText()
 			log.Debugf("Multiline save: %s (%d bytes)", val.node.Name, len(value))
-			// Preserve any expiry: SetKeepTTL re-attaches the v3 lease / re-applies
-			// the v2 TTL so editing a key's value no longer silently drops it.
-			if err := c.model.SetKeepTTL(val.node.Name, value, val.node.LeaseID, val.node.TTL); err != nil {
-				c.view.CloseEditor()
-				c.error("Failed to save value", err, false)
-				return nil
-			}
-			if strings.HasPrefix(baseOf(val.node.Name), "_") {
-				nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId, TTL: val.node.TTL, LeaseID: val.node.LeaseID}
-				c.injectNode(nd)
-			}
+			// Leave the editor before the guard: a confirmation modal cannot
+			// show over the full-screen editor root.
 			c.view.CloseEditor()
-			ordered := c.updateList()
-			base := displayName(baseOf(val.node.Name), false)
-			pos := c.getPosition(base, ordered) + 1
-			c.view.List.SetCurrentItem(pos)
-			// Refresh details panel with mapKey
-			i := c.view.List.GetCurrentItem()
-			_, mk := c.view.List.GetItemText(i)
-			c.fillDetails(strings.TrimSpace(mk))
+			c.guarded(guard{
+				action: "save",
+				paths:  []string{val.node.Name},
+				do: func() {
+					// Preserve any expiry: SetKeepTTL re-attaches the v3 lease / re-applies
+					// the v2 TTL so editing a key's value no longer silently drops it.
+					if err := c.model.SetKeepTTL(val.node.Name, value, val.node.LeaseID, val.node.TTL); err != nil {
+						c.error("Failed to save value", err, false)
+						return
+					}
+					if strings.HasPrefix(baseOf(val.node.Name), "_") {
+						nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId, TTL: val.node.TTL, LeaseID: val.node.LeaseID}
+						c.injectWritten(nd)
+					}
+					ordered := c.updateList()
+					c.selectRow(displayName(baseOf(val.node.Name), false), ordered)
+					// Refresh details panel with mapKey
+					i := c.view.List.GetCurrentItem()
+					_, mk := c.view.List.GetItemText(i)
+					c.fillDetails(strings.TrimSpace(mk))
+				},
+				// Declining the confirmation must not cost the user their edit.
+				onCancel: func() { c.openValueEditor(val, value) },
+			})
 			return nil
 
 		case tcell.KeyEsc, tcell.KeyCtrlQ:
@@ -1040,11 +1393,12 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 	})
 
 	c.view.OpenEditor(ta)
-	return nil
 }
 
-// export prompts for a filename and writes all non-directory keys in the
-// current directory to a JSON file as {"key": "value", ...}.
+// export prompts for a filename and writes every non-directory key under the
+// current directory — the whole subtree, not just this level — to a JSON file
+// as {"key": "value", ...}. Directory markers are omitted, so the result
+// round-trips through importJSON.
 func (c *Controller) export() *tcell.EventKey {
 	defaultPath := "export.json"
 	if home, err := os.UserHomeDir(); err == nil {
@@ -1062,26 +1416,51 @@ func (c *Controller) export() *tcell.EventKey {
 		if filename == "" {
 			return
 		}
-
-		data, err := c.model.Export(c.currentDir)
-		if err != nil {
-			c.error("Export failed", err, false)
-			return
-		}
-
-		raw, err := json.MarshalIndent(data, "", "  ")
-		if err != nil {
-			c.error("Export failed", err, false)
-			return
-		}
-		if err := os.WriteFile(filename, raw, 0o600); err != nil {
-			c.error("Cannot write file", fmt.Errorf("%s: %w", filename, err), false)
-			return
-		}
-		c.info("Exported", fmt.Sprintf("Saved %d keys to %s", len(data), filename))
+		// The default path is a fixed ~/export.json, so a second export is far
+		// more likely to land on a real file than not. Ask before replacing it.
+		c.confirmOverwrite(filename, "export", c.writeExport)
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
 	return nil
+}
+
+// confirmOverwrite guards any local file write that would replace something
+// already on disk, running write only once the user agrees. Both the key
+// export and the journal export go through it.
+func (c *Controller) confirmOverwrite(filename, what string, write func(string)) {
+	if _, err := os.Stat(filename); err != nil {
+		write(filename) // nothing there (or unreadable — let the write report it)
+		return
+	}
+	q := c.view.NewOverwriteQ(fmt.Sprintf("%s already exists.\nReplace it with this %s?", filename, what))
+	q.SetDoneFunc(func(_ int, label string) {
+		c.view.Pages.RemovePage("modal")
+		if label != "overwrite" {
+			return
+		}
+		write(filename)
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(q, 60, 9), true, true)
+}
+
+// writeExport dumps the current subtree to filename as JSON.
+func (c *Controller) writeExport(filename string) {
+	data, err := c.model.Export(c.currentDir)
+	if err != nil {
+		c.error("Export failed", err, false)
+		return
+	}
+
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		c.error("Export failed", err, false)
+		return
+	}
+	if err := os.WriteFile(filename, raw, 0o600); err != nil {
+		c.error("Cannot write file", fmt.Errorf("%s: %w", filename, err), false)
+		return
+	}
+	c.info("Exported", fmt.Sprintf("Saved %d keys to %s", len(data), filename))
 }
 
 // resolveImportKey turns a key from an imported file into an absolute etcd
@@ -1195,17 +1574,30 @@ func (c *Controller) promptImportMode(path string) {
 		}
 		overwrite := label == "overwrite"
 		resolved := make(map[string]string, len(items))
+		targets := make([]string, 0, len(items))
 		for k, val := range items {
-			resolved[c.resolveImportKey(k)] = val
+			key := c.resolveImportKey(k)
+			resolved[key] = val
+			targets = append(targets, key)
 		}
-		written, skipped, ierr := c.model.Import(resolved, overwrite)
 		c.view.Pages.RemovePage("modal")
-		if ierr != nil {
-			c.error("Import failed", ierr, false)
-			return
-		}
-		c.updateList()
-		c.info("Imported", fmt.Sprintf("%d written, %d skipped", written, skipped))
+		// One import can touch many keys; a single protected target gates the
+		// whole batch, which is why the confirmation names the prefix rather
+		// than any one key.
+		c.guarded(guard{action: "import", paths: targets, do: func() {
+			written, skipped, ierr := c.model.Import(resolved, overwrite)
+			if ierr != nil {
+				c.error("Import failed", ierr, false)
+				return
+			}
+			c.updateList()
+			if c.policy.DryRun {
+				c.info("Import (dry run)", fmt.Sprintf(
+					"%d keys would be written — nothing was sent to the cluster.\nPress Ctrl+A to review the journal.", written))
+				return
+			}
+			c.info("Imported", fmt.Sprintf("%d written, %d skipped", written, skipped))
+		}})
 	})
 	c.view.Pages.RemovePage("modal")
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(q, 60, 9), true, true)
@@ -1224,8 +1616,11 @@ func (c *Controller) error(header string, err error, fatal bool) {
 
 func valueStats(v string) (bytes int, lines int, printable bool) {
 	bytes = len(v)
-	lines = strings.Count(v, "\n") + 1
 	printable = utf8.ValidString(v)
+	if v == "" {
+		return bytes, 0, printable // an empty value has no lines, not one
+	}
+	lines = strings.Count(v, "\n") + 1
 	return
 }
 
@@ -1267,6 +1662,20 @@ func formatTTL(secs int64) string {
 	}
 	fmt.Fprintf(&b, "%ds", d/time.Second)
 	return fmt.Sprintf("%s (%ds)", b.String(), secs)
+}
+
+// truncateBytes cuts s to at most max bytes without splitting a UTF-8 rune —
+// a naive s[:max] can leave a partial sequence that renders as a replacement
+// glyph. Returns the prefix and whether anything was dropped.
+func truncateBytes(s string, max int) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	end := max
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end], true
 }
 
 func shortHash(v string) string {
@@ -1381,7 +1790,14 @@ func (c *Controller) jump() *tcell.EventKey {
 // navigateTo moves the browser to a node: into it when it is a directory,
 // otherwise to its parent with the cursor on the key itself.
 func (c *Controller) navigateTo(nd *model.Node) {
-	c.injectNode(nd)
+	// Only inject what a listing genuinely hides — etcd v2 omits
+	// underscore-prefixed keys, which is the sole reason the injected cache
+	// exists. Injecting every jump/find target left the entry in the cache for
+	// the rest of the session, so a key deleted server-side afterwards kept
+	// showing up as a ghost row that no longer resolved.
+	if strings.HasPrefix(baseOf(nd.Name), "_") {
+		c.injectNode(nd)
+	}
 
 	if nd.IsDir {
 		dir := normAbs(nd.Name)
@@ -1511,30 +1927,34 @@ func (c *Controller) duplicate() *tcell.EventKey {
 			c.error("Invalid target", fmt.Errorf("cannot copy %s onto itself", src), false)
 			return
 		}
-		if nd, gerr := c.model.Get(dst); gerr == nil && nd != nil {
-			c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", dst), false)
-			return
-		}
-		var err error
-		if val.node.IsDir {
-			err = c.model.CopyDir(src, dst)
-		} else {
-			err = c.model.CopyKey(src, dst)
-		}
-		if err != nil {
-			c.error("Failed to copy", err, false)
-			return
-		}
-		if strings.HasPrefix(baseOf(dst), "_") {
-			c.injectNode(&model.Node{Name: dst, IsDir: val.node.IsDir, Value: val.node.Value, ClusterId: val.node.ClusterId})
-		}
-		ordered := c.updateList()
-		if parentOf(dst) == normAbs(c.currentDir) {
-			target := displayName(baseOf(dst), val.node.IsDir)
-			c.view.List.SetCurrentItem(c.getPosition(target, ordered) + 1)
-		} else {
-			c.info("Copied", fmt.Sprintf("%s → %s", src, dst))
-		}
+		// Only the destination is written; reading from a protected prefix is
+		// harmless, so the source does not gate the copy.
+		c.guarded(guard{action: "copy", paths: []string{dst}, do: func() {
+			if nd, gerr := c.model.Get(dst); gerr == nil && nd != nil {
+				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", dst), false)
+				return
+			}
+			var err error
+			if val.node.IsDir {
+				err = c.model.CopyDir(src, dst)
+			} else {
+				err = c.model.CopyKey(src, dst)
+			}
+			if err != nil {
+				c.error("Failed to copy", err, false)
+				return
+			}
+			if strings.HasPrefix(baseOf(dst), "_") {
+				c.injectWritten(&model.Node{Name: dst, IsDir: val.node.IsDir, Value: val.node.Value, ClusterId: val.node.ClusterId})
+			}
+			ordered := c.updateList()
+			if parentOf(dst) == normAbs(c.currentDir) {
+				target := displayName(baseOf(dst), val.node.IsDir)
+				c.selectRow(target, ordered)
+			} else {
+				c.info(c.writeHeader("Copied"), fmt.Sprintf("%s → %s", src, dst))
+			}
+		}})
 	})
 	form.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")

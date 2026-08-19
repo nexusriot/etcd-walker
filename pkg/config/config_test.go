@@ -45,3 +45,39 @@ func TestLoadDirectoryIsError(t *testing.T) {
 		t.Fatal("expected error when path is a directory")
 	}
 }
+
+// The safety settings must survive a round trip through JSON, since a
+// mistyped key silently leaving read_only false is the failure that matters.
+func TestLoadSafetySettings(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	body := `{"host":"h","read_only":true,"protected_prefixes":["/registry","/vault"]}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ReadOnly {
+		t.Error("read_only not parsed")
+	}
+	if len(cfg.ProtectedPrefixes) != 2 || cfg.ProtectedPrefixes[0] != "/registry" {
+		t.Errorf("protected_prefixes = %v", cfg.ProtectedPrefixes)
+	}
+}
+
+// A config that says nothing about safety leaves the session unrestricted.
+func TestLoadSafetyDefaults(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"host":"h"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReadOnly || len(cfg.ProtectedPrefixes) != 0 {
+		t.Errorf("unexpected safety defaults: %+v", cfg)
+	}
+}

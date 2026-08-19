@@ -30,6 +30,17 @@ type Config struct {
 
 	// TimeoutSeconds for etcd operations (0 = default 5s)
 	TimeoutSeconds int `json:"timeout_seconds"`
+
+	// ReadOnly refuses every mutating action for the whole session.
+	ReadOnly bool `json:"read_only"`
+
+	// ProtectedPrefixes are paths whose subtrees require a typed confirmation
+	// before any write — e.g. ["/registry"] on a Kubernetes cluster. A bare
+	// "/" protects the entire keyspace.
+	ProtectedPrefixes []string `json:"protected_prefixes"`
+
+	// DryRun records what each mutation would do without performing it.
+	DryRun bool `json:"dry_run"`
 }
 
 // Load tries to read and unmarshal config from the given path.

@@ -62,12 +62,18 @@ etcd-walker/
 │   │   ├── model.go
 │   │   ├── v3backend_test.go   in-memory fakeKV exercises the v3 backend
 │   │   ├── v2backend_test.go   fake KeysAPI exercises the v2 backend
+│   │   ├── model_test.go       Model→backend delegation wiring
+│   │   ├── integration_test.go `integration`-tagged, needs a real etcd
 │   │   └── helpers_test.go
 │   ├── controller/          UI state + keybindings + business glue
 │   │   ├── controller.go
 │   │   ├── history.go          revision-history viewer (picker/detail/diff/restore)
+│   │   ├── journal.go          session journal + dry-run model decorator
 │   │   ├── controller_test.go  fakeModel + headless tview drive the flows
 │   │   ├── history_test.go
+│   │   ├── journal_test.go
+│   │   ├── policy_test.go
+│   │   ├── flows_test.go       dialog flows driven headlessly (create/dup/jump)
 │   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
 │   │   └── view.go
@@ -75,6 +81,7 @@ etcd-walker/
 │       ├── clip.go
 │       └── clip_test.go
 │
+├── .github/workflows/ci.yml  build/vet/gofmt/test/-race, cross-build, etcd
 ├── resources/               screenshots, icons
 ├── examples/                import-sample.json for the JSON import feature
 ├── DEBIAN/                  Debian packaging metadata
@@ -89,10 +96,12 @@ etcd-walker/
 ```
 
 The codebase is intentionally small and flat — one production file per
-package (plus `controller/history.go`, which keeps the self-contained
-revision-history flow out of the already-large `controller.go`), almost all
-with sibling `_test.go` files (only `pkg/view`, pure widget construction,
-has none) — so newcomers can read it end-to-end in a single sitting.
+package, except `pkg/controller`, where two self-contained flows are kept
+out of the already-large `controller.go`: `history.go` (the revision-history
+screens) and `journal.go` (the session journal and its model decorator).
+Almost every file has a sibling `_test.go` (only `pkg/view`, pure widget
+construction, has none), so newcomers can read it end-to-end in a single
+sitting.
 
 ---
 
@@ -100,24 +109,32 @@ has none) — so newcomers can read it end-to-end in a single sitting.
 
 The boot sequence ([cmd/etcd-walker/main.go](cmd/etcd-walker/main.go)) is:
 
-1. Define typed flag wrappers (`stringFlag`, `boolFlag`) that record
-   whether each flag was explicitly set on the command line — this is what
-   makes "CLI overrides config" precise per field.
+1. `registerFlags(flag.CommandLine)` declares every flag and returns them
+   bundled as a `cliFlags`. The typed wrappers (`stringFlag`, `boolFlag`)
+   record whether each flag was explicitly given, which is what makes "CLI
+   overrides config" precise per field; `boolFlag.IsBoolFlag` is what lets
+   `-read-only` be written bare. Registration and bundling are one function
+   on purpose — see B-17 in §12.
 2. Parse `flag.Parse()`.
 3. Seed hard-coded defaults (host `127.0.0.1`, port `2379`,
    protocol `auto`, timeout `5s`).
 4. Call `config.Load(path)` to read the JSON file. Missing file is **not**
    an error; `Load` returns `(nil, nil)` so the program just keeps the
    defaults.
-5. Apply config-file values, then overlay any explicitly-set CLI flags.
-6. Build a `model.Options` struct and hand it to
-   `controller.NewController(opts)`.
+5. Hand the config and the flag bundle to `resolve()`, which applies the
+   config-file values and then overlays any explicitly-set CLI flag,
+   returning the `model.Options` (how to reach the cluster) and the
+   `controller.Policy` (what this session may do to it — see §13).
+6. `controller.NewController(opts, policy)`.
 7. `ctrl.Run()` enters the tview main loop and blocks until the user
    quits.
 
-This three-tier precedence (defaults → file → flags) is implemented
-field-by-field in `main.go` so a partial config (e.g. only `tls_enabled`)
-combines cleanly with a partial set of CLI flags.
+This three-tier precedence (defaults → file → flags) is applied
+field-by-field, so a partial config (e.g. only `tls_enabled`) combines
+cleanly with a partial set of CLI flags. It lives in `resolve()` rather than
+inline in `main()` precisely so it can be tested: ~20 fields each needing
+"config unless the flag was set" is exactly the shape where a copy-paste
+lands a value in the wrong field and nothing complains (§10a).
 
 ---
 
@@ -177,10 +194,15 @@ type backend interface {
 
 Two implementations satisfy it:
 
-* `v3Backend` — wraps `go.etcd.io/etcd/client/v3`. It holds both a
-  `clientv3.KV` (for get/put/delete/range) and the full `*clientv3.Client`
-  (needed for lease operations and `Auth.AuthStatus`). Speaks gRPC, supports
-  auth and TLS.
+* `v3Backend` — wraps `go.etcd.io/etcd/client/v3`. It holds three handles: a
+  `clientv3.KV` (get/put/delete/range), a `lessor` (a three-method narrowing
+  of `clientv3.Lease` — `Grant`/`Revoke`/`TimeToLive` — that
+  `*clientv3.Client` satisfies in production and a `fakeLessor` satisfies in
+  tests), and the full `*clientv3.Client` for `Auth.AuthStatus` and `Close`.
+  Splitting the lease methods out is what made the B-1 fix testable (§12).
+  Speaks gRPC, supports auth and TLS. `close()` releases the client;
+  `NewModel` calls it on any path that abandons a dialled backend, so a
+  failed probe does not leave a gRPC reconnect loop running.
 * `v2Backend` — wraps `github.com/coreos/etcd/client` (`clientv2.KeysAPI`),
   speaks HTTP. Username/password are passed through as HTTP basic auth;
   the TLS knobs are ignored (the endpoint is always `http://`).
@@ -190,7 +212,10 @@ worth calling out:
 
 * `Model.Import(items, overwrite)` — the one operation **not** backed by a
   single interface method: a key/value bulk write implemented in terms of
-  `get`/`set`, with a normalize-and-skip policy.
+  `get`/`set`. Keys are normalized; the root path and the reserved `.dir`
+  marker are counted as skipped rather than written (the same guard
+  `create()` applies, and symmetric with `export`, which omits markers), and
+  in skip mode existing keys are left alone.
 * `Model.SetTTL(key, value, ttlSeconds)` — pass-through to `setTTL`; sets or
   clears a key's expiry (see §5.5).
 * `Model.SetKeepTTL(key, value, leaseID, ttlSeconds)` — pass-through to
@@ -276,16 +301,14 @@ because etcd implements expiry differently across the protocol versions:
 * **v3** has no per-key TTL; expiry is modelled with **leases**. To set a
   TTL, `setTTL` reads the key's *current* lease, grants a fresh one with
   `Lease.Grant(ctx, seconds)`, `Put`s the key with `clientv3.WithLease(id)`,
-  and finally `Revoke`s the superseded lease so it does not linger as an
-  orphan that keeps ticking server-side. A `ttlSeconds <= 0` instead does a
-  plain `Put` (detaching any lease, making the key permanent) and then revokes
-  the old lease too. The revoke is best-effort and guarded on `b.c != nil`;
-  because the tool attaches exactly one key per lease, reaping the old lease
-  never takes another key with it.
+  and finally hands the superseded lease to `revokeIfOrphaned` so it does not
+  linger as an orphan that keeps ticking server-side. A `ttlSeconds <= 0`
+  instead does a plain `Put` (detaching any lease, making the key permanent)
+  and then reaps the old lease the same way.
   When reading, `get` sees the lease id on the `KeyValue` and resolves the
   live countdown through `Lease.TimeToLive` (helper `ttlForLease`, tolerant:
-  returns `0` when the lease id is `0`, the lease has expired, or `b.c` is
-  `nil` — the unit tests wire up only the fake `KV`). `ls` deliberately does
+  returns `0` when the lease id is `0`, the lease has expired, or `b.lessor`
+  is `nil` — the unit tests wire up only the fake `KV`). `ls` deliberately does
   **not** resolve the countdown: the list pane never renders TTL and the
   focused key is re-read anyway (§7.3), so paying one `TimeToLive` round-trip
   per leased child would be wasted work. `ls` carries only the cheap
@@ -305,12 +328,15 @@ each key's lease and the v2 copy re-applies each node's remaining TTL, so
 moving or duplicating an expiring key never silently makes it permanent.
 
 **Sharp edge — shared leases.** Re-attaching the *same* lease means a v3 copy
-shares one lease with its source (and applications outside this tool routinely
-park many keys on one lease). `setTTL`'s clean-up `Revoke` assumes the lease
-belongs to the edited key alone; revoking a shared lease deletes every other
-key attached to it. See finding B-1 in §12 — the fix is to count attached keys
-(`Lease.TimeToLive` with `WithAttachedKeys`) and skip the revoke when the
-lease is shared.
+shares one lease with its source, and applications outside this tool routinely
+park many keys on one lease. Revoking a shared lease deletes every key attached
+to it, so `revokeIfOrphaned` resolves the lease with
+`Lease.TimeToLive(..., WithAttachedKeys())` and revokes only when nothing else
+is still attached — the edited key was re-pointed by the preceding `Put`, so an
+orphan reports an empty key set, and the key itself is tolerated in case of a
+stale read. Any uncertainty (no lessor, a failed lookup, a lease already
+reporting `TTL < 0`) leaves the lease alone: a leaked lease expires by itself,
+a wrongly revoked one takes data with it. This was finding B-1 (§12).
 
 Because the v3 TTL is a *countdown*, it changes every second on the server.
 The controller therefore re-reads the focused key on demand rather than
@@ -353,9 +379,11 @@ surfaces as-is.
 * `List` — the left pane: the directory listing.
 * `Details` — the right pane: metadata about the highlighted node.
 * Constructors for the dialogs (create, edit, rename, set-TTL,
-  delete-confirm, search, recursive-find form, search-results picker, jump,
-  export, JSON import file-browser, import-mode prompt, multi-line editor,
-  hotkeys help).
+  delete-confirm, typed-confirm, file-overwrite prompt, search,
+  recursive-find form, results picker — reused by search results, the
+  revision picker and the journal viewer — jump, export, JSON import
+  file-browser, import-mode prompt, revision detail/diff pane,
+  restore-confirm, multi-line editor, hotkeys help).
 
 Key design decisions:
 
@@ -369,7 +397,14 @@ Key design decisions:
   follow-up instead.
 * The full-screen multi-line editor swaps the application root
   (`OpenEditor`/`CloseEditor`), hiding the frame and hotkey legend so it can
-  use the entire terminal; it is not a `Pages` modal.
+  use the entire terminal; it is not a `Pages` modal. A consequence: no
+  dialog can be shown over it, which is why the value editor closes before
+  its policy guard runs (§13.2).
+* Anything user-supplied that reaches a title or a `TextView` goes through
+  `tview.Escape`. tview's colour-tag parser matches `[a-zA-Z]+` inside
+  brackets and consumes it, in `Box` titles as much as in body text, so an
+  unescaped `[d]` hotkey hint or a key name containing brackets simply
+  disappears — see B-13 in §12.
 
 ---
 
@@ -384,7 +419,9 @@ lives.
 ```go
 type Controller struct {
     view         *view.View
-    model        modelAPI                    // *model.Model in production
+    model        modelAPI                    // journalling wrapper in production
+    policy       Policy                      // read-only / dry-run / protected (§13)
+    journal      *Journal                    // what this session changed (§13.4)
     currentDir   string
     currentNodes map[string]*Node            // mapKey → Node
     position     map[string]int              // dir path → cursor index
@@ -393,12 +430,20 @@ type Controller struct {
     lastGoodDir  string                      // fallback for failed listings
     startupErr   error
 }
+
+type Node struct {
+    node  *model.Node
+    stale bool  // last on-focus refresh failed; displayed data is cached (§13.3)
+}
 ```
 
 * `model` — an unexported `modelAPI` interface rather than the concrete
-  `*model.Model`; production wiring is unchanged, but tests drive the
-  controller with an in-memory fake (see `controller_test.go`, which pairs
-  the fake with headless tview widgets).
+  `*model.Model`. In production it holds a `journaling` decorator wrapping the
+  real model (§13.4); tests drive the controller with an in-memory fake (see
+  `controller_test.go`, which pairs the fake with headless tview widgets).
+* `policy` and `journal` — the session's safety configuration and the record
+  of what it changed. Both are described in §13, which is where the read-only,
+  protected-prefix, dry-run and journal features are documented together.
 * `currentDir` — the path the user is currently looking at.
 * `currentNodes` — keyed by `mapKey` (`"<base>|dir"` or `"<base>|file"`)
   so a key and a directory with the same basename can coexist.
@@ -427,13 +472,18 @@ type Controller struct {
 * On the global `App`: `Ctrl+Q` quits.
 * On the `List` widget: every other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`,
   `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+V`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
-  `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+H`, `Backspace`).
+  `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+A`, `Ctrl+H`, `Backspace`).
+
+  This handler starts by consulting `mutatingKeys`: in a read-only session the
+  bindings that change state are refused here, so the dialog never opens
+  (§13.2). It is a convenience, not the enforcement point — that is `guarded`.
 
 Each hotkey calls a small method (`create`, `duplicate`, `delete`,
 `editMultiline`, `rename`, `setTTL`, `history`, `copyPath`, `copyValue`,
-`search`, `findRecursive`, `jump`, `export`, `importJSON`) which opens the
-appropriate dialog and, on submission, calls into the model and then
-`updateList()` to refresh the listing. `findRecursive` chains two dialogs:
+`search`, `findRecursive`, `jump`, `export`, `importJSON`, `showJournal`)
+which opens the appropriate dialog and, on submission, calls into the model
+and then `updateList()` to refresh the listing. `findRecursive` chains two
+dialogs:
 the query form, then a results picker whose selection hands the node to
 `navigateTo` — the shared helper (also used by `jump`) that enters a
 directory or selects a key in its parent. `history` chains up to four
@@ -450,8 +500,11 @@ screens (§7.5).
 2. Sort via `orderedEntries`: directories first, then keys, each
    alphabetical **by basename** — sorting the raw `"<base>|dir"` map keys
    would order `app2/` before `app/` because `|` sorts after alphanumerics.
-3. Push `tview.ListItem`s into the view, applying yellow styling to
-   underscore-prefixed names.
+3. Push `tview.ListItem`s into the view, labelled by `rowLabel`: a folder or
+   key glyph, yellow for underscore-prefixed names, or grey and `(cached)`
+   when the node is stale (§13.3). Staleness wins over the underscore colour —
+   it is the more urgent signal, and nesting the two tags would leave the
+   `[-]` reset mismatched.
 4. Restore the cursor from `position[currentDir]`.
 5. Cache the display ordering in `c.ordered` for `search()`.
 
@@ -476,22 +529,41 @@ what populates the value in the details pane and in the edit dialogs.
 Because a v3 lease TTL is a live countdown (§5.5), `fillDetails()` re-reads
 the focused **key** from the server with `model.Get` on every selection
 change, replacing the node cached at list time so the TTL and value stay
-current as the user moves the cursor on and off the key. The lookup falls
-back to the cached node on any error (e.g. an injected entry that is not
-yet readable). Directories keep using the cached node plus the live child
-count.
+current as the user moves the cursor on and off the key. When that read
+fails — or the path is no longer a key — it falls back to the cached node
+**and says so**: the entry is marked stale, the pane leads with a red banner
+naming the error, and the row is re-rendered greyed (§13.3). That visibility
+matters because a cached v3 node has no value at all; the silent version of
+this fallback is what made B-7 destructive. Directories keep using the cached
+node plus the live child count.
 
 ### 7.4 Mutations
 
 Every mutating action (`create`, `duplicate`, `delete`, `rename`,
-`editMultiline`, `setTTL`, `importJSON`) follows the same pattern:
+`editMultiline`, `setTTL`, `importJSON`, and `restoreRevision` in
+`history.go`) follows the same pattern:
 
 1. Open a dialog from `view`.
-2. On `Enter`, remove the dialog page first (§6), then validate input and
-   call the matching `model` method.
-3. On error, surface a red modal with the error text — never crash.
-4. On success, update the `injected` cache (so the new state is visible
+2. On `Enter`, remove the dialog page first (§6), then validate input.
+3. Hand the actual mutation to `c.guarded(guard{…})` rather than calling the
+   model directly. That single funnel applies the session policy — refuse in
+   read-only, demand a typed confirmation for protected prefixes or recursive
+   deletes — and is what makes the guarantee checkable; a check bolted onto
+   the key bindings alone would miss `restoreRevision`, which never touches
+   them. See §13.2.
+4. On error, surface a red modal with the error text — never crash.
+5. On success, update the `injected` cache (so the new state is visible
    even if the server lags), then call `updateList()`.
+
+Two mutating paths re-read the key from the server before acting rather than
+trusting the node cached in `currentNodes`: `editMultiline` (before opening
+the editor) and `setTTL` (inside its Save handler, immediately before the
+write). Both rewrite the key's value, and a cached v3 node's value is empty
+until `fillDetails` fetches one — see B-7 in §12.
+
+The mutation itself lands on the `journaling` decorator, not the raw model, so
+it is recorded for the session journal and skipped entirely under dry-run
+(§13.4).
 
 `create` refuses to overwrite an existing key/directory and rejects the
 reserved `.dir` name (§5.3); `rename` and `duplicate` apply the same
@@ -604,12 +676,13 @@ trace without disturbing the interface.
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.8.0**, hard-coded in three places
-that must be bumped together when cutting a release:
+The current user-facing version is **0.9.0**, duplicated in three places
+that must be bumped together (`TestVersionIsConsistentAcrossTheRepo` fails if
+they drift, and it has caught a partial bump):
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
-  (`"Etcd-walker v.0.8.0 …"`).
-* `VERSION ?= 0.8.0` in the `Makefile` (overridable on the CLI:
+  — the `appVersion` constant the header string interpolates.
+* `VERSION ?= 0.9.0` in the `Makefile` (overridable on the CLI:
   `make debs VERSION=…`).
 * The `version=` variable at the top of `build-deb.sh` (the legacy helper;
   `build-deb-arm64.sh` just delegates to it).
@@ -651,6 +724,50 @@ Equivalent raw commands, if you prefer not to use the Makefile:
 
 ---
 
+## 10a. Testing & CI
+
+Three layers, all runnable from the Makefile:
+
+| Layer | Command | What it covers |
+|-------|---------|----------------|
+| Unit | `make test` / `make test-race` | Everything below, against in-memory fakes. Hermetic — no network, no screen. |
+| Coverage | `make cover` | Prints the total; `coverage.out` is git-ignored. |
+| Integration | `make test-integration` | The `integration`-tagged suite in `pkg/model`, against a **real etcd**. |
+
+**The fakes.** `pkg/model` drives the v3 backend through an in-memory
+`clientv3.KV` that models revision history, compaction and per-key leases,
+plus a `fakeLessor`; the v2 backend gets a fake `KeysAPI` that records the
+`SetOptions` each call produced (which is where v2's TTL semantics live).
+`pkg/controller` runs against a `fakeModel` and headless tview widgets.
+
+**Driving dialogs without a screen.** The test `ModalEdit` is the identity
+function, so `Pages.GetFrontPage()` hands back the widget itself; from there
+`InputHandler()(tcell.NewEventKey(...), …)` fires `SetDoneFunc` on an input
+and `GetButton(GetButtonIndex("Save"))` fires a form button. That is how
+`create`/`duplicate`/`jump`/import validation are covered without a terminal.
+
+**What is deliberately not unit-tested.** `pkg/view` is pure widget
+construction (0%), and `main()`/`Run()` are wiring — the logic they used to
+hide has been pulled out into `resolve()` and `headerText()`, which are
+tested directly.
+
+**Why an integration suite exists at all.** Lease sharing, MVCC revision
+walks and prefix-range boundaries are etcd semantics, not ours; a fake can
+only assert what we already believe. B-1 is the case in point — the shared-
+lease test genuinely deletes the sibling key when the guard is removed, which
+no fake proved. The suite writes everything under a per-test
+`/etcd-walker-it/<test>-<nanos>` prefix and deletes it on cleanup, and reads
+`ETCD_WALKER_TEST_ENDPOINT` / `_USER` / `_PASSWORD` from the environment.
+
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs three jobs
+on push and PR: `build` (gofmt check, vet with and without the `integration`
+tag, **staticcheck**, build, test, `-race`, coverage artifact), `cross-build` (linux/amd64, linux/arm64, freebsd/amd64 — the
+targets the README advertises), and `etcd-integration` (the tagged suite
+against an `etcd:v3.5.15` service container). Every job takes its Go version
+from `go.mod` via `go-version-file`, so CI cannot drift from the module.
+
+---
+
 ## 11. Extending the project
 
 Some natural places to extend:
@@ -660,39 +777,89 @@ Some natural places to extend:
   Nothing in `controller` or `view` needs to change.
 * **A new hotkey / dialog**: add a constructor in
   [pkg/view/view.go](pkg/view/view.go) and a handler method on
-  `Controller`, then wire it in `setInput()`.
+  `Controller`, then wire it in `setInput()`. If the handler *changes*
+  anything, route the mutation through `c.guarded(guard{…})` rather than
+  calling the model directly, and add the key to `mutatingKeys` so a
+  read-only session refuses it before the dialog opens (§13.2).
 * **More config fields**: add the field to `pkg/config/config.Config`
-  (with a `json:"…"` tag), thread it through `main.go`, and consume it in
-  `model.Options`.
+  (with a `json:"…"` tag) and thread it through `main.go` — into
+  `model.Options` for anything about *reaching* the cluster, or into
+  `controller.Policy` for anything about what the session may *do* to it.
+* **A new model operation**: add it to the `backend` interface, implement
+  it on both backends, and expose it on `Model`. If it mutates, it must
+  also appear on `modelAPI`, be overridden in `journaling` (not merely
+  promoted from the embedded interface) and be listed in
+  `mutatingModelMethods` — otherwise it silently escapes the session
+  journal and dry-run. Two tests enforce this; see §13.4.
 
-The clean MVC split and the small surface of the `backend` interface are
-the two design constraints worth preserving as the project grows.
+The clean MVC split, the small surface of the `backend` interface, and the
+single `guarded` funnel every mutation passes through are the design
+constraints worth preserving as the project grows.
 
 A prioritized feature backlog lives in [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## 12. Known limitations & open findings (2026-07-26 review)
+## 12. Known limitations & open findings
 
-Findings from the July 2026 code review that are **not yet fixed**, ordered
-by severity. Bugs carry a `B-` id, limitations an `L-` id; the roadmap
-references them.
+Findings from the July 2026 review (B-1..B-6), the August 2026 deep review
+(B-7..B-13, plus O-1..O-3, which that review first logged as behaviour changes
+before they were taken on), and a follow-up review of the 0.9.0 safety work
+(B-14..B-16) and of the test/CI round (B-17..B-18). All are fixed; the limitations below stand. Bugs carry a `B-`
+id, limitations an `L-` id; the roadmap references them.
 
-### Bugs / hazards
+### Bugs / hazards — all fixed
 
-| Id  | Where | Issue |
-|-----|-------|-------|
-| B-1 | `model.go` `v3Backend.setTTL` | The post-write `Revoke` of the key's previous lease assumes one-key-per-lease. `copyKey`/`copyDir` deliberately re-attach the source's lease, and external apps commonly attach many keys to one lease — revoking a shared lease **deletes all its other keys**. Guard: resolve the lease with `TimeToLive(..., WithAttachedKeys())` and only revoke when ≤1 key remains attached. |
-| B-2 | `model.go` `NewModel` | Only the explicit `v3` arm calls `authStatus()`; `auto` and `v2` leave `authLabel` empty, so the header shows `Auth: ?` in the default mode. `v2Backend.authStatus` is production-dead code. |
-| B-3 | `model.go` `NewModel` (`auto`) | When the v3 probe fails and the walker falls back to v2, the freshly dialed v3 `*clientv3.Client` is never `Close()`d — its gRPC reconnect loop keeps retrying against the endpoint for the whole session. Same (short-lived) leak when an explicit probe fails. |
-| B-5 | `model.go` `Model.Import` | Import does not apply the `IsReservedName` guard that `create()` applies: a JSON file containing a `…/.dir` key writes the marker directly, silently turning its parent into a phantom directory. |
-| B-6 | `view.go` legend | Cosmetic: the bottom legend styles the search hotkey with `[::]` instead of `[::b]`, so `[/,Ctrl+S]Search` is the only non-bold entry. |
+| Id  | Where | Issue | Fixed |
+|-----|-------|-------|-------|
+| B-1 | `model.go` `v3Backend.setTTL` | The post-write `Revoke` of the key's previous lease assumed one-key-per-lease. `copyKey`/`copyDir` deliberately re-attach the source's lease, and external apps commonly attach many keys to one lease — revoking a shared lease **deletes all its other keys**. | 2026-08-08 |
+| B-2 | `model.go` `NewModel` | Only the explicit `v3` arm called `authStatus()`; `auto` and `v2` left `authLabel` empty, so the header showed `Auth: ?` in the default mode. `v2Backend.authStatus` was production-dead code. | 2026-08-08 |
+| B-3 | `model.go` `NewModel` (`auto`) | When the v3 probe failed and the walker fell back to v2, the freshly dialed v3 `*clientv3.Client` was never `Close()`d — its gRPC reconnect loop kept retrying against the endpoint for the whole session. | 2026-08-08 |
+| B-4 | `controller.go` `edit()` | Dead file branch that would have dropped TTLs (it saved via `Set`); its directory branch duplicated `rename()`. | 2026-07-26 |
+| B-5 | `model.go` `Model.Import` | Import did not apply the `IsReservedName` guard that `create()` applies: a JSON file containing a `…/.dir` key wrote the marker directly, silently turning its parent into a phantom directory. | 2026-08-08 |
+| B-6 | `view.go` legend | Cosmetic: the bottom legend styled the search hotkey with `[::]` instead of `[::b]`, so `[/,Ctrl+S]Search` was the only non-bold entry. | 2026-08-08 |
+| B-7 | `controller.go` `editMultiline`, `setTTL` | **Data loss.** Both wrote `val.node.Value` straight from the cache. v3 `ls` is keys-only, so a cached node's `Value` is empty until `fillDetails` fetches it — and `fillDetails` discards its own `Get` error silently. After one failed refresh, `Ctrl+E` opened an empty editor over a live key and `Ctrl+S` wiped it; `Ctrl+T` rewrote the key with the stale value. | 2026-08-11 |
+| B-8 | `controller.go` `navigateTo` | Injected *every* jump/find target into the injected cache, which exists only for keys a listing hides (underscore-prefixed, invisible in etcd v2). Entries are never evicted except by an in-app delete/rename, so any key deleted server-side after being visited kept appearing as a ghost row whose details no longer resolved. | 2026-08-11 |
+| B-9 | `controller.go` `getPosition` | Returned `0` for "not found", indistinguishable from "first element". A `/`-search matching nothing jumped the cursor to the first row, reading as a hit; post-mutation lookups landed on the wrong row instead of staying put. | 2026-08-11 |
+| B-10 | `controller.go` `makeNodeMap`, `rename` | Derived the basename as `FieldsFunc(name, '/')[len-1]`, which panics with index-out-of-range on a name that splits into nothing (`""`, `"/"`). Also diverged from `baseOf`, which every other call site uses to build the same map key. | 2026-08-11 |
+| B-11 | `controller.go` `valueStats` | Reported an empty value as 1 line (`Count("\n") + 1`). | 2026-08-11 |
+| B-12 | `controller.go` `export`, `view.go` | Export walks the whole subtree under the current directory, but the doc comment, hotkey help and modal title all said "current dir keys" — exporting `/` silently dumped the entire cluster. Wording corrected; behaviour unchanged. | 2026-08-11 |
+| B-13 | `history.go` titles and text | tview's colour-tag parser matches `[a-zA-Z]+` inside brackets and consumes it, in `Box` titles (`Print`) as much as in `TextView` text. Every hotkey hint on the revision-history screens was unescaped, so the detail title rendered as `/k @ rev 5 —  restore ·  diff vs current ·  back` — the keys themselves invisible. Key names in those titles were unescaped too. Now routed through `tview.Escape`; the legend in `view.go` already did this for `[Del[]`. | 2026-08-11 |
+| O-1 | `controller.go` `export` | Wrote over an existing file with no confirmation. Export now `Stat`s the target and raises an overwrite prompt; the write itself moved into `writeExport`. | 2026-08-11 |
+| O-2 | `history.go` `showRevisionDetail` | Rendered a printable revision value in full and uncapped, while the details pane capped at 512 B and hex at 1 kB — a multi-megabyte value stalled the draw. Now capped at `historyValueLimit` (8 kB) with an `[f]` binding that re-renders uncapped, for the hex branch too. | 2026-08-11 |
+| O-3 | `history.go` `showRevisionDiff` | Diffed against `revs[0]` — the newest revision *as of when the picker opened* — and labelled it "current". Now re-reads the key, diffs against that, labels the right-hand side with the live `ModRev`, and warns when the key drifted since the history was read. A key that vanished meanwhile errors instead of diffing against a snapshot. | 2026-08-11 |
+| B-14 | `controller.go` `confirmTyped` | Declining a protected-path confirmation queued a "Cancelled" notice on `Pages` **and then** ran `onCancel`, which re-opens the value editor via `App.SetRoot`. The notice was hidden behind the editor's root and resurfaced when the editor closed — drawn over a list that already held the focus, i.e. a visible modal the keyboard was not talking to. The notice is now skipped whenever a caller takes the screen back; the re-opened editor is the feedback. | 2026-08-16 |
+| B-15 | `controller.go` post-mutation cache updates | Under `-dry-run` the six post-write `injectNode`/`removeInjected`/`reinjectRename` calls still ran, so a rehearsed create of an underscore-prefixed key put a phantom row in the listing (and a rehearsed delete removed a row for a key that still existed) — the ghost-row class of B-8, reintroduced through the rehearsal path. They now go through `injectWritten`/`removeWritten`/`reinjectWritten`, which no-op under dry-run. `navigateTo` deliberately still injects directly: a jumped-to key really is on the server. | 2026-08-16 |
+| B-16 | `controller.go`, `history.go` success modals | Dry-run reported completed mutations as fact — "3 written, 0 skipped", "Restored", "Copied" — in the one mode whose entire purpose is to state what *would* happen. Import now reports "N keys would be written"; restore and copy route their header through `writeHeader`, which appends "(dry run — not written)". | 2026-08-16 |
+| B-17 | `main.go` flag wiring | Flag registration (`flag.Var` calls) and the bundle handed to `resolve()` were two separate lists. Dropping a field from the struct literal compiled, passed the whole suite, and **nil-panicked on startup** — verified. Registration and bundling are now one `registerFlags(fs)` used by both `main()` and the tests, so there is no second place to forget, with a reflection test asserting no field is nil. | 2026-08-19 |
+| B-18 | `main.go` `boolFlag` | `*boolFlag` did not implement `IsBoolFlag`, so the `flag` package treated every boolean as requiring an argument: `etcd-walker -read-only` failed with "flag needs an argument" — the exact form the README's production example uses. Affected `-read-only`, `-dry-run`, `-tls`, `-debug`, `-tls-skip-verify`. `IsBoolFlag` added; the bare form works and `-flag=false` still turns a config setting off. | 2026-08-19 |
 
-Fixed since the review: **B-4** (2026-07-26) — `edit()` was deleted outright;
-its file branch was unreachable and would have dropped TTLs (it saved via
-`Set`), and its directory branch duplicated `rename()`. `Ctrl+E` on a
+**B-1 fix** — `setTTL` now delegates the cleanup to `revokeIfOrphaned`, which
+resolves the superseded lease with `TimeToLive(..., WithAttachedKeys())` and
+revokes only when no *other* key is still attached (the edited key was already
+re-pointed by the preceding `Put`, so an orphan reports an empty key set; the
+key itself is tolerated in case of a stale read). Any uncertainty — no lessor,
+a failed lookup, a lease already reporting `TTL < 0` — leaves the lease alone:
+a leaked lease expires by itself, a wrongly revoked one takes data with it.
+To make this testable the v3 backend grew a `lessor` field (a three-method
+narrowing of `clientv3.Lease`: `Grant`/`Revoke`/`TimeToLive`) that
+`*clientv3.Client` satisfies in production and a `fakeLessor` — backed by the
+`fakeKV`'s per-key lease map — satisfies in tests. All lease RPCs go through
+it; `b.c` is now only the `Auth` client and `Close`.
+
+**B-4 fix** (2026-07-26) — `edit()` was deleted outright; `Ctrl+E` on a
 directory now delegates to the same rename dialog as `Ctrl+R`, with a
 regression test pinning the fall-through.
+
+**B-7 fix** — both mutating handlers now re-read the key through
+`model.Get` and refuse to act when the read fails or the path is no longer a
+key, instead of trusting whatever `fillDetails` last managed to cache. The
+editor re-reads before opening (it needs the value to display); `setTTL`
+re-reads inside its Save handler, immediately before the write, which also
+stops a TTL change from resurrecting a key deleted while the dialog was open.
+`restoreRevision` already worked this way — the two Ctrl+E/Ctrl+T paths were
+the outliers. This narrows but does not close the read-modify-write window;
+roadmap N-1 (CAS-safe writes via `Txn`/`ModRevision`) is the real fix.
 
 ### Accepted limitations
 
@@ -706,3 +873,138 @@ regression test pinning the fall-through.
 | L-6 | `fillDetails` issues a live `Ls` per directory-focus and a `Get` (+`TimeToLive` when leased) per key-focus — cursor movement does network round-trips; sluggish on high-latency clusters. |
 | L-7 | OSC52 clipboard fallback refuses payloads > 10 kB (`ErrTooLarge`) rather than truncating. |
 | L-8 | No live refresh: listings only update after an action. A v3 `Watch` on the current prefix is roadmap F-1. |
+
+---
+
+## 13. Session safety: policy, guards and stale state
+
+Six features shipped in 0.9.0 (F-4, N-11, N-14, F-5, N-6, N-21) share one
+concern: making it hard to change something you did not
+mean to, and impossible to mistake cached state for live state. They are
+described together because they interlock.
+
+### 13.1 `controller.Policy`
+
+```go
+type Policy struct {
+    ReadOnly          bool     // refuse every mutating action
+    ProtectedPrefixes []string // subtrees needing a typed confirmation
+    DryRun            bool     // record changes instead of making them (§13.4)
+}
+```
+
+`Policy` lives in the controller, not the model, and that is deliberate: it
+describes what *this session* is allowed to do, not what the cluster
+supports. The model stays a pure etcd client with no opinion about
+permission. `main` builds a `Policy` from the config file and flags and
+passes it to `NewController(opts, policy)`.
+
+`Policy.protects(path)` returns the covering prefix, if any. A prefix covers
+itself and everything beneath it, and nothing else: `/reg` does not protect
+`/registry`, which is why the test matches on `target == pfx ||
+strings.HasPrefix(target, pfx+"/")` rather than a bare string prefix. A bare
+`"/"` protects the whole keyspace; blank entries are ignored so a trailing
+comma in `-protect` cannot become a prefix that matches everything.
+
+### 13.2 The `guarded` funnel
+
+Every mutation goes through one function:
+
+```go
+c.guarded(guard{action: "delete", paths: []string{name}, do: func() { … }})
+```
+
+`guarded` refuses outright in read-only mode, gates on a typed confirmation
+when *any* target path is protected, and otherwise runs `do` immediately.
+Routing every write through a single funnel is what makes the guarantee
+checkable: the revision-restore flow, for instance, never touches the main
+list's key bindings, and a check bolted onto those bindings alone would have
+missed it. `guard.paths` is a slice for the same reason — one import can
+write hundreds of keys, and a single protected target has to gate the batch.
+
+The confirmation asks for the *prefix's* basename rather than the key's. It
+reads honestly for a bulk write (there is no single key to name), and it
+tells the user which boundary they crossed rather than echoing back what
+they already typed.
+
+`guard.onCancel` exists for one caller: the value editor closes before the
+confirmation can be shown (a modal cannot draw over the full-screen editor
+root), so a declined confirmation re-opens the editor with the user's text
+intact rather than discarding their work.
+
+Read-only is additionally enforced at the key bindings via `mutatingKeys`,
+purely so the dialog never opens in the first place. `Ctrl+E` is absent from
+that map on purpose: the value editor is the only way to read a value past
+the details pane's preview cap, so in read-only mode it opens with
+`SetDisabled(true)` instead of being blocked, and the save path's guard
+refuses the write.
+
+### 13.3 Stale state (N-11)
+
+`fillDetails` re-reads the focused key on every cursor move. It used to
+discard the error and silently keep the listing's node — and since v3
+listings are keys-only, that node has *no value at all*. That silence is
+what turned B-7 into data loss rather than an annoyance.
+
+Now a failed refresh sets `Node.stale`, prints a red banner in the details
+pane naming the error, and re-renders the row through `rowLabel` as greyed
+and `(cached)`. `setStale` updates the row in place so it appears
+immediately rather than at the next full rebuild. Recovery clears both.
+Staleness deliberately outranks the underscore-prefix highlight in
+`rowLabel`: it is the more urgent signal, and nesting the two colour tags
+would leave the `[-]` reset mismatched.
+
+### 13.4 Session journal and dry-run (N-6, N-21)
+
+The journal decorates `modelAPI` rather than hooking the policy guard:
+
+```go
+type journaling struct {
+    modelAPI          // reads are promoted unchanged
+    j      *Journal
+    dryRun bool
+}
+```
+
+That placement is the whole design. The guard sees an *intent* and the
+paths it will touch; only the model layer sees the exact arguments and
+whether the call actually succeeded. A guard-level hook would log changes
+that then failed — and a journal that lists changes which never happened is
+worse than no journal at all, especially when it is about to be exported as
+a script someone runs.
+
+Dry-run falls out of the same wrapper for free: `apply` records the entry
+and simply skips the underlying call. Nothing else in the codebase knows
+dry-run exists. The visible consequence is that the listing does not change
+after a rehearsed edit — correct, since nothing was written, and the journal
+is where the rehearsal is visible.
+
+**Fidelity over plausibility.** `Journal.Script()` emits real `etcdctl`
+commands only where the recording supports one: put, del, del --prefix, and
+import (whose full payload we hold, sorted so the script is stable between
+renderings). Renames, copies and TTL writes become `#` comments describing
+the change, because reproducing them needs data the decorator never saw — the
+value at rename time, the lease id at replay time. Values that would not
+survive a shell script (invalid UTF-8, control characters) likewise become
+comments rather than mangled puts. The script header says all of this, so
+nobody runs the file believing it is complete.
+
+**The completeness hazard.** Embedding `modelAPI` means a *new* mutating
+method would be silently promoted — journalled by nobody — which would
+quietly falsify the feature's central claim. Two tests guard it:
+`TestModelAPISurfaceIsJournalled` pins the interface's method count so
+growing it is a deliberate act, and `TestEveryMutatorIsRecorded` drives every
+mutator through the decorator and asserts each leaves exactly one entry.
+Deleting any single override makes the second test fail.
+
+### 13.5 Recursive deletes (F-5)
+
+A directory delete is a single `DeleteRange` over a prefix with no undo — the
+most destructive thing the tool can do, and previously one stray Enter away
+on an ok/cancel dialog. It now goes through `guard.confirmWord`, which
+demands the directory's own name be typed out.
+
+`guarded` checks protection *before* `confirmWord`, so deleting a protected
+directory asks once — for the prefix — rather than making the user type two
+different words for one action. Single keys keep the lighter ok/cancel: the
+blast radius is one key, and the journal now records what it was.

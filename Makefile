@@ -20,7 +20,7 @@
 APP        := etcd-walker
 PKG        := ./cmd/etcd-walker
 GO         ?= go
-VERSION    ?= 0.8.0
+VERSION    ?= 0.9.0
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist
@@ -64,7 +64,8 @@ help:
 	@echo "  make pizero2w-armhf     - linux/arm v7 (Pi Zero 2 W, 32-bit OS)"
 	@echo "  make darwin windows     - macOS / Windows"
 	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf"
-	@echo "  make test | test-race | vet | fmt | tidy | clean"
+	@echo "  make test | test-race | cover | vet | fmt | tidy | clean"
+	@echo "  make test-integration   - needs a reachable etcd (see the target)"
 
 .PHONY: tidy
 tidy:
@@ -85,6 +86,17 @@ test:
 .PHONY: test-race
 test-race:
 	$(GO) test -race -count=1 ./...
+
+.PHONY: test-integration
+# Runs the `integration`-tagged suite against a real etcd. Point it elsewhere
+# with ETCD_WALKER_TEST_ENDPOINT / _USER / _PASSWORD.
+test-integration:
+	$(GO) test ./... -tags=integration -run Integration -count=1 -v
+
+.PHONY: cover
+cover:
+	$(GO) test ./... -coverprofile=coverage.out -covermode=atomic
+	$(GO) tool cover -func=coverage.out | tail -1
 
 .PHONY: run
 run:

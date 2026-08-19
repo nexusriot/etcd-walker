@@ -7,7 +7,9 @@ import (
 	"github.com/rivo/tview"
 )
 
-// View ...
+// View owns the tview widgets and the dialog constructors. It is passive: it
+// never calls the model, and the controller installs every input capture and
+// done handler.
 type View struct {
 	App       *tview.Application
 	Frame     *tview.Frame
@@ -17,7 +19,10 @@ type View struct {
 	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
 }
 
-// NewView ...
+// NewView builds the running UI — the two-pane main page, the page stack all
+// modals share, and the frame carrying the header and the hotkey legend.
+// Tests construct a View literal instead: this one's Details pane calls
+// App.Draw on change, which needs a real screen.
 func NewView() *View {
 	app := tview.NewApplication()
 
@@ -57,7 +62,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::b][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -100,8 +105,8 @@ func (v *View) NewInfoMessageQ(header string, details string) *tview.Modal {
 	return v.NewInfoModal(header, details, "ok")
 }
 
-func (v *View) NewCopiedMessageQ(header string, details string) *tview.Modal {
-	return v.NewInfoModal(header, details, "copied")
+func (v *View) NewCopiedMessageQ(details string) *tview.Modal {
+	return v.NewInfoModal("Copied", details, "copied")
 }
 
 func (v *View) NewInfoModal(header, details, button string) *tview.Modal {
@@ -177,6 +182,23 @@ func (v *View) NewHistoryDetail(title string) *tview.TextView {
 	return tv
 }
 
+// NewTypedConfirm asks the user to retype a word before a destructive or
+// policy-gated action proceeds. The caller composes the prompt; it is escaped
+// here because it carries key paths, and tview reads "[x]" in a title as a
+// colour tag and would swallow a name containing brackets (DESIGN §12 B-13).
+func (v *View) NewTypedConfirm(prompt string) *tview.InputField {
+	inp := tview.NewInputField()
+	inp.SetBorder(true).SetTitle(" " + tview.Escape(prompt) + " ")
+	return inp
+}
+
+// NewOverwriteQ asks before clobbering a file that already exists on disk.
+func (v *View) NewOverwriteQ(details string) *tview.Modal {
+	m := tview.NewModal()
+	m.SetText(details).AddButtons([]string{"overwrite", "cancel"})
+	return m
+}
+
 // NewRestoreQ asks before overwriting the current value with an old revision.
 func (v *View) NewRestoreQ(details string) *tview.Modal {
 	m := tview.NewModal()
@@ -238,8 +260,10 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+J        Jump to key/dir (dir ends with '/')
 		  Ctrl+P        Copy path (key/dir)
 		  Ctrl+Y        Copy key value
-		  Ctrl+W        Export current dir keys to JSON file
+		  Ctrl+W        Export all keys under current dir to JSON
 		  Ctrl+O        Import keys from a JSON file (file browser)
+		  Ctrl+A        Session journal: what this session changed,
+		                exportable as an etcdctl script
 		[::b]Search[::-]
 		  /, Ctrl+S     Search by name (in current level)
 		  Ctrl+F        Find recursively (paths, optionally values)
@@ -249,6 +273,13 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		[::b]Misc[::-]
 		  Ctrl+H        This help
 		  Ctrl+Q        Quit
+		[::b]Safety[::-]
+		  -read-only    Refuses every change; header shows READ-ONLY
+		  -dry-run      Records changes in the journal without making
+		                them; header shows DRY-RUN
+		  -protect P    Writes on/under prefix P need the prefix
+		                basename typed out first (repeat with commas)
+		  Deleting a directory always needs its name typed out.
 
 		[dim]Press any key to close.[-]
 	`
@@ -266,7 +297,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 func (v *View) NewExportInput(dir, defaultPath string) *tview.InputField {
 	inp := tview.NewInputField().
 		SetText(defaultPath)
-	inp.SetBorder(true).SetTitle(fmt.Sprintf(" Export %q keys to JSON file ", dir))
+	inp.SetBorder(true).SetTitle(fmt.Sprintf(" Export all keys under %q to JSON file ", dir))
 	return inp
 }
 
