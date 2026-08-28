@@ -352,3 +352,115 @@ func TestIntegrationSearch(t *testing.T) {
 		t.Errorf("path-only search matched a value: %+v", none)
 	}
 }
+
+// Time travel against a real server: etcd's revision is global, so a read at a
+// past revision must show the keyspace as it was — keys written later absent,
+// values as they stood, deleted keys back. A fake can be made to agree with
+// whatever the code does; only the server settles what WithRev really means.
+func TestIntegrationReadsAtPastRevision(t *testing.T) {
+	m := integrationModel(t)
+	p := scratch(t, m)
+
+	if err := m.Set(p+"/stable", "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Set(p+"/doomed", "here"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := m.Revision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before <= 0 {
+		t.Fatalf("Revision() = %d, want the cluster's current revision", before)
+	}
+
+	// Change the world: edit one key, delete another, add a third.
+	if err := m.Set(p+"/stable", "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Del(p + "/doomed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Set(p+"/added-later", "new"); err != nil {
+		t.Fatal(err)
+	}
+
+	past, err := m.LsAt(p, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, n := range past {
+		names[n.Name] = true
+	}
+	if !names[p+"/stable"] || !names[p+"/doomed"] {
+		t.Errorf("listing at rev %d lost keys that existed then: %v", before, names)
+	}
+	if names[p+"/added-later"] {
+		t.Errorf("listing at rev %d shows a key written afterwards: %v", before, names)
+	}
+
+	n, err := m.GetAt(p+"/stable", before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Value != "one" {
+		t.Errorf("value at rev %d = %q, want the value from then", before, n.Value)
+	}
+	if live, err := m.Get(p + "/stable"); err != nil || live.Value != "two" {
+		t.Errorf("live value = %+v/%v, want two", live, err)
+	}
+
+	// A deleted key is readable again at a revision before its deletion —
+	// which is what makes the undo story work.
+	if gone, err := m.GetAt(p+"/doomed", before); err != nil || gone.Value != "here" {
+		t.Errorf("deleted key at rev %d = %+v/%v, want its old value", before, gone, err)
+	}
+	if _, err := m.Get(p + "/doomed"); err == nil {
+		t.Error("the deleted key is still live")
+	}
+
+	exported, err := m.ExportAt(p, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported[p+"/stable"] != "one" || exported[p+"/doomed"] != "here" {
+		t.Errorf("export at rev %d = %v", before, exported)
+	}
+	if _, ok := exported[p+"/added-later"]; ok {
+		t.Errorf("export at rev %d includes a later key: %v", before, exported)
+	}
+
+	found, _, err := m.SearchAt(p, "doomed", false, 10, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].Name != p+"/doomed" {
+		t.Errorf("search at rev %d = %v, want the key that existed then", before, found)
+	}
+}
+
+// A future revision is not a quiet empty result: etcd blocks on it, so the
+// walker must never send one. This pins that the current revision is a usable
+// bound for the picker's validation.
+func TestIntegrationRevisionIsAnUpperBound(t *testing.T) {
+	m := integrationModel(t)
+	p := scratch(t, m)
+
+	if err := m.Set(p+"/k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	rev, err := m.Revision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reading AT the current revision is legal and sees the write.
+	n, err := m.GetAt(p+"/k", rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Value != "v" {
+		t.Errorf("read at the current revision = %q, want v", n.Value)
+	}
+}

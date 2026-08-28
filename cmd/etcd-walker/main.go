@@ -72,7 +72,15 @@ type cliFlags struct {
 	timeout, protect          *stringFlag
 	debug, tls, tlsSkipVerify *boolFlag
 	readOnly, dryRun          *boolFlag
+	noSnapshot, dual          *boolFlag
 	configPath                *string
+}
+
+// session is what resolve produces beyond the connection options and the
+// policy: the settings that shape this run of the UI itself.
+type session struct {
+	debug bool
+	dual  bool
 }
 
 // registerFlags declares every flag on fs and returns the bundle wired to it.
@@ -90,6 +98,7 @@ func registerFlags(fs *flag.FlagSet) cliFlags {
 		timeout: &stringFlag{}, protect: &stringFlag{},
 		debug: &boolFlag{}, tls: &boolFlag{}, tlsSkipVerify: &boolFlag{},
 		readOnly: &boolFlag{}, dryRun: &boolFlag{},
+		noSnapshot: &boolFlag{}, dual: &boolFlag{},
 	}
 	fs.Var(f.host, "host", "etcd host (e.g. 127.0.0.1)")
 	fs.Var(f.port, "port", "etcd port (e.g. 2379)")
@@ -106,6 +115,8 @@ func registerFlags(fs *flag.FlagSet) cliFlags {
 	fs.Var(f.readOnly, "read-only", "refuse every mutating action for this session")
 	fs.Var(f.dryRun, "dry-run", "record what each change would do without performing it")
 	fs.Var(f.protect, "protect", "comma-separated prefixes needing a typed confirmation before any write (e.g. /registry)")
+	fs.Var(f.noSnapshot, "no-snapshot", "do not save an undo snapshot before deleting a directory")
+	fs.Var(f.dual, "dual", "start with two panes side by side (Tab switches, Ctrl+B toggles)")
 	f.configPath = fs.String("config", config.DefaultPath, "config file, optional")
 	return f
 }
@@ -117,14 +128,16 @@ func registerFlags(fs *flag.FlagSet) cliFlags {
 // It is separated from main() because this is the one part of startup with
 // real logic: ~20 fields each needing "config unless the flag was set", where
 // a single copy-paste puts a value in the wrong field and nothing complains.
-func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, bool) {
+func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, session) {
 	opts := model.Options{
 		Host:     "127.0.0.1",
 		Port:     "2379",
 		Protocol: "auto",
 	}
-	var policy controller.Policy
-	debug := false
+	// Undo snapshots default ON: the protection is only worth having if it is
+	// what you get without asking.
+	policy := controller.Policy{SnapshotBeforeDelete: true}
+	var sess session
 
 	if cfg != nil {
 		if cfg.Host != "" {
@@ -142,7 +155,8 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 		if cfg.Password != "" {
 			opts.Password = cfg.Password
 		}
-		debug = cfg.Debug
+		sess.debug = cfg.Debug
+		sess.dual = cfg.DualPane
 		opts.TLSEnabled = cfg.TLSEnabled
 		opts.TLSCAFile = cfg.TLSCAFile
 		opts.TLSCertFile = cfg.TLSCertFile
@@ -152,6 +166,9 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 		policy.ReadOnly = cfg.ReadOnly
 		policy.DryRun = cfg.DryRun
 		policy.ProtectedPrefixes = cfg.ProtectedPrefixes
+		if cfg.SnapshotBeforeDelete != nil {
+			policy.SnapshotBeforeDelete = *cfg.SnapshotBeforeDelete
+		}
 	}
 
 	// CLI flags take precedence over config file values.
@@ -171,7 +188,15 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 		opts.Password = f.password.value
 	}
 	if f.debug.set {
-		debug = f.debug.value
+		sess.debug = f.debug.value
+	}
+	if f.dual.set {
+		sess.dual = f.dual.value
+	}
+	// The flag is spelled as the negation, so -no-snapshot turns the default
+	// off and -no-snapshot=false turns it back on over a config that disabled it.
+	if f.noSnapshot.set {
+		policy.SnapshotBeforeDelete = !f.noSnapshot.value
 	}
 	if f.tls.set {
 		opts.TLSEnabled = f.tls.value
@@ -204,7 +229,7 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 	if f.protect.set {
 		policy.ProtectedPrefixes = splitPrefixes(f.protect.value)
 	}
-	return opts, policy, debug
+	return opts, policy, sess
 }
 
 func main() {
@@ -215,11 +240,11 @@ func main() {
 	if err != nil {
 		log.WithError(err).Warn("failed to load config, falling back to defaults")
 	}
-	opts, policy, debug := resolve(cfg, f)
+	opts, policy, sess := resolve(cfg, f)
 
 	log.SetOutput(os.Stderr)
 
-	if debug {
+	if sess.debug {
 		log.SetLevel(log.DebugLevel)
 	}
 
@@ -227,16 +252,19 @@ func main() {
 		"host":        opts.Host,
 		"port":        opts.Port,
 		"protocol":    opts.Protocol,
-		"debug":       debug,
+		"debug":       sess.debug,
 		"tls":         opts.TLSEnabled,
 		"timeout_sec": opts.TimeoutSeconds,
 		"read_only":   policy.ReadOnly,
 		"dry_run":     policy.DryRun,
+		"snapshots":   policy.SnapshotBeforeDelete,
+		"dual_pane":   sess.dual,
 		"protected":   len(policy.ProtectedPrefixes),
 		"config":      *f.configPath,
 	}).Debug("Starting etcd-walker")
 
 	ctrl := controller.NewController(opts, policy)
+	ctrl.SetDualPane(sess.dual)
 	if err := ctrl.Run(); err != nil {
 		log.WithError(err).Error("etcd-walker exited with error")
 		os.Exit(1)

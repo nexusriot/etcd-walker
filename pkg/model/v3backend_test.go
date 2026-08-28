@@ -64,6 +64,17 @@ func (f *fakeKV) kvAt(key string, e fakeRev) *mvccpb.KeyValue {
 	}
 }
 
+// entryAt returns the newest history entry written at or before rev, and
+// whether the key existed at all by then.
+func (f *fakeKV) entryAt(entries []fakeRev, rev int64) (fakeRev, bool) {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].rev <= rev {
+			return entries[i], true
+		}
+	}
+	return fakeRev{}, false
+}
+
 // Fixed revision metadata stamped on every KV the fake returns, so tests can
 // assert the backend maps CreateRevision/ModRevision/Version through.
 const (
@@ -95,13 +106,20 @@ func opLease(key, val string, opts []clientv3.OpOption) int64 {
 	return f.Int()
 }
 
+// fakeStoreRev is the store revision every response header reports, so a test
+// can assert what revision() read without threading state through.
+const fakeStoreRev = int64(100)
+
 func hdr() *etcdserverpb.ResponseHeader {
-	return &etcdserverpb.ResponseHeader{ClusterId: 42}
+	return &etcdserverpb.ResponseHeader{ClusterId: 42, Revision: fakeStoreRev}
 }
 
 func (f *fakeKV) Get(_ context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
 	op := clientv3.OpGet(key, opts...)
 	resp := &clientv3.GetResponse{Header: hdr()}
+	if rev := op.Rev(); rev > 0 && f.compactRev > 0 && rev < f.compactRev {
+		return nil, rpctypes.ErrCompacted
+	}
 	if len(op.RangeBytes()) > 0 { // prefix get
 		keys := make([]string, 0, len(f.store))
 		for k := range f.store {
@@ -111,18 +129,27 @@ func (f *fakeKV) Get(_ context.Context, key string, opts ...clientv3.OpOption) (
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			// A range read at a revision sees each key as it was then: served
+			// from its history when it has one, and skipped entirely when it
+			// had not been written yet. Keys with no seeded history are taken
+			// as having existed forever, which keeps the plain-listing tests
+			// unaffected.
+			if rev := op.Rev(); rev > 0 {
+				if entries, ok := f.hist[k]; ok {
+					e, live := f.entryAt(entries, rev)
+					if !live {
+						continue
+					}
+					resp.Kvs = append(resp.Kvs, f.kvAt(k, e))
+					continue
+				}
+			}
 			resp.Kvs = append(resp.Kvs, f.kv(k))
 		}
 	} else if entries, ok := f.hist[key]; ok && len(entries) > 0 {
 		if rev := op.Rev(); rev > 0 {
-			if f.compactRev > 0 && rev < f.compactRev {
-				return nil, rpctypes.ErrCompacted
-			}
-			for i := len(entries) - 1; i >= 0; i-- {
-				if entries[i].rev <= rev {
-					resp.Kvs = append(resp.Kvs, f.kvAt(key, entries[i]))
-					break
-				}
+			if e, live := f.entryAt(entries, rev); live {
+				resp.Kvs = append(resp.Kvs, f.kvAt(key, e))
 			}
 		} else {
 			resp.Kvs = append(resp.Kvs, f.kvAt(key, entries[len(entries)-1]))
@@ -190,7 +217,7 @@ func TestV3LsSplitsDirsAndFiles(t *testing.T) {
 		"/app/sub/deep/leaf": "lv",
 		"/app/.dir":          "",
 	})
-	nodes, err := b.ls("/app")
+	nodes, err := b.ls("/app", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,21 +245,21 @@ func TestV3GetExactAndDir(t *testing.T) {
 		"/dir/x":    "1",
 		"/dir/.dir": "",
 	})
-	n, err := b.get("/a/b")
+	n, err := b.get("/a/b", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n.IsDir || n.Value != "hello" {
 		t.Errorf("get(/a/b) = %+v, want file value hello", n)
 	}
-	d, err := b.get("/dir")
+	d, err := b.get("/dir", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !d.IsDir {
 		t.Errorf("get(/dir) should be a directory: %+v", d)
 	}
-	if _, err := b.get("/missing"); err == nil {
+	if _, err := b.get("/missing", 0); err == nil {
 		t.Error("get(/missing) should return not-found error")
 	}
 }
@@ -245,7 +272,7 @@ func TestV3ExportSkipsDirMarker(t *testing.T) {
 		"/x/s/.dir": "",
 		"/x/s/c":    "3",
 	})
-	out, err := b.export("/x")
+	out, err := b.export("/x", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +453,7 @@ func TestV3LsIsKeysOnly(t *testing.T) {
 		"/app/key1":  "big-value",
 		"/app/sub/x": "other",
 	})
-	nodes, err := b.ls("/app")
+	nodes, err := b.ls("/app", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +462,7 @@ func TestV3LsIsKeysOnly(t *testing.T) {
 			t.Errorf("ls should not carry values (keys-only), got %q for %s", n.Value, n.Name)
 		}
 	}
-	n, err := b.get("/app/key1")
+	n, err := b.get("/app/key1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +492,7 @@ func TestTTLForLeaseNilClient(t *testing.T) {
 
 func TestV3GetReturnsRevisions(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{"/k": "v"})
-	n, err := b.get("/k")
+	n, err := b.get("/k", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +509,7 @@ func TestV3SearchByPath(t *testing.T) {
 		"/app/other":     "CONFIG in value",
 		"/app/.dir":      "",
 	})
-	nodes, truncated, err := b.search("/app", "CONFIG", false, 10)
+	nodes, truncated, err := b.search("/app", "CONFIG", false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +534,7 @@ func TestV3SearchInValues(t *testing.T) {
 		"/app/a": "the SECRET token",
 		"/app/b": "nothing",
 	})
-	nodes, _, err := b.search("/app", "secret", true, 10)
+	nodes, _, err := b.search("/app", "secret", true, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +547,7 @@ func TestV3SearchTruncates(t *testing.T) {
 	b, _ := newTestBackend(map[string]string{
 		"/x/m1": "", "/x/m2": "", "/x/m3": "", "/x/m4": "",
 	})
-	nodes, truncated, err := b.search("/x", "m", false, 2)
+	nodes, truncated, err := b.search("/x", "m", false, 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,5 +1038,113 @@ func TestV3DeldirDeletesSubtreeOnly(t *testing.T) {
 		if _, ok := kv.store[keep]; !ok {
 			t.Errorf("deldir(/app) destroyed %s — prefix boundary not respected", keep)
 		}
+	}
+}
+
+// A listing pinned to a revision must show the tree as it was then: keys
+// written later are absent, and values are the ones current at that point.
+// Without WithRev threaded into ls, this returns today's tree under a
+// historical label, which is worse than an error.
+func TestV3LsAtRevision(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/app/old", fakeRev{rev: 5, version: 1, value: "v5"})
+	seedHistory(kv, "/app/edited",
+		fakeRev{rev: 6, version: 1, value: "first"},
+		fakeRev{rev: 30, version: 2, value: "second"})
+	seedHistory(kv, "/app/new", fakeRev{rev: 40, version: 1, value: "later"})
+
+	nodes, err := b.ls("/app", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, n := range nodes {
+		got[n.Name] = true
+	}
+	if !got["/app/old"] || !got["/app/edited"] {
+		t.Errorf("keys live at rev 20 missing from listing: %v", got)
+	}
+	if got["/app/new"] {
+		t.Error("/app/new was written at rev 40 and must not appear in a listing at rev 20")
+	}
+
+	// The same listing at "now" sees everything.
+	nodes, err = b.ls("/app", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 3 {
+		t.Errorf("live listing has %d nodes, want 3", len(nodes))
+	}
+}
+
+func TestV3GetAndExportAtRevision(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/x/k",
+		fakeRev{rev: 6, version: 1, value: "first"},
+		fakeRev{rev: 30, version: 2, value: "second"})
+	seedHistory(kv, "/x/late", fakeRev{rev: 40, version: 1, value: "late"})
+
+	n, err := b.get("/x/k", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Value != "first" {
+		t.Errorf("get at rev 20 = %q, want %q", n.Value, "first")
+	}
+	if n, err := b.get("/x/k", 0); err != nil || n.Value != "second" {
+		t.Errorf("live get = %v/%v, want second", n, err)
+	}
+
+	out, err := b.export("/x", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"/x/k": "first"}
+	if !reflect.DeepEqual(out, want) {
+		t.Errorf("export at rev 20 = %v, want %v", out, want)
+	}
+}
+
+func TestV3SearchAtRevision(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/s/match-old", fakeRev{rev: 5, version: 1, value: "a"})
+	seedHistory(kv, "/s/match-new", fakeRev{rev: 40, version: 1, value: "b"})
+
+	nodes, _, err := b.search("/s", "match", false, 10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "/s/match-old" {
+		t.Errorf("search at rev 20 = %v, want only /s/match-old", nodes)
+	}
+}
+
+// Reading below the compaction point must fail loudly: the data is gone, and
+// a silent empty listing would read as "the tree was empty back then".
+func TestV3ReadsBelowCompactionFail(t *testing.T) {
+	b, kv := newTestBackend(nil)
+	seedHistory(kv, "/c/k", fakeRev{rev: 5, version: 1, value: "v"})
+	kv.compactRev = 10
+
+	if _, err := b.ls("/c", 4); !isCompactedErr(err) {
+		t.Errorf("ls below compaction: err = %v, want compacted", err)
+	}
+	if _, err := b.get("/c/k", 4); !isCompactedErr(err) {
+		t.Errorf("get below compaction: err = %v, want compacted", err)
+	}
+	if _, err := b.export("/c", 4); !isCompactedErr(err) {
+		t.Errorf("export below compaction: err = %v, want compacted", err)
+	}
+}
+
+func TestV3Revision(t *testing.T) {
+	b, _ := newTestBackend(map[string]string{"/a": "1"})
+	rev, err := b.revision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev != fakeStoreRev {
+		t.Errorf("revision = %d, want %d", rev, fakeStoreRev)
 	}
 }

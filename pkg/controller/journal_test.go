@@ -197,7 +197,7 @@ func TestScriptSafe(t *testing.T) {
 func TestModelAPISurfaceIsJournalled(t *testing.T) {
 	iface := reflect.TypeOf((*modelAPI)(nil)).Elem()
 
-	const knownMethods = 18
+	const knownMethods = 19
 	if got := iface.NumMethod(); got != knownMethods {
 		t.Fatalf("modelAPI has %d methods, expected %d — if you added one, decide "+
 			"whether it mutates: mutators must be overridden in journaling (and "+

@@ -238,7 +238,7 @@ func (c *Controller) confirmRestore(nd *model.Node, revs []*model.Revision, idx 
 // the *live* lease/TTL — restoring an old value must not clobber the key's
 // expiry, the same contract the value editor honours.
 func (c *Controller) restoreRevision(nd *model.Node, r *model.Revision) {
-	cur, err := c.model.Get(nd.Name)
+	cur, err := c.model.GetAt(nd.Name, 0)
 	if err != nil {
 		c.error("Restore failed", fmt.Errorf("re-reading %s: %w", nd.Name, err), false)
 		return
@@ -267,7 +267,7 @@ func (c *Controller) showRevisionDiff(nd *model.Node, revs []*model.Revision, id
 	// revs[0]. That entry is a snapshot from when History ran, so calling it
 	// "current" stops being true the moment anyone else writes the key — and
 	// this screen is exactly where someone decides whether to restore.
-	cur, err := c.model.Get(nd.Name)
+	cur, err := c.model.GetAt(nd.Name, 0)
 	if err != nil {
 		c.error("Diff failed", fmt.Errorf("re-reading %s: %w", nd.Name, err), false)
 		return

@@ -67,7 +67,7 @@ func (f *fakeKeysAPI) setFor(key string) *recordedSet {
 // an empty level instead of a modal.
 func TestV2LsKeyNotFound(t *testing.T) {
 	b := &v2Backend{api: &fakeKeysAPI{}, timeout: time.Second}
-	nodes, err := b.ls("/missing")
+	nodes, err := b.ls("/missing", 0)
 	if err != nil {
 		t.Fatalf("ls of missing dir should not error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestV2GetReturnsIndexes(t *testing.T) {
 		"/k": {Node: &clientv2.Node{Key: "/k", Value: "v", CreatedIndex: 7, ModifiedIndex: 9}},
 	}}
 	b := &v2Backend{api: fake, timeout: time.Second}
-	n, err := b.get("/k")
+	n, err := b.get("/k", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestV2Search(t *testing.T) {
 	b := &v2Backend{api: fake, timeout: time.Second}
 
 	// Path search, case-insensitive; value-only matches excluded.
-	nodes, truncated, err := b.search("/", "CONFIG", false, 10)
+	nodes, truncated, err := b.search("/", "CONFIG", false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestV2Search(t *testing.T) {
 	}
 
 	// Value search picks up /other too.
-	nodes, _, err = b.search("/", "config", true, 10)
+	nodes, _, err = b.search("/", "config", true, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestV2Search(t *testing.T) {
 	}
 
 	// Truncation honors the limit.
-	nodes, truncated, err = b.search("/", "config", true, 1)
+	nodes, truncated, err = b.search("/", "config", true, 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,5 +370,28 @@ func TestV2MkdirDelDeldir(t *testing.T) {
 func TestV2Proto(t *testing.T) {
 	if got := (&v2Backend{}).proto(); got != "v2" {
 		t.Errorf("proto = %q, want v2", got)
+	}
+}
+
+// v2 keeps no past revisions. Every read must refuse a historical one rather
+// than serving current data under a historical label, and revision() has
+// nothing to report at all.
+func TestV2RefusesRevisionReads(t *testing.T) {
+	b := &v2Backend{api: &fakeKeysAPI{}, timeout: time.Second}
+
+	if _, err := b.ls("/", 5); err == nil {
+		t.Error("ls at a revision should fail on v2")
+	}
+	if _, err := b.get("/k", 5); err == nil {
+		t.Error("get at a revision should fail on v2")
+	}
+	if _, err := b.export("/", 5); err == nil {
+		t.Error("export at a revision should fail on v2")
+	}
+	if _, _, err := b.search("/", "q", false, 10, 5); err == nil {
+		t.Error("search at a revision should fail on v2")
+	}
+	if _, err := b.revision(); err == nil {
+		t.Error("revision() should fail on v2")
 	}
 }

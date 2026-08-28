@@ -20,12 +20,16 @@ func (r *recordingBackend) note(name string, args ...interface{}) {
 
 func (r *recordingBackend) proto() string { r.note("proto"); return "vX" }
 func (r *recordingBackend) probe() error  { r.note("probe"); return nil }
-func (r *recordingBackend) ls(dir string) ([]*Node, error) {
-	r.note("ls", dir)
+func (r *recordingBackend) ls(dir string, rev int64) ([]*Node, error) {
+	r.note("ls", dir, rev)
 	return nil, nil
 }
-func (r *recordingBackend) get(key string) (*Node, error) { r.note("get", key); return nil, nil }
-func (r *recordingBackend) set(key, value string) error   { r.note("set", key, value); return nil }
+func (r *recordingBackend) get(key string, rev int64) (*Node, error) {
+	r.note("get", key, rev)
+	return nil, nil
+}
+func (r *recordingBackend) revision() (int64, error)    { r.note("revision"); return 7, nil }
+func (r *recordingBackend) set(key, value string) error { r.note("set", key, value); return nil }
 func (r *recordingBackend) setTTL(key, value string, ttl int64) error {
 	r.note("setTTL", key, value, ttl)
 	return nil
@@ -47,8 +51,8 @@ func (r *recordingBackend) renameKey(o, n string) error {
 }
 func (r *recordingBackend) copyKey(s, d string) error { r.note("copyKey", s, d); return nil }
 func (r *recordingBackend) copyDir(s, d string) error { r.note("copyDir", s, d); return nil }
-func (r *recordingBackend) search(dir, q string, inValues bool, limit int) ([]*Node, bool, error) {
-	r.note("search", dir, q, inValues, limit)
+func (r *recordingBackend) search(dir, q string, inValues bool, limit int, rev int64) ([]*Node, bool, error) {
+	r.note("search", dir, q, inValues, limit, rev)
 	return nil, false, nil
 }
 func (r *recordingBackend) history(key string, limit int) ([]*Revision, bool, error) {
@@ -59,8 +63,8 @@ func (r *recordingBackend) authStatus() (bool, bool, error) {
 	r.note("authStatus")
 	return false, false, nil
 }
-func (r *recordingBackend) export(dir string) (map[string]string, error) {
-	r.note("export", dir)
+func (r *recordingBackend) export(dir string, rev int64) (map[string]string, error) {
+	r.note("export", dir, rev)
 	return nil, nil
 }
 
@@ -75,8 +79,8 @@ func TestModelDelegatesToBackend(t *testing.T) {
 		wantCall string
 		wantArgs []interface{}
 	}{
-		{"Ls", func(m *Model) { m.Ls("/d") }, "ls", []interface{}{"/d"}},
-		{"Get", func(m *Model) { m.Get("/k") }, "get", []interface{}{"/k"}},
+		{"Ls", func(m *Model) { m.Ls("/d") }, "ls", []interface{}{"/d", int64(0)}},
+		{"Get", func(m *Model) { m.Get("/k") }, "get", []interface{}{"/k", int64(0)}},
 		{"Set", func(m *Model) { m.Set("/k", "v") }, "set", []interface{}{"/k", "v"}},
 		{"SetTTL", func(m *Model) { m.SetTTL("/k", "v", 60) }, "setTTL", []interface{}{"/k", "v", int64(60)}},
 		{"SetKeepTTL", func(m *Model) { m.SetKeepTTL("/k", "v", 7, 30) }, "setKeep", []interface{}{"/k", "v", int64(7), int64(30)}},
@@ -87,10 +91,17 @@ func TestModelDelegatesToBackend(t *testing.T) {
 		{"RenameKey", func(m *Model) { m.RenameKey("/a", "/b") }, "renameKey", []interface{}{"/a", "/b"}},
 		{"CopyKey", func(m *Model) { m.CopyKey("/a", "/b") }, "copyKey", []interface{}{"/a", "/b"}},
 		{"CopyDir", func(m *Model) { m.CopyDir("/a", "/b") }, "copyDir", []interface{}{"/a", "/b"}},
-		{"Export", func(m *Model) { m.Export("/d") }, "export", []interface{}{"/d"}},
-		{"Search", func(m *Model) { m.Search("/d", "q", true, 5) }, "search", []interface{}{"/d", "q", true, 5}},
+		{"Export", func(m *Model) { m.Export("/d") }, "export", []interface{}{"/d", int64(0)}},
+		{"Search", func(m *Model) { m.Search("/d", "q", true, 5) }, "search", []interface{}{"/d", "q", true, 5, int64(0)}},
 		{"History", func(m *Model) { m.History("/k", 9) }, "history", []interface{}{"/k", 9}},
 		{"ProtocolVersion", func(m *Model) { m.ProtocolVersion() }, "proto", nil},
+		// The *At readers must pass the revision through untouched: a dropped
+		// rev would silently serve current data under a historical label.
+		{"LsAt", func(m *Model) { m.LsAt("/d", 42) }, "ls", []interface{}{"/d", int64(42)}},
+		{"GetAt", func(m *Model) { m.GetAt("/k", 42) }, "get", []interface{}{"/k", int64(42)}},
+		{"ExportAt", func(m *Model) { m.ExportAt("/d", 42) }, "export", []interface{}{"/d", int64(42)}},
+		{"SearchAt", func(m *Model) { m.SearchAt("/d", "q", true, 5, 42) }, "search", []interface{}{"/d", "q", true, 5, int64(42)}},
+		{"Revision", func(m *Model) { m.Revision() }, "revision", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,6 +155,6 @@ type failingBackend struct {
 	err error
 }
 
-func (f *failingBackend) set(string, string) error  { return f.err }
-func (f *failingBackend) del(string) error          { return f.err }
-func (f *failingBackend) get(string) (*Node, error) { return nil, f.err }
+func (f *failingBackend) set(string, string) error         { return f.err }
+func (f *failingBackend) del(string) error                 { return f.err }
+func (f *failingBackend) get(string, int64) (*Node, error) { return nil, f.err }

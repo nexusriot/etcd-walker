@@ -1,13 +1,15 @@
 # Etcd-walker — Roadmap
 
-Prioritized backlog, last revised 2026-08-14. Bug ids (`B-*`) and limitation
+Prioritized backlog, last revised 2026-08-28. Bug ids (`B-*`) and limitation
 ids (`L-*`) refer to [DESIGN.md §12](DESIGN.md); feature ids (`F-*`, `N-*`)
 are referenced back from there and from §13. Nothing here is scheduled — it
 is an ordered menu.
 
-The current version is **0.9.0**, which carries the safety work (F-4, F-5,
-N-6, N-11, N-14, N-21) and every fix from the B-1..B-18 rounds. Note that
-the working tree is not committed; the last tag is 0.6.0.
+The current version is **0.10.0**, which adds time-travel browsing (F-19),
+undo snapshots for recursive deletes (N-25) and the two-pane layout (F-20),
+described in [DESIGN.md §14](DESIGN.md). 0.9.0 carried the safety work
+(F-4, F-5, N-6, N-11, N-14, N-21) and every fix from the B-1..B-18 rounds.
+Note that the last tag is 0.6.0.
 
 ## 0. Open findings — all cleared
 
@@ -58,13 +60,18 @@ its bare form, so the README's own `-read-only` example did not run.
 **2026-08-14** shipped the safety work — F-4 (read-only sessions), N-11
 (visible stale state), N-14 (protected prefixes), then F-5 (type-to-confirm
 recursive deletes), N-6 (session journal) and N-21 (dry-run), all described
-in DESIGN §13. Next up: F-3, then N-1 (CAS-safe writes).
+in DESIGN §13. **2026-08-28** shipped F-19, N-25 and F-20 (DESIGN §14),
+which also turned up two defects of their own: undo snapshots corrupted
+non-UTF-8 values through `encoding/json` (fixed with a base64 side map), and
+`NewView` rooted an empty layout so the running app started with no focus and
+every list binding dead (fixed and pinned by a view test). Next up: F-3, then
+N-1 (CAS-safe writes).
 
 ## 1. Quick wins
 
 | Id | Feature | Sketch |
 |----|---------|--------|
-| F-1 | **Watch mode / live refresh** | Toggleable (hotkey, e.g. `Ctrl+G`) v3 `Watch` on the current prefix (v2: polling fallback) that re-runs `updateList` via `App.QueueUpdateDraw` on events. Indicator in the header. The single most useful addition for anyone staring at a changing cluster. |
+| F-1 | **Watch mode / live refresh** | Toggleable (hotkey — `Ctrl+G` and `Ctrl+B` are taken as of 0.10.0) v3 `Watch` on the current prefix (v2: polling fallback) that re-runs `updateList` via `App.QueueUpdateDraw` on events. Indicator in the header. The single most useful addition for anyone staring at a changing cluster. |
 | F-2 | **Auth label everywhere** | Same as B-2 above — the feature half is showing `ON/OFF` in `auto`/`v2` modes. |
 | F-3 | **`-version` flag + single-sourced version** | `var version = "dev"` + `-ldflags "-X main.version=$(VERSION)"` in the Makefile; header reads it, `-version` prints it. Kills the three-place bump documented in DESIGN §9.3. |
 | ~~F-4~~ | **Read-only mode** — shipped in 0.9.0 | `-read-only` flag / `"read_only": true` config: mutating hotkeys show a "read-only session" modal instead of acting; header shows `[RO]`. Cheap insurance for browsing production. |
@@ -74,6 +81,7 @@ in DESIGN §13. Next up: F-3, then N-1 (CAS-safe writes).
 
 | Id | Feature | Sketch |
 |----|---------|--------|
+| F-21 | **Live pane, live diff** | With two panes and per-pane revisions in place, F-15 (directory diff) is now "diff pane A against pane B" — the two sides are already chosen, `diffLines`/`renderDiff` already exist (N-13), and the interesting case (same prefix, two revisions) is one keystroke away from what 0.10.0 ships. |
 | F-6 | **Multi-select + batch ops** | `Space` marks/unmarks rows (`currentNodes` already keys them stably); batch delete first, then batch copy/move to a target dir. |
 | F-8 | **Lease browser (v3)** | New screen listing `Leases()` with TTL + attached keys (`TimeToLive` + `WithAttachedKeys`); actions: revoke, keepalive-once, jump to key. Also the natural home for B-1's shared-lease warning. |
 | F-9 | **Paginated range ops** | Replace the single `Range` in `ls`/`search`/`export` with a `WithLimit(N)`+`WithFromKey` loop (L-1); progress modal with cancel for search/export. Unlocks million-key clusters. |
@@ -89,7 +97,7 @@ in DESIGN §13. Next up: F-3, then N-1 (CAS-safe writes).
 | F-14 | **Cluster status pane** | `Maintenance` API: member list + leader, per-member db size, alarms, endpoint health/RTT; either a modal or a third pane. |
 | F-15 | **Directory diff** | Compare two prefixes (same or different cluster once F-11 lands): added/removed/changed keys, drill into per-key value diff. |
 | F-16 | **Auth management (v3)** | Users/roles CRUD + permission grants via the `Auth` client — turns the walker into a small etcd admin console. |
-| F-17 | **Bookmarks + navigation history** | Persist favourite paths per profile (config or XDG state file); `Ctrl+B` to bookmark, picker to jump; back/forward stack alongside `position`. |
+| F-17 | **Bookmarks + navigation history** | Persist favourite paths per profile (config or XDG state file); a free key to bookmark (`Ctrl+B` is the pane toggle as of 0.10.0), picker to jump; back/forward stack alongside `position`. |
 | F-18 | **Snapshot save** | `Maintenance.Snapshot` streamed to a local file with progress — one-keystroke cluster backup before risky edits. |
 
 ## 4. Newly identified (2026-08-08 analysis)
@@ -105,7 +113,7 @@ in DESIGN §13. Next up: F-3, then N-1 (CAS-safe writes).
 | N-7 | **Prefix stats ("du" for etcd)** | Key count and total value bytes per child prefix + largest keys. Nothing in the TUI shows where the db size went. Better after F-9. |
 | N-8 | **Sort & live filter** | `orderedEntries` is hardcoded dirs-then-files-alpha; add sort by mod-revision/size/TTL and a filter that *hides* non-matching rows (today's search only moves the cursor). |
 | N-9 | **Regex/glob in find** | `search` is substring-only; a regex predicate is a one-line change in both backends. |
-| N-10 | **Undo the last destructive op** | Stash the prior value/lease on delete, rename and overwrite; `Ctrl+Z` restores. Single keys only, not recursive dir deletes. |
+| N-10 | **Undo the last destructive op** | Stash the prior value/lease on delete, rename and overwrite; `Ctrl+Z` restores. Single keys only — recursive directory deletes are covered by N-25's snapshots as of 0.10.0. |
 
 ## 5. From the 2026-08-11 review
 
@@ -124,6 +132,9 @@ Ideas the deep review turned up, roughly by value-per-effort.
 
 | Id | Feature | Version |
 |----|---------|---------|
+| F-19 | **Time travel** — `Ctrl+G` pins a pane to a past etcd revision; every read (listing, details, find, export) carries it, mutations are refused, and compaction is reported rather than shown as an empty tree. Absolute, relative (`-N`) or empty for live. DESIGN §14.1. | 0.10.0 |
+| N-25 | **Undo snapshots** — a recursive directory delete exports the subtree to `$XDG_STATE_HOME/etcd-walker/snapshots` first; `Ctrl+U` restores or discards. A snapshot that cannot be written cancels the delete (`-no-snapshot` opts out); binary values survive byte for byte. DESIGN §14.2. | 0.10.0 |
+| F-20 | **Two panes** — `Ctrl+B`/`-dual`, `Tab` to switch, `F5`/`F6` to copy or move into the other pane. Each pane keeps its own directory, cursor and revision. DESIGN §14.3. | 0.10.0 |
 | F-4 | **Read-only sessions** — `-read-only` / `"read_only"`. Mutating bindings refused up front, `[READ-ONLY]` in a yellow header, value editor opens disabled so values stay readable. DESIGN §13. | 0.9.0 |
 | N-11 | **Visible stale state** — a failed on-focus re-read is reported in the details pane and greys the row with a `(cached)` tag, instead of silently leaving the listing's node in place. DESIGN §13. | 0.9.0 |
 | N-14 | **Protected prefixes** — `-protect` / `"protected_prefixes"`. Writes on or under a protected path need the prefix basename typed out; enforced by one `guarded` funnel every mutation passes through, so bulk imports and revision-restores are covered too. DESIGN §13. | 0.9.0 |

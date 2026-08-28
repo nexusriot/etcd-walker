@@ -115,13 +115,13 @@ func setBool(f *boolFlag, v bool) *boolFlag      { _ = f.Set(strconv.FormatBool(
 
 // With no config and no flags the hard-coded defaults stand.
 func TestResolveDefaults(t *testing.T) {
-	opts, policy, debug := resolve(nil, noFlags())
+	opts, policy, sess := resolve(nil, noFlags())
 
 	if opts.Host != "127.0.0.1" || opts.Port != "2379" || opts.Protocol != "auto" {
 		t.Errorf("defaults = %+v", opts)
 	}
-	if debug || policy.ReadOnly || policy.DryRun || len(policy.ProtectedPrefixes) != 0 {
-		t.Errorf("defaults should be permissive: debug=%v policy=%+v", debug, policy)
+	if sess.debug || policy.ReadOnly || policy.DryRun || len(policy.ProtectedPrefixes) != 0 {
+		t.Errorf("defaults should be permissive: debug=%v policy=%+v", sess.debug, policy)
 	}
 }
 
@@ -135,7 +135,7 @@ func TestResolveAppliesEveryConfigField(t *testing.T) {
 		TLSKeyFile: "key", TLSSkipVerify: true, TimeoutSeconds: 9,
 		ReadOnly: true, DryRun: true, ProtectedPrefixes: []string{"/a"},
 	}
-	opts, policy, debug := resolve(cfg, noFlags())
+	opts, policy, sess := resolve(cfg, noFlags())
 
 	if opts.Host != "h" || opts.Port != "1" || opts.Protocol != "v3" {
 		t.Errorf("endpoint = %+v", opts)
@@ -150,7 +150,7 @@ func TestResolveAppliesEveryConfigField(t *testing.T) {
 	if opts.TimeoutSeconds != 9 {
 		t.Errorf("timeout = %d, want 9", opts.TimeoutSeconds)
 	}
-	if !debug {
+	if !sess.debug {
 		t.Error("debug not applied")
 	}
 	if !policy.ReadOnly || !policy.DryRun || len(policy.ProtectedPrefixes) != 1 {
@@ -178,7 +178,7 @@ func TestResolveFlagsOverrideConfig(t *testing.T) {
 	f.readOnly = setBool(f.readOnly, false)
 	f.dryRun = setBool(f.dryRun, false)
 
-	opts, policy, debug := resolve(cfg, f)
+	opts, policy, sess := resolve(cfg, f)
 
 	if opts.Host != "flag-host" || opts.Port != "2222" || opts.Protocol != "v3" {
 		t.Errorf("flags did not override endpoint: %+v", opts)
@@ -195,9 +195,9 @@ func TestResolveFlagsOverrideConfig(t *testing.T) {
 	}
 	// Explicit false must be able to turn a config-enabled switch back OFF —
 	// the whole reason the flag wrappers track "set".
-	if debug || opts.TLSEnabled || policy.ReadOnly || policy.DryRun {
+	if sess.debug || opts.TLSEnabled || policy.ReadOnly || policy.DryRun {
 		t.Errorf("explicit false did not override config: debug=%v tls=%v policy=%+v",
-			debug, opts.TLSEnabled, policy)
+			sess.debug, opts.TLSEnabled, policy)
 	}
 	if len(policy.ProtectedPrefixes) != 2 || policy.ProtectedPrefixes[0] != "/one" {
 		t.Errorf("-protect should REPLACE the configured list, got %v", policy.ProtectedPrefixes)
@@ -262,6 +262,7 @@ func TestRegisterFlagsDeclaresDocumentedFlags(t *testing.T) {
 		"host", "port", "protocol", "debug", "username", "password",
 		"tls", "tls-ca", "tls-cert", "tls-key", "tls-skip-verify",
 		"timeout", "read-only", "dry-run", "protect", "config",
+		"no-snapshot", "dual",
 	} {
 		if !declared[name] {
 			t.Errorf("-%s is documented but not registered", name)
@@ -273,7 +274,7 @@ func TestRegisterFlagsDeclaresDocumentedFlags(t *testing.T) {
 // IsBoolFlag, `etcd-walker -read-only` fails with "flag needs an argument" —
 // and that is the exact command the README's production example gives.
 func TestBoolFlagsAcceptBareForm(t *testing.T) {
-	for _, name := range []string{"read-only", "dry-run", "tls", "debug", "tls-skip-verify"} {
+	for _, name := range []string{"read-only", "dry-run", "tls", "debug", "tls-skip-verify", "no-snapshot", "dual"} {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
 		registerFlags(fs)
@@ -326,5 +327,50 @@ func TestUnparsedFlagsLeaveConfigIntact(t *testing.T) {
 	}
 	if !policy.ReadOnly || !policy.DryRun {
 		t.Errorf("policy not preserved: %+v", policy)
+	}
+}
+
+// Undo snapshots are on unless something turns them off, so an absent config
+// key and an absent flag must both leave the protection in place. The config
+// field is a pointer for exactly this reason: a plain bool's zero value would
+// silently disable it for everyone who never wrote the key.
+func TestResolveSnapshotDefaultsOn(t *testing.T) {
+	if _, policy, _ := resolve(nil, noFlags()); !policy.SnapshotBeforeDelete {
+		t.Error("snapshots must default to on with no config and no flags")
+	}
+	if _, policy, _ := resolve(&config.Config{Host: "h"}, noFlags()); !policy.SnapshotBeforeDelete {
+		t.Error("a config that never mentions snapshots must leave them on")
+	}
+
+	off := false
+	if _, policy, _ := resolve(&config.Config{SnapshotBeforeDelete: &off}, noFlags()); policy.SnapshotBeforeDelete {
+		t.Error(`"snapshot_before_delete": false must turn them off`)
+	}
+
+	f := noFlags()
+	f.noSnapshot = setBool(f.noSnapshot, true)
+	if _, policy, _ := resolve(nil, f); policy.SnapshotBeforeDelete {
+		t.Error("-no-snapshot must turn them off")
+	}
+
+	// -no-snapshot=false turns them back on over a config that disabled them.
+	f = noFlags()
+	f.noSnapshot = setBool(f.noSnapshot, false)
+	if _, policy, _ := resolve(&config.Config{SnapshotBeforeDelete: &off}, f); !policy.SnapshotBeforeDelete {
+		t.Error("-no-snapshot=false must re-enable snapshots over the config")
+	}
+}
+
+func TestResolveDualPane(t *testing.T) {
+	if _, _, sess := resolve(nil, noFlags()); sess.dual {
+		t.Error("dual pane must default to off")
+	}
+	if _, _, sess := resolve(&config.Config{DualPane: true}, noFlags()); !sess.dual {
+		t.Error(`"dual_pane": true not applied`)
+	}
+	f := noFlags()
+	f.dual = setBool(f.dual, false)
+	if _, _, sess := resolve(&config.Config{DualPane: true}, f); sess.dual {
+		t.Error("-dual=false must override the config")
 	}
 }

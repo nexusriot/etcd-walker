@@ -20,7 +20,7 @@
 APP        := etcd-walker
 PKG        := ./cmd/etcd-walker
 GO         ?= go
-VERSION    ?= 0.9.0
+VERSION    ?= 0.10.0
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist

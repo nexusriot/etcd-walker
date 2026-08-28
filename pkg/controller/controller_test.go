@@ -28,10 +28,25 @@ type fakeModel struct {
 	histErr    error
 	histCalls  int
 	exportData map[string]string // served by Export
+	exportErr  error             // forced Export failure
 	setErr     error             // forced Set failure
 
-	setKeepCalls []setKeepCall
-	delDirCalls  []string
+	// The rev* fields model the cluster's past: nodesAt/getsAt stand in for
+	// the tree as it was at any pinned revision, revErr forces the compaction
+	// failure, and readRevs records the revision every read carried — which is
+	// how a test proves a pinned pane never quietly read live data.
+	nodesAt  map[string][]*model.Node
+	getsAt   map[string]*model.Node
+	revErr   error
+	rev      int64
+	revCalls int
+	readRevs []int64
+
+	setKeepCalls   []setKeepCall
+	delDirCalls    []string
+	renameDirCalls []string
+	renameKeyCalls []string
+	delCalls       []string
 	// calls records every mutating call as "op arg1 arg2", so a flow test can
 	// assert that a rejected input reached the model not at all.
 	calls []string
@@ -50,18 +65,43 @@ type setKeepCall struct {
 func (f *fakeModel) ProtocolVersion() string { return "v3" }
 func (f *fakeModel) AuthLabel() string       { return "OFF" }
 
-func (f *fakeModel) Ls(dir string) ([]*model.Node, error) {
+func (f *fakeModel) LsAt(dir string, rev int64) ([]*model.Node, error) {
+	f.readRevs = append(f.readRevs, rev)
+	if rev > 0 {
+		if f.revErr != nil {
+			return nil, f.revErr
+		}
+		return f.nodesAt[dir], nil
+	}
 	if err := f.lsErr[dir]; err != nil {
 		return nil, err
 	}
 	return f.nodes[dir], nil
 }
 
-func (f *fakeModel) Get(key string) (*model.Node, error) {
+func (f *fakeModel) GetAt(key string, rev int64) (*model.Node, error) {
+	f.readRevs = append(f.readRevs, rev)
+	if rev > 0 {
+		if f.revErr != nil {
+			return nil, f.revErr
+		}
+		if n, ok := f.getsAt[key]; ok {
+			return n, nil
+		}
+		return nil, fmt.Errorf("not found at rev %d: %s", rev, key)
+	}
 	if n, ok := f.gets[key]; ok {
 		return n, nil
 	}
 	return nil, fmt.Errorf("not found: %s", key)
+}
+
+func (f *fakeModel) Revision() (int64, error) {
+	f.revCalls++
+	if f.rev == 0 {
+		return 0, fmt.Errorf("no revision available")
+	}
+	return f.rev, nil
 }
 
 func (f *fakeModel) Set(k, v string) error              { f.note("set %s %s", k, v); return f.setErr }
@@ -71,21 +111,37 @@ func (f *fakeModel) SetKeepTTL(key, value string, leaseID, ttl int64) error {
 	return nil
 }
 func (f *fakeModel) MkDir(d string) error { f.note("mkdir %s", d); return nil }
-func (f *fakeModel) Del(string) error     { return nil }
+func (f *fakeModel) Del(key string) error {
+	f.delCalls = append(f.delCalls, key)
+	return nil
+}
 func (f *fakeModel) DelDir(key string) error {
 	f.delDirCalls = append(f.delDirCalls, key)
 	return nil
 }
-func (f *fakeModel) RenameDir(string, string) error           { return nil }
-func (f *fakeModel) RenameKey(string, string) error           { return nil }
-func (f *fakeModel) CopyKey(s1, d string) error               { f.note("copykey %s %s", s1, d); return nil }
-func (f *fakeModel) CopyDir(s1, d string) error               { f.note("copydir %s %s", s1, d); return nil }
-func (f *fakeModel) Export(string) (map[string]string, error) { return f.exportData, nil }
+func (f *fakeModel) RenameDir(o, n string) error {
+	f.renameDirCalls = append(f.renameDirCalls, o+" -> "+n)
+	return nil
+}
+func (f *fakeModel) RenameKey(o, n string) error {
+	f.renameKeyCalls = append(f.renameKeyCalls, o+" -> "+n)
+	return nil
+}
+func (f *fakeModel) CopyKey(s1, d string) error { f.note("copykey %s %s", s1, d); return nil }
+func (f *fakeModel) CopyDir(s1, d string) error { f.note("copydir %s %s", s1, d); return nil }
+func (f *fakeModel) ExportAt(_ string, rev int64) (map[string]string, error) {
+	f.readRevs = append(f.readRevs, rev)
+	if rev > 0 && f.revErr != nil {
+		return nil, f.revErr
+	}
+	return f.exportData, f.exportErr
+}
 func (f *fakeModel) Import(items map[string]string, o bool) (int, int, error) {
 	f.note("import %d %v", len(items), o)
 	return len(items), 0, nil
 }
-func (f *fakeModel) Search(string, string, bool, int) ([]*model.Node, bool, error) {
+func (f *fakeModel) SearchAt(_, _ string, _ bool, _ int, rev int64) ([]*model.Node, bool, error) {
+	f.readRevs = append(f.readRevs, rev)
 	return nil, false, nil
 }
 func (f *fakeModel) History(key string, limit int) ([]*model.Revision, bool, error) {
@@ -99,12 +155,20 @@ func (f *fakeModel) History(key string, limit int) ([]*model.Revision, bool, err
 // newTestController wires a Controller to headless tview widgets (no screen
 // needed as long as the app never runs) and the given fake model.
 func newTestController(m modelAPI) *Controller {
+	lists := [2]*tview.List{
+		tview.NewList().ShowSecondaryText(false),
+		tview.NewList().ShowSecondaryText(false),
+	}
 	v := &view.View{
 		App:     tview.NewApplication(),
 		Pages:   tview.NewPages(),
-		List:    tview.NewList().ShowSecondaryText(false),
+		List:    lists[0],
+		Lists:   lists,
 		Details: tview.NewTextView().SetDynamicColors(true),
 		ModalEdit: func(p tview.Primitive, width, height int) tview.Primitive {
+			return p
+		},
+		ModalScroll: func(p tview.Primitive, width int) tview.Primitive {
 			return p
 		},
 	}
@@ -114,11 +178,10 @@ func newTestController(m modelAPI) *Controller {
 		// Present but not wired to the model: tests that care about journalling
 		// wrap their fake in newJournaling explicitly, the way NewController
 		// does. This just keeps the viewer from dereferencing nil.
-		journal:     &Journal{},
-		currentDir:  "/",
-		lastGoodDir: "/",
-		position:    make(map[string]int),
-		injected:    make(map[string]map[string]*model.Node),
+		journal:   &Journal{},
+		paneState: newPaneState(),
+		inactive:  newPaneState(),
+		injected:  make(map[string]map[string]*model.Node),
 	}
 }
 

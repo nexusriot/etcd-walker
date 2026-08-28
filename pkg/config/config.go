@@ -41,6 +41,14 @@ type Config struct {
 
 	// DryRun records what each mutation would do without performing it.
 	DryRun bool `json:"dry_run"`
+
+	// SnapshotBeforeDelete saves a directory's subtree to a local file before
+	// deleting it. It is a pointer because the default is *on*: an absent key
+	// must mean "keep the protection", not "false".
+	SnapshotBeforeDelete *bool `json:"snapshot_before_delete"`
+
+	// DualPane starts the browser with two panes side by side.
+	DualPane bool `json:"dual_pane"`
 }
 
 // Load tries to read and unmarshal config from the given path.

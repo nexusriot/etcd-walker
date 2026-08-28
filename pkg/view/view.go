@@ -11,12 +11,49 @@ import (
 // never calls the model, and the controller installs every input capture and
 // done handler.
 type View struct {
-	App       *tview.Application
-	Frame     *tview.Frame
-	Pages     *tview.Pages
-	List      *tview.List
-	Details   *tview.TextView
+	App   *tview.Application
+	Frame *tview.Frame
+	Pages *tview.Pages
+	// List is the pane that currently has focus — always one of Lists. The
+	// controller repoints it when the user switches panes, so every handler
+	// can keep addressing "the list" without knowing how many there are.
+	List *tview.List
+	// Lists are the two browser panes. The second one exists even in
+	// single-pane mode; only the layout decides whether it is on screen.
+	Lists   [2]*tview.List
+	Details *tview.TextView
+	// Main is the layout SetDual rebuilds. Tests construct a View without it.
+	Main      *tview.Flex
 	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
+	// ModalScroll centers a panel whose content can be longer than the
+	// terminal. Its height is proportional instead of fixed, so the panel
+	// shrinks with the screen rather than being clipped: a clipped panel hides
+	// its bottom rows with no way to reach them, and scrolling *inside* it
+	// cannot help, because those rows are never drawn in the first place.
+	ModalScroll func(p tview.Primitive, width int) tview.Primitive
+}
+
+// SetDual switches between the single-pane layout (one list beside the details
+// pane) and the two-pane one (both lists side by side above a full-width
+// details pane). Details keeps the full width in dual mode because splitting
+// three ways leaves nothing readable in an 80-column terminal.
+func (v *View) SetDual(on bool) {
+	if v.Main == nil {
+		return // headless View built by a test: no layout to rearrange
+	}
+	v.Main.Clear()
+	if !on {
+		v.Main.SetDirection(tview.FlexColumn)
+		v.Main.AddItem(v.Lists[0], 0, 2, true)
+		v.Main.AddItem(v.Details, 0, 3, false)
+		return
+	}
+	panes := tview.NewFlex().SetDirection(tview.FlexColumn)
+	panes.AddItem(v.Lists[0], 0, 1, true)
+	panes.AddItem(v.Lists[1], 0, 1, false)
+	v.Main.SetDirection(tview.FlexRow)
+	v.Main.AddItem(panes, 0, 3, true)
+	v.Main.AddItem(v.Details, 0, 2, false)
 }
 
 // NewView builds the running UI — the two-pane main page, the page stack all
@@ -26,13 +63,17 @@ type View struct {
 func NewView() *View {
 	app := tview.NewApplication()
 
-	list := tview.NewList().
-		ShowSecondaryText(false) // secondary text hidden but used to store raw keys
-	list.SetBorder(true).
-		SetTitleAlign(tview.AlignLeft)
-	// Readable selection
-	list.SetSelectedTextColor(tcell.ColorBlack).
-		SetSelectedBackgroundColor(tcell.ColorYellow)
+	newPane := func() *tview.List {
+		l := tview.NewList().
+			ShowSecondaryText(false) // secondary text hidden but used to store raw keys
+		l.SetBorder(true).
+			SetTitleAlign(tview.AlignLeft)
+		// Readable selection
+		l.SetSelectedTextColor(tcell.ColorBlack).
+			SetSelectedBackgroundColor(tcell.ColorYellow)
+		return l
+	}
+	lists := [2]*tview.List{newPane(), newPane()}
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
@@ -44,8 +85,6 @@ func NewView() *View {
 	tv.SetBorder(true).SetTitle("Details")
 
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 2, true)
-	main.AddItem(tv, 0, 3, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
@@ -60,24 +99,45 @@ func NewView() *View {
 			AddItem(nil, 0, 1, false)
 	}
 
+	// One row of padding above and below, and the panel takes everything left
+	// over — so it is as tall as the terminal allows and never taller.
+	modalScroll := func(p tview.Primitive, width int) tview.Primitive {
+		return tview.NewFlex().
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(nil, 1, 0, false).
+				AddItem(p, 0, 1, true).
+				AddItem(nil, 1, 0, false), width, 1, true).
+			AddItem(nil, 0, 1, false)
+	}
+
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::b][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::b][Ctrl+G][::-]Rev [::b][Ctrl+B][::-]2-pane [::b][Tab[][::-]Pane [::b][F5/F6][::-]Copy/Move [::b][Ctrl+U][::-]Undo [::b][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
 	)
 
-	app.SetRoot(frame, true)
-
 	v := View{
-		app,
-		frame,
-		pages,
-		list,
-		tv,
-		modal,
+		App:         app,
+		Frame:       frame,
+		Pages:       pages,
+		List:        lists[0],
+		Lists:       lists,
+		Details:     tv,
+		Main:        main,
+		ModalEdit:   modal,
+		ModalScroll: modalScroll,
 	}
+	// Fill the layout BEFORE handing it to the application: SetRoot resolves
+	// the focus by descending into the root's items, so rooting an empty Flex
+	// leaves nothing focused — and every key binding on the list is installed
+	// as an input capture, which only runs on the focused primitive. That is
+	// how a build once started with the whole keyboard dead.
+	v.SetDual(false)
+	app.SetRoot(frame, true)
+	app.SetFocus(lists[0])
 
 	return &v
 }
@@ -246,50 +306,70 @@ func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 
 func (v *View) NewHotkeysModal() *tview.TextView {
 	helpText := `
-		[::b]Navigation[::-]
-		  Enter         Open dir / select
-		  Backspace     Up ([..])
-		[::b]Actions[::-]
-		  Ctrl+N        Create node or directory
-		  Ctrl+D        Duplicate key/dir to a new path
-		  Ctrl+E        Edit value (multiline) / rename dir
-		  Ctrl+R        Rename key or directory
-		  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
-		  Ctrl+V        Revision history of a key (v3): view/diff/restore
-		  Del           Delete (recursive for dirs)
-		  Ctrl+J        Jump to key/dir (dir ends with '/')
-		  Ctrl+P        Copy path (key/dir)
-		  Ctrl+Y        Copy key value
-		  Ctrl+W        Export all keys under current dir to JSON
-		  Ctrl+O        Import keys from a JSON file (file browser)
-		  Ctrl+A        Session journal: what this session changed,
-		                exportable as an etcdctl script
-		[::b]Search[::-]
-		  /, Ctrl+S     Search by name (in current level)
-		  Ctrl+F        Find recursively (paths, optionally values)
-		[::b]Editor[::-]
-		  Ctrl+S        Save
-		  Esc/Ctrl+Q    Cancel/Cancel+Quit
-		[::b]Misc[::-]
-		  Ctrl+H        This help
-		  Ctrl+Q        Quit
-		[::b]Safety[::-]
-		  -read-only    Refuses every change; header shows READ-ONLY
-		  -dry-run      Records changes in the journal without making
-		                them; header shows DRY-RUN
-		  -protect P    Writes on/under prefix P need the prefix
-		                basename typed out first (repeat with commas)
-		  Deleting a directory always needs its name typed out.
+[::b]Navigation[::-]
+  Enter         Open dir / select
+  Backspace     Up ([..])
+[::b]Actions[::-]
+  Ctrl+N        Create node or directory
+  Ctrl+D        Duplicate key/dir to a new path
+  Ctrl+E        Edit value (multiline) / rename dir
+  Ctrl+R        Rename key or directory
+  Ctrl+T        Set/clear TTL on a key (seconds or 1h30m)
+  Ctrl+V        Revision history of a key (v3): view/diff/restore
+  Del           Delete (recursive for dirs)
+  Ctrl+J        Jump to key/dir (dir ends with '/')
+  Ctrl+P        Copy path (key/dir)
+  Ctrl+Y        Copy key value
+  Ctrl+W        Export all keys under current dir to JSON
+  Ctrl+O        Import keys from a JSON file (file browser)
+  Ctrl+A        Session journal: what this session changed,
+                exportable as an etcdctl script
+  Ctrl+U        Undo snapshots: restore a deleted directory
+[::b]Time travel (v3)[::-]
+  Ctrl+G        Browse a past revision: a number, -N for N
+                revisions back, or empty to return to live.
+                A pinned pane is read-only; each pane has
+                its own revision.
+[::b]Two panes[::-]
+  Ctrl+B        Show/hide the second pane
+  Tab           Switch panes
+  F5            Copy the selected entry to the other pane
+  F6            Move the selected entry to the other pane
+[::b]Search[::-]
+  /, Ctrl+S     Search by name (in current level)
+  Ctrl+F        Find recursively (paths, optionally values)
+[::b]Editor[::-]
+  Ctrl+S        Save
+  Esc/Ctrl+Q    Cancel/Cancel+Quit
+[::b]Misc[::-]
+  Ctrl+H        This help
+  Ctrl+Q        Quit
+[::b]Safety[::-]
+  -read-only    Refuses every change; header shows READ-ONLY
+  -dry-run      Records changes in the journal without making
+                them; header shows DRY-RUN
+  -protect P    Writes on/under prefix P need the prefix
+                basename typed out first (repeat with commas)
+  Deleting a directory always needs its name typed out,
+  and its subtree is saved to an undo snapshot first
+  (-no-snapshot turns that off).
 
-		[dim]Press any key to close.[-]
-	`
+[dim]↓,↑ · PgDn,PgUp · Home,End scroll   ·   Esc or q closes.[-]
+`
 	tv := tview.NewTextView()
 	tv.SetDynamicColors(true)
 	tv.SetTextAlign(tview.AlignLeft)
 	tv.SetWordWrap(true)
 	tv.SetText(helpText)
+	// Scrollable is the default, but it is the whole point of this panel: the
+	// binding list is longer than a short terminal, so it has to be reachable
+	// by scrolling. The controller's input capture must let the scroll keys
+	// through for this to mean anything.
+	tv.SetScrollable(true)
 	tv.SetBorder(true)
-	tv.SetTitle(" Hotkeys ")
+	// tview eats "[Esc]" as a colour tag, so the hint is escaped (DESIGN §12
+	// B-13); the arrows survive because they are not plain letters.
+	tv.SetTitle(" Hotkeys — [↓,↑] scroll · " + tview.Escape("[Esc]") + " closes ")
 
 	return tv
 }

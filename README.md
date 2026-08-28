@@ -29,6 +29,19 @@ Grab the latest pre-built binaries / `.deb` packages here:
   restore an old value in one keystroke — the key's live TTL/lease is
   preserved. How far back it reaches depends on the cluster's compaction
   policy; v2 has no value history.
+- **Time travel** (`Ctrl+G`, v3): pin a pane to a past etcd revision and
+  browse the whole keyspace as it was at that moment — listings, values,
+  details, recursive find and export all read at that revision. Enter an
+  absolute revision, `-N` for N revisions back, or nothing to return to
+  live. A pinned pane is read-only (the value editor opens as a viewer) and
+  says so in its title and details pane; keys deleted since are visible
+  again. Bounded by the cluster's compaction point, which is reported
+  plainly instead of showing an empty tree
+- **Two panes** (`Ctrl+B` / `-dual`): a second browser pane side by side,
+  `Tab` to switch. Each pane keeps its own directory, cursor and revision —
+  so you can put yesterday's revision next to today's tree — and `F5`/`F6`
+  copy or move the selected entry into the other pane's directory without
+  asking for a path
 - Quick search inside the current level (`/` or `Ctrl+S`)
 - Recursive find under the current directory (`Ctrl+F`) — case-insensitive
   substring match on key paths, optionally inside values, with a results
@@ -70,6 +83,13 @@ Grab the latest pre-built binaries / `.deb` packages here:
   script, then run it deliberately
 - Deleting a directory requires typing its name — a recursive delete is a
   single unrecoverable range delete, not something a stray Enter should do
+- **Undo snapshots** (`Ctrl+U`): before every recursive directory delete the
+  subtree is exported to a local file under `$XDG_STATE_HOME/etcd-walker/
+  snapshots`, and `Ctrl+U` lists them newest-first to restore or discard.
+  A snapshot that cannot be written cancels the delete rather than leaving
+  you without an undo (`-no-snapshot` opts out). Restores go through the
+  same policy guard and journal as any other bulk write, and binary values
+  survive byte for byte
 - Failed refreshes are visible, never silent: when the on-focus re-read of
   a key fails, the details pane says so and the row is greyed and marked
   `(cached)`, so a stale value is never mistaken for a live one
@@ -91,6 +111,11 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+R`        | Rename key or directory                      |
 | `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
 | `Ctrl+V`        | Revision history of a key (v3): view / diff / restore |
+| `Ctrl+G`        | Browse a past revision (v3): number, `-N`, or empty for live |
+| `Ctrl+B`        | Show / hide the second pane                   |
+| `Tab`           | Switch panes                                 |
+| `F5` / `F6`     | Copy / move the selected entry to the other pane |
+| `Ctrl+U`        | Undo snapshots — restore a deleted directory  |
 | `Ctrl+S` or `/` | Quick search inside the current level        |
 | `Ctrl+F`        | Recursive find (paths, optionally values)    |
 | `Ctrl+J`        | Jump to absolute or relative path            |
@@ -99,7 +124,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+A`        | Session journal — review / export as etcdctl  |
 | `Ctrl+P`        | Copy current path to clipboard               |
 | `Ctrl+Y`        | Copy current key value to clipboard          |
-| `Ctrl+H`        | Show in-app hotkeys help                     |
+| `Ctrl+H`        | Show in-app hotkeys help (scrolls: `↓`/`↑`, `PgDn`/`PgUp`, `Home`/`End`; `Esc` or `q` closes) |
 | `Ctrl+Q`        | Quit                                         |
 
 ---
@@ -141,7 +166,10 @@ Full schema (every field is optional):
 
   "read_only": false,
   "dry_run": false,
-  "protected_prefixes": ["/registry"]
+  "protected_prefixes": ["/registry"],
+
+  "snapshot_before_delete": true,
+  "dual_pane": false
 }
 ```
 
@@ -164,6 +192,8 @@ Field reference:
 | `read_only`       | bool    | `false`     | Refuse every mutating action for the session         |
 | `dry_run`         | bool    | `false`     | Record changes in the journal without performing them |
 | `protected_prefixes` | []string | _empty_  | Prefixes needing a typed confirmation before any write; `"/"` protects everything |
+| `snapshot_before_delete` | bool | `true`  | Export a directory's subtree to a local undo snapshot before deleting it. Omitting the key keeps it **on** |
+| `dual_pane`       | bool    | `false`     | Start with two panes side by side               |
 
 #### Command-line flags
 
@@ -184,6 +214,9 @@ Field reference:
 -dry-run bool              record changes without performing them
 -protect string            comma-separated prefixes needing a typed
                            confirmation before any write (e.g. /registry)
+-no-snapshot bool          do not save an undo snapshot before deleting a
+                           directory (snapshots are on by default)
+-dual bool                 start with two panes side by side
 -debug bool                enable debug logging
 ```
 
@@ -195,6 +228,9 @@ setting on, and `-read-only=false` turns it off again, which is how you
 override a `"read_only": true` in the config file for one session.
 `-protect` replaces the configured `protected_prefixes` rather than adding
 to them, so a session's protection can always be read off its command line.
+`-no-snapshot` is spelled as the negation of a default-on setting, so
+`-no-snapshot=false` re-enables undo snapshots over a config file that
+turned them off.
 
 ##### Browsing production safely
 
@@ -220,6 +256,58 @@ etcd-walker -host prod-etcd -dry-run
 
 Make the edits as usual, press `Ctrl+A` to review exactly what would have
 happened, and export it as a script to run once you are satisfied.
+
+##### Looking at the past
+
+etcd's revision counter is global and monotonic, so "what did this look like
+before the change?" is a property of the whole keyspace, not of one key.
+`Ctrl+G` pins the pane to a revision:
+
+| Entered  | Meaning                                     |
+|----------|---------------------------------------------|
+| `12345`  | the keyspace as of revision 12345           |
+| `-100`   | a hundred revisions ago                     |
+| _(empty)_| back to the live cluster                    |
+
+Everything the pane does then reads at that revision — the listing, the
+details pane, `Ctrl+F` and `Ctrl+W` — and keys deleted since are visible
+again. The title reads `[ /dir @ rev 12345 ]` and every mutation is refused
+while it is set, because a snapshot of a moment is not a place to write.
+
+How far back it reaches is set by the cluster's compaction policy. A
+revision that has been compacted away is reported as exactly that, and the
+pane stays where it was rather than switching to a view that cannot load.
+
+##### Two panes
+
+`Ctrl+B` opens a second pane (or start with `-dual`); `Tab` switches between
+them. Each pane has its own directory, cursor and revision, so a natural
+layout is yesterday's revision on one side and the live tree on the other.
+
+`F5` copies the selected key or directory into the other pane's directory
+and `F6` moves it — no path to type, because the other pane *is* the
+destination. Both go through the same policy guard, journal and dry-run as
+every other write.
+
+##### Undoing a directory delete
+
+A recursive delete is one range delete on the server with nothing to undo it
+with. Before performing one, `etcd-walker` exports the whole subtree to
+`$XDG_STATE_HOME/etcd-walker/snapshots` (falling back to
+`~/.local/state/…`; `ETCD_WALKER_STATE_DIR` overrides it):
+
+```
+20260828T140304-registry_pods.json
+```
+
+`Ctrl+U` lists those snapshots newest-first with their path, time and key
+count, and offers to restore one (overwriting or skipping keys that exist
+again) or delete the file. A restore is an ordinary bulk write: it is
+policy-gated and lands in the session journal.
+
+If the snapshot cannot be written the delete does **not** happen — the
+protection is worth nothing if it silently degrades. Pass `-no-snapshot`
+to delete without one.
 
 #### Configuration examples
 
@@ -283,8 +371,8 @@ The header shows the cluster's auth state as `Auth: ON`, `Auth: OFF`, or
 and the credentials are missing or wrong, `etcd-walker` shows the etcd
 error in-app so the misconfiguration is easy to spot.
 
-> Note: the auth state is currently only probed when the protocol is set to
-> `v3` explicitly; in `auto` and `v2` modes the header always shows `Auth: ?`.
+> Note: the auth state is probed in every mode; `Auth: ?` means the server
+> did not report either way.
 
 ---
 
@@ -308,6 +396,14 @@ error in-app so the misconfiguration is easy to spot.
   10 kB are refused rather than silently truncated.
 - v3 keys containing `//` or a trailing `/` are displayed at their
   normalized path and cannot be opened or edited.
+- Browsing a past revision needs etcd v3 and reaches only as far back as the
+  cluster's compaction point; the v2 store keeps no past revisions at all,
+  so `Ctrl+G` refuses there rather than showing current data as history.
+- Undo snapshots cover recursive *directory* deletes only. A single key is
+  recoverable from its own revision history (`Ctrl+V`) on v3.
+- Snapshots are written to the local disk unencrypted, exactly like an
+  export — do not snapshot secrets onto a machine you would not export them
+  to. They are never pruned automatically; `Ctrl+U` deletes them.
 
 ---
 

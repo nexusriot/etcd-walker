@@ -28,8 +28,14 @@ import (
 type modelAPI interface {
 	ProtocolVersion() string
 	AuthLabel() string
-	Ls(directory string) ([]*model.Node, error)
-	Get(key string) (*model.Node, error)
+	// The readers all take an explicit revision (0 = live) rather than coming
+	// in live and historical flavours: a pane pinned to the past must never be
+	// able to reach a live read by picking the wrong method name.
+	LsAt(directory string, rev int64) ([]*model.Node, error)
+	GetAt(key string, rev int64) (*model.Node, error)
+	// Revision is the cluster's current store revision, used to bound and
+	// resolve what the user types into the revision picker.
+	Revision() (int64, error)
 	Set(key, value string) error
 	SetTTL(key, value string, ttlSeconds int64) error
 	SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error
@@ -40,9 +46,9 @@ type modelAPI interface {
 	RenameKey(oldKey, newKey string) error
 	CopyKey(src, dst string) error
 	CopyDir(srcDir, dstDir string) error
-	Search(dir, query string, inValues bool, limit int) ([]*model.Node, bool, error)
+	SearchAt(dir, query string, inValues bool, limit int, rev int64) ([]*model.Node, bool, error)
 	History(key string, limit int) ([]*model.Revision, bool, error)
-	Export(dir string) (map[string]string, error)
+	ExportAt(dir string, rev int64) (map[string]string, error)
 	Import(items map[string]string, overwrite bool) (written, skipped int, err error)
 }
 
@@ -60,6 +66,11 @@ type Policy struct {
 	// change can be rehearsed against the real cluster and reviewed from the
 	// session journal before being run for real.
 	DryRun bool
+	// SnapshotBeforeDelete exports a directory's subtree to a local file
+	// before deleting it, so the one irreversible operation this tool has
+	// becomes recoverable. Default on; the delete is refused when the
+	// snapshot cannot be written.
+	SnapshotBeforeDelete bool
 }
 
 // protects reports the protected prefix covering path, if any. A prefix covers
@@ -97,23 +108,50 @@ type guard struct {
 	onCancel func()
 }
 
-type Controller struct {
-	view   *view.View
-	model  modelAPI
-	policy Policy
-	// journal records every mutation this session made, for review or export
-	// as an etcdctl script. Written by the journalling model decorator.
-	journal      *Journal
+// paneState is everything one browser pane knows: where it is, what it is
+// showing, and which revision it is reading at. The controller always acts on
+// the active pane, so the second pane is parked in Controller.inactive and the
+// two are swapped wholesale. Keeping it a struct rather than loose fields is
+// what makes that swap total: a hand-written swap that forgot one field would
+// leave a pane's cursor, listing and directory disagreeing.
+type paneState struct {
 	currentDir   string
 	currentNodes map[string]*Node // mapKey => Node (mapKey is "<basename>|dir" or "<basename>|file")
 	position     map[string]int
-	injected     map[string]map[string]*model.Node
 	// ordered mirrors the display names of the list rows (below "[..]") in the
 	// exact order updateList built them; search() selects rows through it.
 	ordered []string
 	// lastGoodDir is the most recent directory that listed successfully; a
 	// failed listing falls back here instead of aborting the session.
 	lastGoodDir string
+	// rev pins this pane to a past etcd revision (0 = live). Every read the
+	// pane makes carries it, and every write is refused while it is set: the
+	// pane is a snapshot of a moment, not a place to edit.
+	rev int64
+}
+
+type Controller struct {
+	view   *view.View
+	model  modelAPI
+	policy Policy
+	// journal records every mutation this session made, for review or export
+	// as an etcdctl script. Written by the journalling model decorator.
+	journal  *Journal
+	injected map[string]map[string]*model.Node
+	// endpoint is the host:port this session is connected to, recorded in undo
+	// snapshots so a file found later says which cluster it came from.
+	endpoint string
+
+	// The active pane's state is embedded, so every handler keeps addressing
+	// c.currentDir/c.currentNodes and operates on whichever pane has focus.
+	paneState
+	// inactive is the other pane's parked state, exchanged with the embedded
+	// one by swapPanes. It is meaningful only while dual is set.
+	inactive paneState
+	// dual shows both panes side by side; active is the index of the pane
+	// currently embedded (0 = left, 1 = right).
+	dual   bool
+	active int
 
 	startupErr error
 }
@@ -131,7 +169,7 @@ func splitFunc(r rune) bool { return r == '/' }
 
 // appVersion is the user-facing version. DESIGN §9.3: it is duplicated in the
 // Makefile and build-deb.sh, and all three must move together until F-3 lands.
-const appVersion = "0.9.0"
+const appVersion = "0.10.0"
 
 // headerText renders the frame's status line and the colour that goes with it.
 // It is separated from NewController so it can be tested without dialling a
@@ -180,14 +218,14 @@ func NewController(opts model.Options, policy Policy) *Controller {
 	v.Frame.AddText(text, true, tview.AlignCenter, headerColor)
 
 	controller := &Controller{
-		view:        v,
-		policy:      policy,
-		journal:     &Journal{dryRun: policy.DryRun},
-		currentDir:  "/",
-		lastGoodDir: "/",
-		position:    make(map[string]int),
-		injected:    make(map[string]map[string]*model.Node),
-		startupErr:  err,
+		view:       v,
+		policy:     policy,
+		endpoint:   fmt.Sprintf("%s:%s", opts.Host, opts.Port),
+		journal:    &Journal{dryRun: policy.DryRun},
+		paneState:  newPaneState(),
+		inactive:   newPaneState(),
+		injected:   make(map[string]map[string]*model.Node),
+		startupErr: err,
 	}
 	// Assign only a real model: a nil *model.Model stored in the interface
 	// would read as non-nil. On startup error Run() never touches the model.
@@ -352,12 +390,24 @@ func (c *Controller) writeHeader(header string) string {
 	return header
 }
 
+// The pane* helpers are how the browser reads: through the active pane's
+// revision, so a pane pinned to the past cannot accidentally show live data.
+// Write paths deliberately spell out GetAt(key, 0) instead — an existence
+// check before a write is about the cluster now, never about a snapshot.
+
+func (c *Controller) paneLs(dir string) ([]*model.Node, error) { return c.model.LsAt(dir, c.rev) }
+func (c *Controller) paneGet(key string) (*model.Node, error)  { return c.model.GetAt(key, c.rev) }
+
+// atRevision reports whether the active pane is showing a past revision, which
+// makes it a read-only snapshot for as long as it is set.
+func (c *Controller) atRevision() bool { return c.rev > 0 }
+
 func (c *Controller) makeNodeMap() error {
 	log.Debugf("updating node map started")
 	m := make(map[string]*Node)
 
 	// Model-provided listing
-	list, err := c.model.Ls(c.currentDir)
+	list, err := c.paneLs(c.currentDir)
 	if err != nil {
 		return err
 	}
@@ -488,7 +538,7 @@ func (c *Controller) updateList() []string {
 	}
 
 	c.view.List.Clear()
-	c.view.List.SetTitle("[ [::b]" + c.currentDir + "[::-] ]")
+	c.view.List.SetTitle(c.listTitle())
 
 	// [..] always on top
 	c.view.List.AddItem("[..]", "..", 0, func() {
@@ -528,6 +578,16 @@ func (c *Controller) updateList() []string {
 	return display
 }
 
+// listTitle labels a pane with the directory it shows and, when it is pinned,
+// the revision — a historical listing that looked like a live one would be a
+// trap, since everything on it is read-only and possibly long gone.
+func (c *Controller) listTitle() string {
+	if c.atRevision() {
+		return fmt.Sprintf("[ [::b]%s[::-] @ [yellow::b]rev %d[white::-] ]", c.currentDir, c.rev)
+	}
+	return "[ [::b]" + c.currentDir + "[::-] ]"
+}
+
 func (c *Controller) fillDetails(mapKey string) {
 	c.view.Details.Clear()
 
@@ -545,7 +605,7 @@ func (c *Controller) fillDetails(mapKey string) {
 	// live is what made B-7 destructive.
 	if !n.IsDir {
 		refreshErr := error(nil)
-		fresh, err := c.model.Get(n.Name)
+		fresh, err := c.paneGet(n.Name)
 		switch {
 		case err != nil:
 			refreshErr = err
@@ -565,6 +625,9 @@ func (c *Controller) fillDetails(mapKey string) {
 	base := baseOf(n.Name)
 	parent := parentOf(n.Name)
 
+	if c.atRevision() {
+		fmt.Fprintf(c.view.Details, "[yellow]⏱ revision %d — a read-only snapshot of the past[-]\n\n", c.rev)
+	}
 	fmt.Fprintf(c.view.Details, "[::b]Path info[::-]\n")
 	fmt.Fprintf(c.view.Details, "  [green]Type:[-] %s\n", map[bool]string{true: "Directory", false: "Key"}[n.IsDir])
 	fmt.Fprintf(c.view.Details, "  [green]Basename:[-] %s\n", base)
@@ -623,7 +686,7 @@ func (c *Controller) fillDetails(mapKey string) {
 			dirPath = dirPath + "/"
 		}
 
-		list, err := c.model.Ls(dirPath)
+		list, err := c.paneLs(dirPath)
 		if err != nil {
 			fmt.Fprintf(c.view.Details, "\n[::b]Directory info[::-]\n")
 			fmt.Fprintf(c.view.Details, "  [red]Failed to list children:[-] %s\n", err.Error())
@@ -691,6 +754,13 @@ func (c *Controller) guarded(g guard) {
 		c.refuseReadOnly(g.action)
 		return
 	}
+	// A pane pinned to a revision is a snapshot of a moment. Writing from it
+	// would apply the past to the present through a listing that cannot show
+	// the result, so the pane has to come back to the present first.
+	if c.atRevision() {
+		c.refuseAtRevision(g.action)
+		return
+	}
 	for _, p := range g.paths {
 		if prefix, ok := c.policy.protects(p); ok {
 			c.confirmTyped(
@@ -712,6 +782,13 @@ func (c *Controller) guarded(g guard) {
 func (c *Controller) refuseReadOnly(action string) {
 	c.info("Read-only session", fmt.Sprintf(
 		"%s is disabled. Restart without -read-only (or set read_only:false) to make changes.", action))
+}
+
+// refuseAtRevision explains that this pane is a snapshot, and how to leave it.
+func (c *Controller) refuseAtRevision(action string) {
+	c.info("Viewing revision "+strconv.FormatInt(c.rev, 10), fmt.Sprintf(
+		"%s is disabled while this pane is browsing the past. Press Ctrl+G and clear the revision to return to the live cluster.",
+		action))
 }
 
 // confirmTyped runs do only once want has been typed out verbatim. Used both
@@ -854,14 +931,21 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
-	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	capture := func(event *tcell.EventKey) *tcell.EventKey {
 		// Refuse mutating bindings up front in a read-only session, so the
 		// dialog never opens rather than opening and then refusing. The guard
 		// inside each handler is still the authority — this only saves the
-		// user a pointless form.
-		if action, ok := mutatingKeys[event.Key()]; ok && c.policy.ReadOnly {
-			c.refuseReadOnly(action)
-			return nil
+		// user a pointless form. A pane pinned to a past revision is refused
+		// the same way, for the same reason.
+		if action, ok := mutatingKeys[event.Key()]; ok {
+			if c.policy.ReadOnly {
+				c.refuseReadOnly(action)
+				return nil
+			}
+			if c.atRevision() {
+				c.refuseAtRevision(action)
+				return nil
+			}
 		}
 		switch event.Key() {
 
@@ -895,16 +979,22 @@ func (c *Controller) setInput() {
 			return c.importJSON()
 		case tcell.KeyCtrlA:
 			return c.showJournal()
-		case tcell.KeyCtrlH:
-			help := c.view.NewHotkeysModal()
-
-			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
-				c.view.Pages.RemovePage("modal-help")
-				return nil
-			})
-
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 30), true, true)
+		case tcell.KeyCtrlG:
+			return c.goToRevision()
+		case tcell.KeyCtrlU:
+			return c.showSnapshots()
+		case tcell.KeyCtrlB:
+			c.SetDualPane(!c.dual)
 			return nil
+		case tcell.KeyTab, tcell.KeyBacktab:
+			c.switchPane()
+			return nil
+		case tcell.KeyF5:
+			return c.crossTransfer(false)
+		case tcell.KeyF6:
+			return c.crossTransfer(true)
+		case tcell.KeyCtrlH:
+			return c.showHotkeys()
 
 		case tcell.KeyBackspace2:
 			c.Up()
@@ -917,7 +1007,39 @@ func (c *Controller) setInput() {
 			}
 		}
 		return event
+	}
+	// Both panes share one capture: it always acts on whichever pane is
+	// active, and only the active one has the focus.
+	for _, l := range c.view.Lists {
+		if l != nil {
+			l.SetInputCapture(capture)
+		}
+	}
+}
+
+// showHotkeys puts the hotkey reference on screen as a scrollable panel.
+//
+// It has to scroll, and it has to fit: the binding list is longer than a short
+// terminal, and the panel used to be a fixed 30 rows — taller than an 80x24
+// screen — so its last sections were drawn off the bottom with no way to reach
+// them. ModalScroll sizes it to the screen; the capture below only intercepts
+// the keys that mean "close", and hands everything else to the TextView, whose
+// own handler scrolls on the arrows, PgUp/PgDn, Home/End and g/G. The previous
+// capture swallowed *every* key in order to close on any of them, which is
+// what made the panel unscrollable.
+func (c *Controller) showHotkeys() *tcell.EventKey {
+	help := c.view.NewHotkeysModal()
+	help.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch {
+		case ev.Key() == tcell.KeyEsc, ev.Key() == tcell.KeyEnter, ev.Key() == tcell.KeyCtrlH,
+			ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q'):
+			c.view.Pages.RemovePage("modal-help")
+			return nil
+		}
+		return ev
 	})
+	c.view.Pages.AddPage("modal-help", c.view.ModalScroll(help, 70), true, true)
+	return nil
 }
 
 func (c *Controller) Down(cur string) {
@@ -976,11 +1098,22 @@ func (c *Controller) Run() error {
 		return c.view.App.Run()
 	}
 
-	// Normal flow
-	c.view.List.SetChangedFunc(func(i int, main string, secondary string, _ rune) {
-		curMK := strings.TrimSpace(secondary) // mapKey
-		c.fillDetails(curMK)
-	})
+	// Normal flow. Both panes get the handler, but only the active one may
+	// draw the details: rebuilding the parked pane's list also fires its
+	// changed func, and filling details from it would describe a node that is
+	// not under the cursor.
+	for i, l := range c.view.Lists {
+		if l == nil {
+			continue
+		}
+		idx := i
+		l.SetChangedFunc(func(_ int, _ string, secondary string, _ rune) {
+			if idx != c.active {
+				return
+			}
+			c.fillDetails(strings.TrimSpace(secondary))
+		})
+	}
 	c.updateList()
 	c.setInput()
 	return c.view.App.Run()
@@ -1024,11 +1157,42 @@ func (c *Controller) search() *tcell.EventKey {
 	return nil
 }
 
+// deleteNode performs the delete both confirmation paths gate. A directory is
+// exported to a local undo snapshot first, and a snapshot that cannot be
+// written cancels the delete: the alternative is destroying a subtree with
+// nothing to put back.
+func (c *Controller) deleteNode(val *Node) {
+	snapNote := ""
+	if val.node.IsDir {
+		note, ok := c.snapshotForDelete(val.node.Name)
+		if !ok {
+			return
+		}
+		snapNote = note
+	}
+	var err error
+	if val.node.IsDir {
+		err = c.model.DelDir(val.node.Name)
+	} else {
+		err = c.model.Del(val.node.Name)
+	}
+	if err != nil {
+		c.error("Error deleting node", err, false)
+		return
+	}
+	// Remove from injected cache if present
+	c.removeWritten(val.node)
+	c.view.Details.Clear()
+	c.updateList()
+	if snapNote != "" {
+		c.info(c.writeHeader("Deleted "+val.node.Name), snapNote)
+	}
+}
+
 func (c *Controller) delete() *tcell.EventKey {
 	if c.view.List.GetItemCount() == 0 {
 		return nil
 	}
-	var err error
 	i := c.view.List.GetCurrentItem()
 	_, mapKey := c.view.List.GetItemText(i) // secondary text is mapKey
 	mapKey = strings.TrimSpace(mapKey)
@@ -1042,21 +1206,7 @@ func (c *Controller) delete() *tcell.EventKey {
 		return nil
 	}
 
-	doDelete := func() {
-		if !val.node.IsDir {
-			err = c.model.Del(val.node.Name)
-		} else {
-			err = c.model.DelDir(val.node.Name)
-		}
-		if err != nil {
-			c.error("Error deleting node", err, false)
-			return
-		}
-		// Remove from injected cache if present
-		c.removeWritten(val.node)
-		c.view.Details.Clear()
-		c.updateList()
-	}
+	doDelete := func() { c.deleteNode(val) }
 
 	// A recursive delete is the most destructive thing this tool can do — a
 	// single DeleteRange over a fat prefix, with no undo. It gets a
@@ -1108,7 +1258,7 @@ func (c *Controller) create() *tcell.EventKey {
 		c.guarded(guard{action: "create", paths: []string{full}, do: func() {
 			// Refuse to overwrite an existing key or directory silently — the
 			// same guard rename applies.
-			if nd, gerr := c.model.Get(full); gerr == nil && nd != nil {
+			if nd, gerr := c.model.GetAt(full, 0); gerr == nil && nd != nil {
 				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", full), false)
 				return
 			}
@@ -1181,7 +1331,7 @@ func (c *Controller) rename() *tcell.EventKey {
 		// side being protected gates the whole operation.
 		c.guarded(guard{action: "rename", paths: []string{oldPath, newPath}, do: func() {
 			// Refuse to overwrite an existing key or directory silently.
-			if nd, err := c.model.Get(newPath); err == nil && nd != nil {
+			if nd, err := c.model.GetAt(newPath, 0); err == nil && nd != nil {
 				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", newPath), false)
 				return
 			}
@@ -1259,7 +1409,7 @@ func (c *Controller) setTTL() *tcell.EventKey {
 		// one is empty on v3 until fillDetails fetches it, and stale after any
 		// concurrent write. Re-read immediately before the write — this also
 		// stops a TTL change from resurrecting a key deleted in the meantime.
-		fresh, gerr := c.model.Get(val.node.Name)
+		fresh, gerr := c.model.GetAt(val.node.Name, 0)
 		if gerr != nil {
 			c.error("Failed to set TTL", fmt.Errorf("re-reading %s: %w", val.node.Name, gerr), false)
 			return
@@ -1316,7 +1466,7 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 	// own Get error. Opening the editor on that empty string and saving would
 	// silently wipe the key, so re-read it here and refuse to edit what we
 	// cannot read.
-	fresh, gerr := c.model.Get(val.node.Name)
+	fresh, gerr := c.paneGet(val.node.Name)
 	if gerr != nil {
 		c.error("Cannot edit", fmt.Errorf("re-reading %s: %w", val.node.Name, gerr), false)
 		return nil
@@ -1340,11 +1490,18 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 // refused by the policy guard regardless.
 func (c *Controller) openValueEditor(val *Node, initial string) {
 	title := fmt.Sprintf(" Edit (multiline): %s ", val.node.Name)
+	viewOnly := c.policy.ReadOnly || c.atRevision()
 	if c.policy.ReadOnly {
 		title = fmt.Sprintf(" View (read-only): %s ", val.node.Name)
 	}
+	if c.atRevision() {
+		title = fmt.Sprintf(" View at rev %d: %s ", c.rev, val.node.Name)
+	}
 	ta := c.view.NewMultilineEditor(title, initial)
-	if c.policy.ReadOnly {
+	if viewOnly {
+		// Typing into a value that cannot be saved only costs the user their
+		// work. The editor still opens: it is the only way to read a value
+		// past the details pane's preview cap.
 		ta.SetDisabled(true)
 	}
 
@@ -1445,7 +1602,7 @@ func (c *Controller) confirmOverwrite(filename, what string, write func(string))
 
 // writeExport dumps the current subtree to filename as JSON.
 func (c *Controller) writeExport(filename string) {
-	data, err := c.model.Export(c.currentDir)
+	data, err := c.model.ExportAt(c.currentDir, c.rev)
 	if err != nil {
 		c.error("Export failed", err, false)
 		return
@@ -1770,7 +1927,7 @@ func (c *Controller) jump() *tcell.EventKey {
 			}
 		}
 
-		nd, err := c.model.Get(target)
+		nd, err := c.paneGet(target)
 		if err != nil {
 			c.error("Not found", fmt.Errorf("%s", target), false)
 			return
@@ -1845,7 +2002,7 @@ func (c *Controller) findRecursive() *tcell.EventKey {
 		if query == "" {
 			return
 		}
-		nodes, truncated, err := c.model.Search(c.currentDir, query, inValues, searchLimit)
+		nodes, truncated, err := c.model.SearchAt(c.currentDir, query, inValues, searchLimit, c.rev)
 		if err != nil {
 			c.error("Search failed", err, false)
 			return
@@ -1930,7 +2087,7 @@ func (c *Controller) duplicate() *tcell.EventKey {
 		// Only the destination is written; reading from a protected prefix is
 		// harmless, so the source does not gate the copy.
 		c.guarded(guard{action: "copy", paths: []string{dst}, do: func() {
-			if nd, gerr := c.model.Get(dst); gerr == nil && nd != nil {
+			if nd, gerr := c.model.GetAt(dst, 0); gerr == nil && nd != nil {
 				c.error("Target exists", fmt.Errorf("%q already exists; choose a different name", dst), false)
 				return
 			}

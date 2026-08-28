@@ -84,9 +84,29 @@ func (m *Model) AuthLabel() string {
 	return m.authLabel
 }
 
-func (m *Model) Ls(directory string) ([]*Node, error) { return m.backend.ls(directory) }
-func (m *Model) Get(key string) (*Node, error)        { return m.backend.get(key) }
+func (m *Model) Ls(directory string) ([]*Node, error) { return m.backend.ls(directory, 0) }
+func (m *Model) Get(key string) (*Node, error)        { return m.backend.get(key, 0) }
 func (m *Model) Set(key, value string) error          { return m.backend.set(key, value) }
+
+// The *At readers serve the same data as of an etcd revision. rev 0 means
+// "as of now"; a positive rev reads the store as it was at that point, which
+// is what the time-travel browser is built on. Only v3 keeps past revisions —
+// the v2 backend refuses a non-zero rev rather than silently serving current
+// data under a historical label.
+func (m *Model) LsAt(directory string, rev int64) ([]*Node, error) {
+	return m.backend.ls(directory, rev)
+}
+func (m *Model) GetAt(key string, rev int64) (*Node, error) { return m.backend.get(key, rev) }
+func (m *Model) ExportAt(dir string, rev int64) (map[string]string, error) {
+	return m.backend.export(dir, rev)
+}
+func (m *Model) SearchAt(dir, query string, inValues bool, limit int, rev int64) ([]*Node, bool, error) {
+	return m.backend.search(dir, query, inValues, limit, rev)
+}
+
+// Revision reports the cluster's current store revision — the upper bound for
+// a time-travel read, and the anchor for relative ones ("100 revisions ago").
+func (m *Model) Revision() (int64, error) { return m.backend.revision() }
 
 // SetTTL writes key=value with a time-to-live of ttlSeconds. A ttlSeconds <= 0
 // clears any existing expiry (the key becomes permanent).
@@ -107,7 +127,7 @@ func (m *Model) Del(key string) error                         { return m.backend
 func (m *Model) DelDir(key string) error                      { return m.backend.deldir(key) }
 func (m *Model) RenameDir(oldDir, newDir string) error        { return m.backend.renameDir(oldDir, newDir) }
 func (m *Model) RenameKey(oldKey, newKey string) error        { return m.backend.renameKey(oldKey, newKey) }
-func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir) }
+func (m *Model) Export(dir string) (map[string]string, error) { return m.backend.export(dir, 0) }
 
 // CopyKey duplicates a single key (value plus lease/TTL) to a new path,
 // leaving the source untouched.
@@ -121,7 +141,7 @@ func (m *Model) CopyDir(srcDir, dstDir string) error { return m.backend.copyDir(
 // the full key path — and on the value too when inValues is set. It returns
 // at most limit nodes plus whether the result set was truncated at that cap.
 func (m *Model) Search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
-	return m.backend.search(dir, query, inValues, limit)
+	return m.backend.search(dir, query, inValues, limit, 0)
 }
 
 // History returns the stored versions of a key, newest first, at most limit
@@ -153,7 +173,7 @@ func (m *Model) Import(items map[string]string, overwrite bool) (written, skippe
 			continue
 		}
 		if !overwrite {
-			if n, gerr := m.backend.get(key); gerr == nil && n != nil && !n.IsDir {
+			if n, gerr := m.backend.get(key, 0); gerr == nil && n != nil && !n.IsDir {
 				skipped++
 				continue
 			}
@@ -169,8 +189,8 @@ func (m *Model) Import(items map[string]string, overwrite bool) (written, skippe
 type backend interface {
 	proto() string
 	probe() error
-	ls(directory string) ([]*Node, error)
-	get(key string) (*Node, error)
+	ls(directory string, rev int64) ([]*Node, error)
+	get(key string, rev int64) (*Node, error)
 	set(key, value string) error
 	setTTL(key, value string, ttlSeconds int64) error
 	setKeep(key, value string, leaseID, ttlSeconds int64) error
@@ -181,10 +201,12 @@ type backend interface {
 	renameKey(oldKey, newKey string) error
 	copyKey(src, dst string) error
 	copyDir(srcDir, dstDir string) error
-	search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
+	search(dir, query string, inValues bool, limit int, rev int64) ([]*Node, bool, error)
 	history(key string, limit int) ([]*Revision, bool, error)
 	authStatus() (enabled bool, known bool, err error)
-	export(dir string) (map[string]string, error)
+	export(dir string, rev int64) (map[string]string, error)
+	// revision reports the store's current revision.
+	revision() (int64, error)
 }
 
 func NewModel(opts Options) (*Model, error) {
@@ -444,7 +466,29 @@ func withTrail(p string) string {
 	return p + "/"
 }
 
-func (b *v3Backend) ls(directory string) ([]*Node, error) {
+// atRev appends the revision option when rev > 0, so one read path serves both
+// "as of now" and a pinned historical revision. etcd rejects rev <= 0 as an
+// explicit option, which is why 0 means "leave it off" rather than "revision 0".
+func atRev(rev int64, opts ...clientv3.OpOption) []clientv3.OpOption {
+	if rev > 0 {
+		opts = append(opts, clientv3.WithRev(rev))
+	}
+	return opts
+}
+
+// revision reports the store's current revision, taken from the header of a
+// point read of a key nobody has (so the cost is one index lookup, not a scan).
+func (b *v3Backend) revision() (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+	defer cancel()
+	resp, err := b.cli.Get(ctx, "/", clientv3.WithCountOnly())
+	if err != nil {
+		return 0, err
+	}
+	return resp.Header.GetRevision(), nil
+}
+
+func (b *v3Backend) ls(directory string, rev int64) ([]*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 
@@ -452,7 +496,7 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	// details pane re-fetches the focused key anyway. Transferring every value
 	// under the prefix made listing large trees painfully heavy.
 	prefix := withTrail(directory)
-	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	resp, err := b.cli.Get(ctx, prefix, atRev(rev, clientv3.WithPrefix(), clientv3.WithKeysOnly())...)
 	if err != nil {
 		return nil, err
 	}
@@ -521,13 +565,13 @@ func (b *v3Backend) ls(directory string) ([]*Node, error) {
 	return nodes, nil
 }
 
-func (b *v3Backend) get(key string) (*Node, error) {
+func (b *v3Backend) get(key string, rev int64) (*Node, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 
 	k := normPath(key)
 
-	exact, err := b.cli.Get(ctx, k)
+	exact, err := b.cli.Get(ctx, k, atRev(rev)...)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +591,7 @@ func (b *v3Backend) get(key string) (*Node, error) {
 	}
 
 	pfx := withTrail(k)
-	dirProbe, err := b.cli.Get(ctx, pfx, clientv3.WithPrefix(), clientv3.WithLimit(1))
+	dirProbe, err := b.cli.Get(ctx, pfx, atRev(rev, clientv3.WithPrefix(), clientv3.WithLimit(1))...)
 	if err != nil {
 		return nil, err
 	}
@@ -779,7 +823,7 @@ func (b *v3Backend) renameKey(oldKey, newKey string) error {
 	return err
 }
 
-func (b *v3Backend) export(dir string) (map[string]string, error) {
+func (b *v3Backend) export(dir string, rev int64) (map[string]string, error) {
 	timeout := b.timeout * 10
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second
@@ -788,7 +832,7 @@ func (b *v3Backend) export(dir string) (map[string]string, error) {
 	defer cancel()
 
 	prefix := withTrail(dir)
-	resp, err := b.cli.Get(ctx, prefix, clientv3.WithPrefix())
+	resp, err := b.cli.Get(ctx, prefix, atRev(rev, clientv3.WithPrefix())...)
 	if err != nil {
 		return nil, err
 	}
@@ -805,7 +849,7 @@ func (b *v3Backend) export(dir string) (map[string]string, error) {
 	return result, nil
 }
 
-func (b *v3Backend) search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
+func (b *v3Backend) search(dir, query string, inValues bool, limit int, rev int64) ([]*Node, bool, error) {
 	timeout := b.timeout * 10
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second
@@ -814,7 +858,7 @@ func (b *v3Backend) search(dir, query string, inValues bool, limit int) ([]*Node
 	defer cancel()
 
 	prefix := withTrail(dir)
-	opts := []clientv3.OpOption{clientv3.WithPrefix()}
+	opts := atRev(rev, clientv3.WithPrefix())
 	if !inValues {
 		// Path-only search never looks at values; keep the sweep keys-only.
 		opts = append(opts, clientv3.WithKeysOnly())
@@ -964,11 +1008,28 @@ func (b *v2Backend) proto() string { return "v2" }
 // probe checks reachability with a non-recursive root listing, which v2
 // serves cheaply (single level, no subtree walk).
 func (b *v2Backend) probe() error {
-	_, err := b.ls("/")
+	_, err := b.ls("/", 0)
 	return err
 }
 
-func (b *v2Backend) ls(directory string) ([]*Node, error) {
+// noRevisions rejects a historical read on the v2 store, which keeps no past
+// revisions at all. Serving current data under a historical label would be
+// worse than refusing: every value on screen would be a lie.
+func noRevisions(rev int64) error {
+	if rev > 0 {
+		return fmt.Errorf("browsing revision %d requires etcd v3 (the v2 store keeps no past revisions)", rev)
+	}
+	return nil
+}
+
+func (b *v2Backend) revision() (int64, error) {
+	return 0, fmt.Errorf("revisions require etcd v3 (the v2 store has no store revision)")
+}
+
+func (b *v2Backend) ls(directory string, rev int64) ([]*Node, error) {
+	if err := noRevisions(rev); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	resp, err := b.api.Get(ctx, directory,
@@ -993,7 +1054,10 @@ func (b *v2Backend) ls(directory string) ([]*Node, error) {
 	return nds, nil
 }
 
-func (b *v2Backend) get(key string) (*Node, error) {
+func (b *v2Backend) get(key string, rev int64) (*Node, error) {
+	if err := noRevisions(rev); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	resp, err := b.api.Get(ctx, normPath(key), nil)
@@ -1187,7 +1251,10 @@ func (b *v2Backend) renameKey(oldKey, newKey string) error {
 	return err
 }
 
-func (b *v2Backend) export(dir string) (map[string]string, error) {
+func (b *v2Backend) export(dir string, rev int64) (map[string]string, error) {
+	if err := noRevisions(rev); err != nil {
+		return nil, err
+	}
 	timeout := b.timeout * 10
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second
@@ -1217,7 +1284,10 @@ func v2collectKeys(nodes clientv2.Nodes, result map[string]string) {
 	}
 }
 
-func (b *v2Backend) search(dir, query string, inValues bool, limit int) ([]*Node, bool, error) {
+func (b *v2Backend) search(dir, query string, inValues bool, limit int, rev int64) ([]*Node, bool, error) {
+	if err := noRevisions(rev); err != nil {
+		return nil, false, err
+	}
 	timeout := b.timeout * 10
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second

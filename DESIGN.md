@@ -69,14 +69,22 @@ etcd-walker/
 │   │   ├── controller.go
 │   │   ├── history.go          revision-history viewer (picker/detail/diff/restore)
 │   │   ├── journal.go          session journal + dry-run model decorator
+│   │   ├── timetravel.go       revision picker + pinning a pane to the past
+│   │   ├── panes.go            two-pane state swap + cross-pane copy/move
+│   │   ├── snapshot.go         undo snapshots for recursive deletes
 │   │   ├── controller_test.go  fakeModel + headless tview drive the flows
 │   │   ├── history_test.go
 │   │   ├── journal_test.go
 │   │   ├── policy_test.go
+│   │   ├── timetravel_test.go
+│   │   ├── panes_test.go
+│   │   ├── snapshot_test.go
+│   │   ├── integration_test.go `integration`-tagged: delete/restore + history
 │   │   ├── flows_test.go       dialog flows driven headlessly (create/dup/jump)
 │   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
-│   │   └── view.go
+│   │   ├── view.go
+│   │   └── view_test.go        layout + focus (a lost focus kills every binding)
 │   └── util/clip/           clipboard with OSC52 fallback
 │       ├── clip.go
 │       └── clip_test.go
@@ -96,12 +104,11 @@ etcd-walker/
 ```
 
 The codebase is intentionally small and flat — one production file per
-package, except `pkg/controller`, where two self-contained flows are kept
-out of the already-large `controller.go`: `history.go` (the revision-history
-screens) and `journal.go` (the session journal and its model decorator).
-Almost every file has a sibling `_test.go` (only `pkg/view`, pure widget
-construction, has none), so newcomers can read it end-to-end in a single
-sitting.
+package, except `pkg/controller`, where self-contained flows are kept out of
+the already-large `controller.go`: `history.go` (the revision-history
+screens), `journal.go` (the session journal and its model decorator),
+`timetravel.go`, `panes.go` and `snapshot.go` (§14). Every file has a sibling
+`_test.go`, so newcomers can read it end-to-end in a single sitting.
 
 ---
 
@@ -173,8 +180,9 @@ to branch on protocol.
 type backend interface {
     proto() string
     probe() error
-    ls(dir string) ([]*Node, error)
-    get(path string) (*Node, error)
+    ls(dir string, rev int64) ([]*Node, error)
+    get(path string, rev int64) (*Node, error)
+    revision() (int64, error)
     set(path, value string) error
     setTTL(path, value string, ttlSeconds int64) error
     setKeep(path, value string, leaseID, ttlSeconds int64) error
@@ -185,12 +193,17 @@ type backend interface {
     renameKey(oldPath, newPath string) error
     copyKey(src, dst string) error
     copyDir(srcDir, dstDir string) error
-    search(dir, query string, inValues bool, limit int) ([]*Node, bool, error)
+    search(dir, query string, inValues bool, limit int, rev int64) ([]*Node, bool, error)
     history(key string, limit int) ([]*Revision, bool, error)
     authStatus() (enabled bool, known bool, err error)
-    export(dir string) (map[string]string, error)
+    export(dir string, rev int64) (map[string]string, error)
 }
 ```
+
+Every read carries a revision (`0` = as of now) rather than coming in live
+and historical variants: with two spellings, a caller browsing the past
+could reach live data by picking the wrong method name, and the result
+would look plausible. See §14.1.
 
 Two implementations satisfy it:
 
@@ -376,8 +389,12 @@ surfaces as-is.
 * `App` — the `tview.Application`.
 * `Frame` — the outer chrome with the status header.
 * `Pages` — a stack of overlay pages used for modal dialogs.
-* `List` — the left pane: the directory listing.
-* `Details` — the right pane: metadata about the highlighted node.
+* `Lists` / `List` — the two browser panes and a pointer to the focused one
+  (§14.3).
+* `Details` — metadata about the highlighted node.
+* `ModalEdit` / `ModalScroll` — the two centering helpers. `ModalEdit` takes a
+  fixed width and height; `ModalScroll` takes a width and lets the height
+  follow the screen, for panels whose content can outgrow the terminal.
 * Constructors for the dialogs (create, edit, rename, set-TTL,
   delete-confirm, typed-confirm, file-overwrite prompt, search,
   recursive-find form, results picker — reused by search results, the
@@ -395,6 +412,16 @@ Key design decisions:
   page name `"modal"`, so a handler must remove the current dialog **before**
   showing a follow-up (e.g. an error) — a deferred remove would delete the
   follow-up instead.
+* **A modal that swallows every key cannot scroll.** The hotkey panel closed
+  on *any* keystroke, which was implemented as an input capture returning
+  `nil` for everything — so the arrows, `PgUp`/`PgDn` and `Home`/`End` never
+  reached the `TextView`'s own handler and its content below the fold was
+  unreachable. The capture now intercepts only `Esc`/`q`/`Enter`/`Ctrl+H` and
+  returns every other event. The panel was *also* a fixed 30 rows on a
+  24-row terminal, where scrolling would not have helped either: the rows
+  past the screen edge are never drawn, so `ModalScroll` sizes it to the
+  screen. `TestHotkeysPanelFitsAShortTerminal` renders it on a simulation
+  screen at 80x24 and asserts the frame closes.
 * The full-screen multi-line editor swaps the application root
   (`OpenEditor`/`CloseEditor`), hiding the frame and hotkey legend so it can
   use the entire terminal; it is not a `Pages` modal. A consequence: no
@@ -418,17 +445,28 @@ lives.
 
 ```go
 type Controller struct {
-    view         *view.View
-    model        modelAPI                    // journalling wrapper in production
-    policy       Policy                      // read-only / dry-run / protected (§13)
-    journal      *Journal                    // what this session changed (§13.4)
+    view     *view.View
+    model    modelAPI                    // journalling wrapper in production
+    policy   Policy                      // read-only / dry-run / protected (§13)
+    journal  *Journal                    // what this session changed (§13.4)
+    injected map[string]map[string]*model.Node
+    endpoint string                      // host:port, recorded in snapshots (§14.2)
+
+    paneState        // the ACTIVE pane, embedded (§14.3)
+    inactive paneState
+    dual     bool
+    active   int
+
+    startupErr error
+}
+
+type paneState struct {
     currentDir   string
-    currentNodes map[string]*Node            // mapKey → Node
-    position     map[string]int              // dir path → cursor index
-    injected     map[string]map[string]*model.Node
-    ordered      []string                    // display names, list order
-    lastGoodDir  string                      // fallback for failed listings
-    startupErr   error
+    currentNodes map[string]*Node  // mapKey → Node
+    position     map[string]int    // dir path → cursor index
+    ordered      []string          // display names, list order
+    lastGoodDir  string            // fallback for failed listings
+    rev          int64             // pinned revision, 0 = live (§14.1)
 }
 
 type Node struct {
@@ -460,6 +498,11 @@ type Node struct {
 * `lastGoodDir` — the most recent directory that listed successfully; a
   failed listing reports the error and falls back here instead of aborting
   the session (§9.2).
+* `rev` — the revision this pane reads at; `0` means the live cluster. Every
+  read goes through `paneLs`/`paneGet`, which apply it (§14.1).
+* `paneState` is **embedded** so all of the above stay addressable as
+  `c.currentDir`, `c.currentNodes` and so on: the controller always acts on
+  the active pane, and the second pane is parked in `inactive` (§14.3).
 * `startupErr` — captured from `model.NewModel`; instead of crashing the
   process the controller renders the error inside the TUI on
   `Run()`, so a bad config produces a friendly screen rather than a stack
@@ -676,13 +719,13 @@ trace without disturbing the interface.
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.9.0**, duplicated in three places
+The current user-facing version is **0.10.0**, duplicated in three places
 that must be bumped together (`TestVersionIsConsistentAcrossTheRepo` fails if
 they drift, and it has caught a partial bump):
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
   — the `appVersion` constant the header string interpolates.
-* `VERSION ?= 0.9.0` in the `Makefile` (overridable on the CLI:
+* `VERSION ?= 0.10.0` in the `Makefile` (overridable on the CLI:
   `make debs VERSION=…`).
 * The `version=` variable at the top of `build-deb.sh` (the legacy helper;
   `build-deb-arm64.sh` just delegates to it).
@@ -1008,3 +1051,131 @@ demands the directory's own name be typed out.
 directory asks once — for the prefix — rather than making the user type two
 different words for one action. Single keys keep the lighter ok/cancel: the
 blast radius is one key, and the journal now records what it was.
+
+---
+
+## 14. Time travel, undo snapshots and two panes
+
+Three features shipped together in 0.10.0. They are grouped here because they
+share one idea: *the browser should be able to show more than one moment, and
+undo the moment it destroys.*
+
+### 14.1 Time travel (F-19)
+
+etcd's revision counter is global and monotonic. That makes "the keyspace as
+it was" a single extra option on the reads the walker already issues, rather
+than a feature that has to reconstruct anything: `clientv3.WithRev(rev)` on
+the same range/point gets.
+
+**Where the revision lives.** On `paneState.rev`, not on the model. The model
+gained an explicit `rev` parameter on every read (`ls`, `get`, `export`,
+`search`) and a `revision()` reporting the store's current one; the controller
+reads through `paneLs`/`paneGet`, which carry the active pane's value. Putting
+it in the pane is what makes "yesterday on the left, today on the right" fall
+out of the two-pane work for free.
+
+**Why an explicit parameter and not two method families.** A live `Ls` beside
+a historical `LsAt` invites exactly one bug: a read site that picks the live
+name while the pane is pinned. The result is not an error — it is today's data
+under a historical title, which is worse. With one signature the revision is
+impossible to omit; a write path that genuinely means "check the cluster now"
+spells that out as `GetAt(key, 0)`.
+
+**A pinned pane is read-only.** `guarded` refuses every mutation while
+`rev > 0`, and the binding-level check refuses the dialogs up front, the same
+two layers read-only mode uses. `Ctrl+E` still opens — reading a historical
+value in full is the point — but disabled. The alternative, letting a write
+through, would apply the past to the present through a listing that cannot
+show the result.
+
+**Compaction is the boundary, and it is reported.** `applyRevision` performs
+the listing *before* committing to the new revision: if the read fails the
+pane stays where it was and the error explains that the revision has been
+compacted away. Switching first and failing afterwards would strand the user
+in a pane where every read errors.
+
+**Input.** The picker takes an absolute revision, `-N` for N revisions back
+(resolved against `Revision()`, because nobody knows the absolute number
+during an incident), or nothing to return to live. A future revision is
+rejected up front: etcd *blocks* on one rather than erroring.
+
+`TestIntegrationReadsAtPastRevision` pins the semantics against a real
+cluster — including a deleted key becoming readable again at an earlier
+revision, which no fake could establish.
+
+### 14.2 Undo snapshots (N-25)
+
+Before every recursive directory delete the subtree is exported to
+`$XDG_STATE_HOME/etcd-walker/snapshots` (`ETCD_WALKER_STATE_DIR` overrides),
+and `Ctrl+U` browses those files to restore or discard one.
+
+**Failing closed.** If the snapshot cannot be written, the delete does not
+happen. A safety net that silently degrades when the disk is full is worse
+than none, because the user has stopped watching for the fall. `-no-snapshot`
+is the deliberate opt-out, and the error message names it.
+
+**Restore is an ordinary bulk write.** It goes through `Model.Import`, so it
+inherits the policy guard, the typed confirmation for protected prefixes, the
+journal and dry-run without a line of its own. The overwrite/skip question is
+asked rather than assumed: keys may exist again by the time anyone restores.
+
+**Binary values are base64.** `encoding/json` rewrites invalid UTF-8 as
+U+FFFD, so a value containing a raw `0xff` byte stored in the plain map comes
+back *different from what was deleted*. An undo that corrupts what it restores
+is not an undo, so non-UTF-8 values go into a separate `binary_keys` map,
+encoded. Text values stay in `keys` in the same shape as the JSON export, so a
+snapshot is still a file a human can read. This was found by
+`TestIntegrationDeleteSnapshotRestoreRoundTrip` against a real cluster — the
+hermetic tests had happily agreed with the broken behaviour.
+
+**Scope.** Directory deletes only. A single key is recoverable from its own
+revision history (§5.6) on v3, and a file per key would bury the snapshots
+that matter.
+
+### 14.3 Two panes (F-20)
+
+`Ctrl+B` shows a second pane, `Tab` switches, `F5`/`F6` copy or move the
+selected entry into the other pane's directory.
+
+**One embedded state, one swap.** The controller embeds the active
+`paneState` and parks the other in `inactive`. Switching is a single struct
+assignment:
+
+```go
+c.paneState, c.inactive = c.inactive, c.paneState
+```
+
+That is the whole design decision. Every handler keeps addressing
+`c.currentDir` and `c.currentNodes` and automatically acts on the focused
+pane, and a field added to `paneState` cannot be forgotten by the switch —
+which a hand-written six-field swap absolutely would, leaving a pane's cursor
+and its listing describing different directories.
+`TestSwapPanesMovesEveryField` reflects over the struct so growing it stays a
+deliberate act.
+
+**Widgets versus state.** `view.Lists[2]` holds both list widgets and
+`view.List` points at the focused one. Collapsing back to a single pane moves
+the *widget* (`active = 0`) and never the state — swapping there would drop
+the user into the other pane's directory, a silent jump. That distinction was
+wrong in the first draft and a test caught it.
+
+**Refreshing the other pane.** `withOtherPane` swaps in, runs `updateList`,
+and swaps back, because every helper addresses the active pane by definition.
+Both lists carry the details-refresh handler, guarded by pane index: rebuilding
+the parked list also fires its changed callback, and filling the details pane
+from it would describe a node nobody is looking at.
+
+**Cross-pane transfers** reuse `CopyKey`/`CopyDir`/`RenameKey`/`RenameDir`
+and go through `guarded` like any other write, so read-only, protected
+prefixes, dry-run and the journal all cover them for free. Writing into a pane
+that is pinned to a revision is refused: the data would land somewhere that
+pane cannot show.
+
+**The focus trap.** `tview` resolves focus when the root is set, by descending
+into the root primitive's items. The first draft rooted the layout `Flex`
+while it was still empty and filled it afterwards — so nothing had focus, and
+because every binding is installed as an *input capture on the list*, the
+running application started with the entire keyboard dead while looking
+perfectly normal. `NewView` now populates the layout before `SetRoot` and sets
+the focus explicitly; `TestNewViewFocusesTheFirstPane` pins it. Only a live
+run surfaced this: no unit test that calls handlers directly can.
