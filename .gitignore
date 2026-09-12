@@ -25,5 +25,13 @@ Thumbs.db
 *~
 .idea/
 
-# coverage output from `make cover` / CI
+# coverage output from `make cover` / CI, and the HTML report
+# `go tool cover -html=coverage.out -o coverage.html` writes next to it.
 coverage.out
+coverage.html
+
+# Local Go tooling state: a `go.work` used to point the module at a checkout
+# elsewhere, and `go mod vendor` output. Neither belongs to the project.
+go.work
+go.work.sum
+/vendor/

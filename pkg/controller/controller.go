@@ -169,7 +169,7 @@ func splitFunc(r rune) bool { return r == '/' }
 
 // appVersion is the user-facing version. DESIGN §9.3: it is duplicated in the
 // Makefile and build-deb.sh, and all three must move together until F-3 lands.
-const appVersion = "0.10.0"
+const appVersion = "0.10.1"
 
 // headerText renders the frame's status line and the colour that goes with it.
 // It is separated from NewController so it can be tested without dialling a

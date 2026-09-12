@@ -428,9 +428,10 @@ It defaults to `127.0.0.1:2379` and takes `ETCD_WALKER_TEST_ENDPOINT`,
 environment. Everything it writes goes under a unique `/etcd-walker-it/…`
 prefix and is removed afterwards.
 
-CI runs the unit suite (plus `-race`), a gofmt/vet check, cross-builds for
-linux amd64/arm64 and freebsd, and the integration suite against an etcd
-service container on every push and pull request.
+CI runs the unit suite (plus `-race` and a coverage artifact), a
+gofmt/vet/staticcheck check, cross-builds for linux amd64/arm64 and freebsd,
+and the integration suite against an etcd service container — on every pull
+request and on every push to `master`/`main`.
 
 ---
 
@@ -519,11 +520,13 @@ The resulting package is written to `build/etcd-walker_<version>_<arch>.deb`.
 ./etcd-walker [-config path] [-host host] [-port port] [-protocol v2|v3|auto] \
               [-username user] [-password pass] [-debug] \
               [-tls] [-tls-ca path] [-tls-cert path] [-tls-key path] \
-              [-tls-skip-verify] [-timeout seconds]
+              [-tls-skip-verify] [-timeout seconds] \
+              [-read-only] [-dry-run] [-protect prefixes] \
+              [-no-snapshot] [-dual]
 ```
 
 Default values: host `127.0.0.1`, port `2379`, protocol `auto`,
-debug `false`, timeout `5s`.
+debug `false`, timeout `5s`, undo snapshots **on**, single pane.
 
 ---
 

@@ -89,7 +89,7 @@ etcd-walker/
 │       ├── clip.go
 │       └── clip_test.go
 │
-├── .github/workflows/ci.yml  build/vet/gofmt/test/-race, cross-build, etcd
+├── .github/workflows/ci.yml  gofmt/vet/staticcheck/test/-race, cross-build, etcd
 ├── resources/               screenshots, icons
 ├── examples/                import-sample.json for the JSON import feature
 ├── DEBIAN/                  Debian packaging metadata
@@ -100,6 +100,7 @@ etcd-walker/
 ├── go.mod / go.sum
 ├── LICENSE
 ├── README.md
+├── ROADMAP.md               prioritized feature backlog
 └── DESIGN.md                this document
 ```
 
@@ -250,11 +251,11 @@ worth calling out:
 
 `authStatus()` returns a `(enabled, known, err)` triple rather than a string
 so the controller can distinguish "auth is off" from "couldn't determine"
-and render the header label (`ON` / `OFF` / `?`) accordingly. Note that
-today only the explicit-`v3` arm of `NewModel` actually calls it — in
-`auto` and `v2` modes `authLabel` is never populated and the header shows
-`?` (and `v2Backend.authStatus`, though implemented and tested, is dead in
-production). Fixing this is on the roadmap (F-2).
+and render the header label (`ON` / `OFF` / `?`) accordingly. Every arm of
+`NewModel` — `v3`, both halves of `auto`, and `v2` — runs its connected
+backend through the `authLabelOf` helper, so the label is populated in every
+mode and `v2Backend.authStatus` is live in production. It used not to be:
+only the explicit-`v3` arm called it, which is finding B-2 in §12.
 
 ### 5.2 Protocol selection
 
@@ -513,22 +514,28 @@ type Node struct {
 `setInput()` installs two `SetInputCapture` callbacks:
 
 * On the global `App`: `Ctrl+Q` quits.
-* On the `List` widget: every other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`,
-  `Ctrl+E`, `Ctrl+R`, `Ctrl+T`, `Ctrl+V`, `Ctrl+P`, `Ctrl+Y`, `Ctrl+S`, `/`,
-  `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+A`, `Ctrl+H`, `Backspace`).
+* On **both** panes' lists — one shared capture, since it always acts on
+  whichever pane is active and only that one has the focus (§14.3): every
+  other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`, `Ctrl+E`, `Ctrl+R`, `Ctrl+T`,
+  `Ctrl+V`, `Ctrl+G`, `Ctrl+U`, `Ctrl+B`, `Tab`, `F5`, `F6`, `Ctrl+P`,
+  `Ctrl+Y`, `Ctrl+S`, `/`, `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+A`,
+  `Ctrl+H`, `Backspace`).
 
-  This handler starts by consulting `mutatingKeys`: in a read-only session the
-  bindings that change state are refused here, so the dialog never opens
-  (§13.2). It is a convenience, not the enforcement point — that is `guarded`.
+  This handler starts by consulting `mutatingKeys`: in a read-only session —
+  or one whose pane is pinned to a past revision (§14.1) — the bindings that
+  change state are refused here, so the dialog never opens (§13.2). It is a
+  convenience, not the enforcement point — that is `guarded`.
 
 Each hotkey calls a small method (`create`, `duplicate`, `delete`,
-`editMultiline`, `rename`, `setTTL`, `history`, `copyPath`, `copyValue`,
-`search`, `findRecursive`, `jump`, `export`, `importJSON`, `showJournal`)
-which opens the appropriate dialog and, on submission, calls into the model
-and then `updateList()` to refresh the listing. `findRecursive` chains two
-dialogs:
-the query form, then a results picker whose selection hands the node to
-`navigateTo` — the shared helper (also used by `jump`) that enters a
+`editMultiline`, `rename`, `setTTL`, `history`, `goToRevision`,
+`showSnapshots`, `crossTransfer`, `copyPath`, `copyValue`, `search`,
+`findRecursive`, `jump`, `export`, `importJSON`, `showJournal`) which opens
+the appropriate dialog and, on submission, calls into the model and then
+`updateList()` to refresh the listing. The two pane bindings are the
+exception: `Ctrl+B` calls `SetDualPane` and `Tab` calls `switchPane`, both of
+which rearrange widgets and state without a dialog. `findRecursive` chains
+two dialogs: the query form, then a results picker whose selection hands the
+node to `navigateTo` — the shared helper (also used by `jump`) that enters a
 directory or selects a key in its parent. `history` chains up to four
 screens (§7.5).
 
@@ -656,9 +663,11 @@ remove-before-add rule (§6):
    coloring and long unchanged runs collapsed to `··· N unchanged lines
    ···` around 3 lines of context. Binary values and values whose line
    product exceeds `maxDiffCells` (the DP table bound) fall back to a plain
-   notice instead of a diff. The diff compares against `revs[0]` — the
-   current value as of the walk — so the whole flow reasons about one
-   consistent snapshot.
+   notice instead of a diff. The right-hand side is re-read from the
+   cluster when the diff opens rather than taken from `revs[0]` — that
+   entry is a snapshot from when the picker was built, and this is the
+   screen where someone decides whether to restore. The header names the
+   live `ModRev` and warns when the key changed in between (O-3 in §12).
 4. **Restore confirm** — cancel returns to the detail screen; confirm calls
    `restoreRevision`, which re-reads the key and writes the old value via
    `SetKeepTTL` with the key's *live* lease/TTL, honouring the same
@@ -719,13 +728,13 @@ trace without disturbing the interface.
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.10.0**, duplicated in three places
+The current user-facing version is **0.10.1**, duplicated in three places
 that must be bumped together (`TestVersionIsConsistentAcrossTheRepo` fails if
 they drift, and it has caught a partial bump):
 
 * The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
   — the `appVersion` constant the header string interpolates.
-* `VERSION ?= 0.10.0` in the `Makefile` (overridable on the CLI:
+* `VERSION ?= 0.10.1` in the `Makefile` (overridable on the CLI:
   `make debs VERSION=…`).
 * The `version=` variable at the top of `build-deb.sh` (the legacy helper;
   `build-deb-arm64.sh` just delegates to it).
@@ -775,7 +784,7 @@ Three layers, all runnable from the Makefile:
 |-------|---------|----------------|
 | Unit | `make test` / `make test-race` | Everything below, against in-memory fakes. Hermetic — no network, no screen. |
 | Coverage | `make cover` | Prints the total; `coverage.out` is git-ignored. |
-| Integration | `make test-integration` | The `integration`-tagged suite in `pkg/model`, against a **real etcd**. |
+| Integration | `make test-integration` | The `integration`-tagged suites in `pkg/model` and `pkg/controller`, against a **real etcd**. |
 
 **The fakes.** `pkg/model` drives the v3 backend through an in-memory
 `clientv3.KV` that models revision history, compaction and per-key leases,
@@ -789,10 +798,13 @@ function, so `Pages.GetFrontPage()` hands back the widget itself; from there
 and `GetButton(GetButtonIndex("Save"))` fires a form button. That is how
 `create`/`duplicate`/`jump`/import validation are covered without a terminal.
 
-**What is deliberately not unit-tested.** `pkg/view` is pure widget
-construction (0%), and `main()`/`Run()` are wiring — the logic they used to
-hide has been pulled out into `resolve()` and `headerText()`, which are
-tested directly.
+**What is deliberately not unit-tested.** `main()`/`Run()` are wiring — the
+logic they used to hide has been pulled out into `resolve()` and
+`headerText()`, which are tested directly. `pkg/view` is mostly widget
+construction and stays the thinnest layer (~32%); what *is* covered there is
+the part where a mistake kills the whole UI — that the layout gives a pane
+the focus, and that the hotkey panel fits a short terminal — both found by
+running the app, not by calling a handler.
 
 **Why an integration suite exists at all.** Lease sharing, MVCC revision
 walks and prefix-range boundaries are etcd semantics, not ours; a fake can
@@ -869,7 +881,7 @@ id, limitations an `L-` id; the roadmap references them.
 | B-12 | `controller.go` `export`, `view.go` | Export walks the whole subtree under the current directory, but the doc comment, hotkey help and modal title all said "current dir keys" — exporting `/` silently dumped the entire cluster. Wording corrected; behaviour unchanged. | 2026-08-11 |
 | B-13 | `history.go` titles and text | tview's colour-tag parser matches `[a-zA-Z]+` inside brackets and consumes it, in `Box` titles (`Print`) as much as in `TextView` text. Every hotkey hint on the revision-history screens was unescaped, so the detail title rendered as `/k @ rev 5 —  restore ·  diff vs current ·  back` — the keys themselves invisible. Key names in those titles were unescaped too. Now routed through `tview.Escape`; the legend in `view.go` already did this for `[Del[]`. | 2026-08-11 |
 | O-1 | `controller.go` `export` | Wrote over an existing file with no confirmation. Export now `Stat`s the target and raises an overwrite prompt; the write itself moved into `writeExport`. | 2026-08-11 |
-| O-2 | `history.go` `showRevisionDetail` | Rendered a printable revision value in full and uncapped, while the details pane capped at 512 B and hex at 1 kB — a multi-megabyte value stalled the draw. Now capped at `historyValueLimit` (8 kB) with an `[f]` binding that re-renders uncapped, for the hex branch too. | 2026-08-11 |
+| O-2 | `history.go` `showRevisionDetail` | Rendered a printable revision value in full and uncapped, while the details pane capped at 512 B (`previewLimit`) and hex at 256 B (`hexLimit`) — a multi-megabyte value stalled the draw. Now capped at `historyValueLimit` (8 kB) with an `[f]` binding that re-renders uncapped, for the hex branch too. | 2026-08-11 |
 | O-3 | `history.go` `showRevisionDiff` | Diffed against `revs[0]` — the newest revision *as of when the picker opened* — and labelled it "current". Now re-reads the key, diffs against that, labels the right-hand side with the live `ModRev`, and warns when the key drifted since the history was read. A key that vanished meanwhile errors instead of diffing against a snapshot. | 2026-08-11 |
 | B-14 | `controller.go` `confirmTyped` | Declining a protected-path confirmation queued a "Cancelled" notice on `Pages` **and then** ran `onCancel`, which re-opens the value editor via `App.SetRoot`. The notice was hidden behind the editor's root and resurfaced when the editor closed — drawn over a list that already held the focus, i.e. a visible modal the keyboard was not talking to. The notice is now skipped whenever a caller takes the screen back; the re-opened editor is the feedback. | 2026-08-16 |
 | B-15 | `controller.go` post-mutation cache updates | Under `-dry-run` the six post-write `injectNode`/`removeInjected`/`reinjectRename` calls still ran, so a rehearsed create of an underscore-prefixed key put a phantom row in the listing (and a rehearsed delete removed a row for a key that still existed) — the ghost-row class of B-8, reintroduced through the rehearsal path. They now go through `injectWritten`/`removeWritten`/`reinjectWritten`, which no-op under dry-run. `navigateTo` deliberately still injects directly: a jumped-to key really is on the server. | 2026-08-16 |
@@ -930,9 +942,10 @@ described together because they interlock.
 
 ```go
 type Policy struct {
-    ReadOnly          bool     // refuse every mutating action
-    ProtectedPrefixes []string // subtrees needing a typed confirmation
-    DryRun            bool     // record changes instead of making them (§13.4)
+    ReadOnly             bool     // refuse every mutating action
+    ProtectedPrefixes    []string // subtrees needing a typed confirmation
+    DryRun               bool     // record changes instead of making them (§13.4)
+    SnapshotBeforeDelete bool     // export a subtree before deleting it (§14.2)
 }
 ```
 

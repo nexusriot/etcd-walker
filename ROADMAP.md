@@ -1,15 +1,16 @@
 # Etcd-walker — Roadmap
 
-Prioritized backlog, last revised 2026-08-28. Bug ids (`B-*`) and limitation
+Prioritized backlog, last revised 2026-09-12. Bug ids (`B-*`) and limitation
 ids (`L-*`) refer to [DESIGN.md §12](DESIGN.md); feature ids (`F-*`, `N-*`)
 are referenced back from there and from §13. Nothing here is scheduled — it
 is an ordered menu.
 
-The current version is **0.10.0**, which adds time-travel browsing (F-19),
-undo snapshots for recursive deletes (N-25) and the two-pane layout (F-20),
+The current version is **0.10.1**, a documentation-accuracy pass over the
+0.10.0 feature round. 0.10.0 added time-travel browsing (F-19), undo
+snapshots for recursive deletes (N-25) and the two-pane layout (F-20),
 described in [DESIGN.md §14](DESIGN.md). 0.9.0 carried the safety work
 (F-4, F-5, N-6, N-11, N-14, N-21) and every fix from the B-1..B-18 rounds.
-Note that the last tag is 0.6.0.
+Note that the last tag is 0.9.0, so 0.10.x is unreleased so far.
 
 ## 0. Open findings — all cleared
 
@@ -72,7 +73,6 @@ N-1 (CAS-safe writes).
 | Id | Feature | Sketch |
 |----|---------|--------|
 | F-1 | **Watch mode / live refresh** | Toggleable (hotkey — `Ctrl+G` and `Ctrl+B` are taken as of 0.10.0) v3 `Watch` on the current prefix (v2: polling fallback) that re-runs `updateList` via `App.QueueUpdateDraw` on events. Indicator in the header. The single most useful addition for anyone staring at a changing cluster. |
-| F-2 | **Auth label everywhere** | Same as B-2 above — the feature half is showing `ON/OFF` in `auto`/`v2` modes. |
 | F-3 | **`-version` flag + single-sourced version** | `var version = "dev"` + `-ldflags "-X main.version=$(VERSION)"` in the Makefile; header reads it, `-version` prints it. Kills the three-place bump documented in DESIGN §9.3. |
 | ~~F-4~~ | **Read-only mode** — shipped in 0.9.0 | `-read-only` flag / `"read_only": true` config: mutating hotkeys show a "read-only session" modal instead of acting; header shows `[RO]`. Cheap insurance for browsing production. |
 | ~~F-5~~ | **Type-to-confirm for recursive deletes** — shipped in 0.9.0 | For directory deletes, require typing the basename (à la GitHub repo deletion) instead of a bare ok/cancel — a recursive `DeleteRange` on a fat prefix is the most destructive thing the tool can do. |
@@ -141,6 +141,7 @@ Ideas the deep review turned up, roughly by value-per-effort.
 | F-5 | **Type-to-confirm recursive deletes** — a directory delete demands its own name typed out; a protected path supersedes the word so one action never asks twice. DESIGN §13.5. | 0.9.0 |
 | N-6 | **Session journal** — `Ctrl+A`: every mutation recorded by a decorator around `modelAPI` (exact args, only on success), exportable as an etcdctl script or to the clipboard. Unreproducible ops are comments, never plausible-but-wrong commands. DESIGN §13.4. | 0.9.0 |
 | N-21 | **Dry-run** — `-dry-run` / `"dry_run"`. Falls out of the journal decorator: record and skip. DESIGN §13.4. | 0.9.0 |
+| F-2 | **Auth label everywhere** — the feature half of B-2: `authLabelOf` runs in every arm of `NewModel`, so `auto` and `v2` sessions show a real `ON`/`OFF` instead of `?`. DESIGN §5.1. | 0.9.0 |
 | F-7 | **Revision history viewer (v3)** — `Ctrl+V`: revision picker (`Get`+`WithRev` walk, compaction-aware), detail view, LCS line-diff vs current, restore via `SetKeepTTL` (lease/TTL preserved). DESIGN §5.6/§7.5. | 0.8.0 |
 
 ## Non-goals (for now)
