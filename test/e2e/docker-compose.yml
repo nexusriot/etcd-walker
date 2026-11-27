@@ -10,6 +10,13 @@
 #   etcd-auth  etcd 3.5; the harness enables auth (root/rootpw, ro/ropw) and the
 #              5 s simple-token TTL exercises token expiry
 #   etcd-tls   etcd 3.5 over HTTPS with client-certificate auth (mTLS)
+#
+# The 3.5 clusters run with --unsafe-no-fsync. On CI runners an fsync of the
+# WAL can stall for seconds, and a stalled etcd turned unrelated scenarios red
+# with "context deadline exceeded" — from etcdctl inside the container as much
+# as from the walker. The data is throwaway, and unlike a tmpfs data dir it
+# still survives the `docker compose stop/start` the disconnect scenarios do.
+# etcd 3.3 (etcd-v2) has no such flag.
 x-health: &health
   interval: 1s
   timeout: 3s
@@ -22,13 +29,14 @@ services:
       - etcd
       - --name=v3
       - --data-dir=/etcd-data
+      - --unsafe-no-fsync
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://127.0.0.1:${EW_V3_PORT:-12379}
     ports: ["127.0.0.1:${EW_V3_PORT:-12379}:2379"]
     healthcheck:
       <<: *health
       test: ["CMD", "etcdctl", "endpoint", "health"]
-    mem_limit: 256m
+    mem_limit: 512m
 
   etcd-v2:
     image: quay.io/coreos/etcd:v3.3.27
@@ -45,7 +53,7 @@ services:
       # cluster-health would query the *advertised* URL (the host port), which
       # does not exist inside the container; the v3 endpoint check is local.
       test: ["CMD-SHELL", "ETCDCTL_API=3 /usr/local/bin/etcdctl endpoint health"]
-    mem_limit: 256m
+    mem_limit: 512m
 
   etcd-auth:
     image: quay.io/coreos/etcd:v3.5.21
@@ -53,6 +61,7 @@ services:
       - etcd
       - --name=auth
       - --data-dir=/etcd-data
+      - --unsafe-no-fsync
       - --auth-token=simple
       - --auth-token-ttl=5
       - --listen-client-urls=http://0.0.0.0:2379
@@ -61,7 +70,7 @@ services:
     healthcheck:
       <<: *health
       test: ["CMD", "etcdctl", "endpoint", "health"]
-    mem_limit: 256m
+    mem_limit: 512m
 
   etcd-tls:
     image: quay.io/coreos/etcd:v3.5.21
@@ -69,6 +78,7 @@ services:
       - etcd
       - --name=tls
       - --data-dir=/etcd-data
+      - --unsafe-no-fsync
       - --listen-client-urls=https://0.0.0.0:2379
       - --advertise-client-urls=https://127.0.0.1:${EW_TLS_PORT:-42379}
       - --cert-file=/certs/server.crt
@@ -81,4 +91,4 @@ services:
       <<: *health
       test: ["CMD", "etcdctl", "--endpoints=https://127.0.0.1:2379", "--cacert=/certs/ca.crt",
              "--cert=/certs/client.crt", "--key=/certs/client.key", "endpoint", "health"]
-    mem_limit: 256m
+    mem_limit: 512m

@@ -47,6 +47,16 @@ export EW_V3_PORT EW_V2_PORT EW_AUTH_PORT EW_TLS_PORT
 cleanup() {
   local rc=$?
   tmux -L "$EW_TMUX_SOCKET" kill-server 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    # A failing run on CI is only debuggable from its log: say what the
+    # clusters were doing (slow applies, fsync warnings, OOM, restarts).
+    echo "e2e: failed (exit $rc) — cluster state and recent etcd logs follow"
+    docker compose ps -a 2>&1 || true
+    docker stats --no-stream 2>&1 | grep -E "NAME|$COMPOSE_PROJECT_NAME" || true
+    docker compose logs --no-color --tail=150 2>&1 \
+      | grep -E '"level":"(warn|error|fatal|panic)"|took too long|slow|fdatasync|OOM|Killed' \
+      | tail -80 || true
+  fi
   if [ -z "${EW_KEEP:-}" ]; then
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$WORK"
