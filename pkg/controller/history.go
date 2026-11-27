@@ -246,7 +246,9 @@ func (c *Controller) restoreRevision(nd *model.Node, r *model.Revision) {
 	// A restore is a write like any other, and it reaches here without passing
 	// the main list's key bindings, so it needs the policy guard of its own.
 	c.guarded(guard{action: "restore", paths: []string{nd.Name}, do: func() {
-		if err := c.model.SetKeepTTL(nd.Name, r.Value, cur.LeaseID, cur.TTL); err != nil {
+		// CAS against the version just read: a write landing between that read
+		// and this one is someone else's, and must not be silently reverted.
+		if err := c.model.SetKeepTTL(nd.Name, r.Value, cur.LeaseID, cur.TTL, cur.ModRev); err != nil {
 			c.error("Restore failed", err, false)
 			return
 		}

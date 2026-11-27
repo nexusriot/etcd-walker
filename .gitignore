@@ -24,6 +24,12 @@ Thumbs.db
 *.swp
 *~
 .idea/
+# (.vscode/ is NOT ignored: the shared tasks.json is tracked on purpose.)
+
+# Local state of coding-assistant tooling (Serena's memories and project
+# config, Claude Code's per-user settings). Personal, never project source.
+.serena/
+.claude/settings.local.json
 
 # coverage output from `make cover` / CI, and the HTML report
 # `go tool cover -html=coverage.out -o coverage.html` writes next to it.
@@ -35,3 +41,20 @@ coverage.html
 go.work
 go.work.sum
 /vendor/
+
+# End-to-end suite (test/e2e). run.sh keeps its certificates, state dir and
+# logs in a mktemp dir it removes; these cover running e2e.py directly: the
+# binary `make e2e-bin` builds, per-scenario stderr captures, the default
+# certificate and undo-snapshot dirs, and Python's bytecode cache.
+/test/e2e/etcd-walker
+/test/e2e/*.stderr
+/test/e2e/certs/
+/test/e2e/state/
+/test/e2e/__pycache__/
+
+# README screenshot tooling (tools/screenshots): the binary copied in, the
+# raw ANSI captures, and the per-run state/stderr it leaves behind.
+/tools/screenshots/etcd-walker
+/tools/screenshots/*.ansi
+/tools/screenshots/state/
+/tools/screenshots/shots.err

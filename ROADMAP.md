@@ -1,16 +1,26 @@
 # Etcd-walker — Roadmap
 
-Prioritized backlog, last revised 2026-09-12. Bug ids (`B-*`) and limitation
+Prioritized backlog, last revised 2026-11-27. Bug ids (`B-*`) and limitation
 ids (`L-*`) refer to [DESIGN.md §12](DESIGN.md); feature ids (`F-*`, `N-*`)
 are referenced back from there and from §13. Nothing here is scheduled — it
 is an ordered menu.
 
-The current version is **0.10.1**, a documentation-accuracy pass over the
-0.10.0 feature round. 0.10.0 added time-travel browsing (F-19), undo
+The current version is **0.11.0**: live refresh (F-1), conflict-safe saves
+(N-1) and the single-sourced version with `-version` (F-3), plus the fixes
+from the end-to-end rounds (B-19..B-26). Before it, 0.10.1 was a
+documentation-accuracy pass over the 0.10.0 feature round. 0.10.0 added time-travel browsing (F-19), undo
 snapshots for recursive deletes (N-25) and the two-pane layout (F-20),
 described in [DESIGN.md §14](DESIGN.md). 0.9.0 carried the safety work
 (F-4, F-5, N-6, N-11, N-14, N-21) and every fix from the B-1..B-18 rounds.
-Note that the last tag is 0.9.0, so 0.10.x is unreleased so far.
+Note that the last tag is 0.9.0, so 0.10.x and 0.11.0 are unreleased so far.
+
+**2026-11-26** shipped F-3 (single-sourced version + `-version`), F-1 (live
+refresh) and N-1 (conflict-safe saves), described in DESIGN §9.3 and §15,
+together with a tmux-driven end-to-end suite run against real v3, v2,
+auth-enabled and mTLS clusters. Three rounds of it found B-19..B-21, and the
+gap review and fault-injection rounds that followed found B-22..B-26 (DESIGN
+§12), all fixed. F-1 also delivers the visible half of N-4: in live mode the header
+shows when the cluster stops answering, and watches restart on recovery.
 
 ## 0. Open findings — all cleared
 
@@ -65,16 +75,16 @@ in DESIGN §13. **2026-08-28** shipped F-19, N-25 and F-20 (DESIGN §14),
 which also turned up two defects of their own: undo snapshots corrupted
 non-UTF-8 values through `encoding/json` (fixed with a base64 side map), and
 `NewView` rooted an empty layout so the running app started with no focus and
-every list binding dead (fixed and pinned by a view test). Next up: F-3, then
-N-1 (CAS-safe writes).
+every list binding dead (fixed and pinned by a view test). F-3 and N-1 followed
+on 2026-11-26 (below).
 
 ## 1. Quick wins
 
 | Id | Feature | Sketch |
 |----|---------|--------|
-| F-1 | **Watch mode / live refresh** | Toggleable (hotkey — `Ctrl+G` and `Ctrl+B` are taken as of 0.10.0) v3 `Watch` on the current prefix (v2: polling fallback) that re-runs `updateList` via `App.QueueUpdateDraw` on events. Indicator in the header. The single most useful addition for anyone staring at a changing cluster. |
-| F-3 | **`-version` flag + single-sourced version** | `var version = "dev"` + `-ldflags "-X main.version=$(VERSION)"` in the Makefile; header reads it, `-version` prints it. Kills the three-place bump documented in DESIGN §9.3. |
-| ~~F-4~~ | **Read-only mode** — shipped in 0.9.0 | `-read-only` flag / `"read_only": true` config: mutating hotkeys show a "read-only session" modal instead of acting; header shows `[RO]`. Cheap insurance for browsing production. |
+| ~~F-1~~ | **Watch mode / live refresh** — shipped | `Ctrl+L` / `-live`: per-pane v3/v2 watches, coalesced refreshes, header health indicator. DESIGN §15.1. |
+| ~~F-3~~ | **`-version` flag + single-sourced version** — shipped | `pkg/version`, read by the Makefile and `build-deb.sh`, stamped via `-X`. DESIGN §9.3. |
+| ~~F-4~~ | **Read-only mode** — shipped in 0.9.0 | `-read-only` flag / `"read_only": true` config: mutating hotkeys show a "read-only session" modal instead of acting; header shows `[READ-ONLY]`. Cheap insurance for browsing production. |
 | ~~F-5~~ | **Type-to-confirm for recursive deletes** — shipped in 0.9.0 | For directory deletes, require typing the basename (à la GitHub repo deletion) instead of a bare ok/cancel — a recursive `DeleteRange` on a fat prefix is the most destructive thing the tool can do. |
 
 ## 2. Power features
@@ -104,10 +114,10 @@ N-1 (CAS-safe writes).
 
 | Id | Feature | Sketch |
 |----|---------|--------|
-| N-1 | **CAS-safe writes** | `Set` is a blind `Put` and the editor saves over whatever is on the server now. `Node.ModRev` is already captured, so wrap saves in `Txn().If(Compare(ModRevision(k), "=", rev))` (v2: `PrevIndex`) and offer reload/overwrite/diff — the F-7 diff renderer is right there — when it fails. The biggest correctness gap left for multi-user clusters. |
+| ~~N-1~~ | **CAS-safe writes** — shipped for the editor and restore (DESIGN §15.2); `setTTL`/copies remain last-write-wins (L-9) | `Set` is a blind `Put` and the editor saves over whatever is on the server now. `Node.ModRev` is already captured, so wrap saves in `Txn().If(Compare(ModRevision(k), "=", rev))` (v2: `PrevIndex`) and offer reload/overwrite/diff — the F-7 diff renderer is right there — when it fails. The biggest correctness gap left for multi-user clusters. |
 | N-2 | **User-level config discovery** | `config.DefaultPath` is only `/etc/etcd-walker/config.json`, so a non-root user needs `-config` every run. Search `$ETCD_WALKER_CONFIG` → `$XDG_CONFIG_HOME/etcd-walker/config.json` → `~/.config/…` → `/etc/…`. Pairs with F-11. |
 | N-3 | **Credential hygiene** | `-password` is world-readable in `ps`. Add `-password-file`, an env var, and an interactive prompt when a username is set but no password is. |
-| N-4 | **Connection state + reconnect** | The model dials inside `NewController` before any UI exists (unreachable host = blank terminal for the timeout), and there is no reconnect: if etcd goes away every op errors while the header still reads healthy. Prerequisite for F-1. |
+| N-4 | **Connection state + reconnect** — *partly delivered by F-1: live mode shows health and restarts watches on recovery; the startup-dial and non-live parts remain* | The model dials inside `NewController` before any UI exists (unreachable host = blank terminal for the timeout), and there is no reconnect: if etcd goes away every op errors while the header still reads healthy. (Was the prerequisite for F-1, which shipped with its own health check.) |
 | N-5 | **Throttle the details refetch** | `fillDetails` issues a `Get` per cursor move (L-6); holding ↓ through a 500-key dir is 500 round trips. Debounce on cursor rest or cache by `ModRev`. |
 | ~~N-6~~ | **Session journal / copy-as-etcdctl** — shipped in 0.9.0 | Record every mutation and export it as an `etcdctl` script. Composes with F-4: browse read-only, emit the script, run it elsewhere. *Shipped as the `Ctrl+A` journal (whole script to file or clipboard); the proposed per-key "copy as etcdctl put" keystroke was not built — the journal covers the use case and the single-key variant is still open if wanted.* |
 | N-7 | **Prefix stats ("du" for etcd)** | Key count and total value bytes per child prefix + largest keys. Nothing in the TUI shows where the db size went. Better after F-9. |
@@ -132,6 +142,9 @@ Ideas the deep review turned up, roughly by value-per-effort.
 
 | Id | Feature | Version |
 |----|---------|---------|
+| F-1 | **Live refresh** — `Ctrl+L`/`-live`: each live pane watches its directory and re-lists on change, cursor kept on its entry, bursts coalesced to ≤2 refreshes/s, `● LIVE` / `⚠ LIVE` health in the header, watches restarted after outages and cluster recreation. DESIGN §15.1. | unreleased |
+| N-1 | **Conflict-safe saves** — the editor saves via `Txn`/`prevIndex` CAS on the revision it opened; on conflict: diff / overwrite (still CAS) / reload / keep editing, or recreate / discard for a deleted key. Restores are CAS too. DESIGN §15.2. | unreleased |
+| F-3 | **Single-sourced version** — `pkg/version`, `-version` with commit/toolchain/platform. DESIGN §9.3. | unreleased |
 | F-19 | **Time travel** — `Ctrl+G` pins a pane to a past etcd revision; every read (listing, details, find, export) carries it, mutations are refused, and compaction is reported rather than shown as an empty tree. Absolute, relative (`-N`) or empty for live. DESIGN §14.1. | 0.10.0 |
 | N-25 | **Undo snapshots** — a recursive directory delete exports the subtree to `$XDG_STATE_HOME/etcd-walker/snapshots` first; `Ctrl+U` restores or discards. A snapshot that cannot be written cancels the delete (`-no-snapshot` opts out); binary values survive byte for byte. DESIGN §14.2. | 0.10.0 |
 | F-20 | **Two panes** — `Ctrl+B`/`-dual`, `Tab` to switch, `F5`/`F6` to copy or move into the other pane. Each pane keeps its own directory, cursor and revision. DESIGN §14.3. | 0.10.0 |

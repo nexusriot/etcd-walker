@@ -20,8 +20,13 @@
 APP        := etcd-walker
 PKG        := ./cmd/etcd-walker
 GO         ?= go
-VERSION    ?= 0.10.1
+# The version lives in pkg/version/version.go (DESIGN §9.3) — read it from
+# there rather than repeating it. VERSION=… on the command line still wins and
+# is stamped into the binary via -X below.
+VERSION    ?= $(shell sed -n 's/^var Version = "\(.*\)"/\1/p' pkg/version/version.go)
+VERSION_PKG := github.com/nexusriot/etcd-walker/pkg/version
 LDFLAGS    ?= -s -w
+GO_LDFLAGS := $(LDFLAGS) -X $(VERSION_PKG).Version=$(VERSION)
 BUILD_DIR  := build
 DIST_DIR   := dist
 
@@ -29,7 +34,7 @@ DIST_DIR   := dist
 define go_build
 	@mkdir -p $(DIST_DIR)
 	CGO_ENABLED=$(4) GOOS=$(1) GOARCH=$(2) $(if $(5),GOARM=$(5),) \
-		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST_DIR)/$(3) $(PKG)
+		$(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o $(DIST_DIR)/$(3) $(PKG)
 	@echo ">> $(DIST_DIR)/$(3)"
 endef
 
@@ -41,7 +46,7 @@ define build_deb
 	@mkdir -p "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin"
 	@cp -r DEBIAN "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN"
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(2) $(if $(3),GOARM=$(3),) \
-		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(APP)" $(PKG)
+		$(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(APP)" $(PKG)
 	@chmod 0755 "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(APP)"
 	@sed -i "s/_version_/$(VERSION)/g" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	@sed -i "s/^Architecture: .*/Architecture: $(1)/" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
@@ -66,6 +71,8 @@ help:
 	@echo "  make debs               - deb-amd64 + deb-i386 + deb-arm64 + deb-armhf"
 	@echo "  make test | test-race | cover | vet | fmt | tidy | clean"
 	@echo "  make test-integration   - needs a reachable etcd (see the target)"
+	@echo "  make e2e                - hermetic e2e: own etcd v2/v3/auth/TLS via compose"
+	@echo "  make e2e-bin            - just the binary the e2e suite drives"
 
 .PHONY: tidy
 tidy:
@@ -92,6 +99,20 @@ test-race:
 # with ETCD_WALKER_TEST_ENDPOINT / _USER / _PASSWORD.
 test-integration:
 	$(GO) test ./... -tags=integration -run Integration -count=1 -v
+
+.PHONY: e2e-bin
+# Builds the binary the tmux-driven end-to-end suite runs (test/e2e/e2e.py).
+# See that file for how to bring up the test clusters and run it.
+e2e-bin:
+	CGO_ENABLED=0 $(GO) build -ldflags "$(GO_LDFLAGS)" -o test/e2e/etcd-walker $(PKG)
+
+.PHONY: e2e
+# Hermetic end-to-end run: own etcd clusters (v3, v2, auth, TLS) via docker
+# compose on free loopback ports, the real binary driven through a private
+# tmux server, everything torn down afterwards. Needs docker compose, tmux,
+# python3, openssl. Filter scenarios with E2E="cas live".
+e2e: e2e-bin
+	test/e2e/run.sh $(E2E)
 
 .PHONY: cover
 cover:

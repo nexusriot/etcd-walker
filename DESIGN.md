@@ -60,10 +60,14 @@ etcd-walker/
 │   │   └── config_test.go
 │   ├── model/               etcd abstraction (v2 / v3 behind one iface)
 │   │   ├── model.go
+│   │   ├── watch.go            Watch/Ping for live mode, ConflictError (§15)
+│   │   ├── cas_watch_test.go   CAS saves + watch/ping against fakes (§15)
+│   │   ├── tls_test.go         explainTLS against throwaway TLS servers
 │   │   ├── v3backend_test.go   in-memory fakeKV exercises the v3 backend
 │   │   ├── v2backend_test.go   fake KeysAPI exercises the v2 backend
 │   │   ├── model_test.go       Model→backend delegation wiring
 │   │   ├── integration_test.go `integration`-tagged, needs a real etcd
+│   │   ├── integration_live_test.go `integration`: CAS/Watch/Ping on v3 and v2
 │   │   └── helpers_test.go
 │   ├── controller/          UI state + keybindings + business glue
 │   │   ├── controller.go
@@ -72,6 +76,7 @@ etcd-walker/
 │   │   ├── timetravel.go       revision picker + pinning a pane to the past
 │   │   ├── panes.go            two-pane state swap + cross-pane copy/move
 │   │   ├── snapshot.go         undo snapshots for recursive deletes
+│   │   ├── live.go             live refresh: watches, coalescing, health (§15)
 │   │   ├── controller_test.go  fakeModel + headless tview drive the flows
 │   │   ├── history_test.go
 │   │   ├── journal_test.go
@@ -79,18 +84,26 @@ etcd-walker/
 │   │   ├── timetravel_test.go
 │   │   ├── panes_test.go
 │   │   ├── snapshot_test.go
+│   │   ├── live_test.go        live refresh + conflict resolution
+│   │   ├── gaps_test.go        coverage-gap round: search, TTL, find, dialogs
+│   │   ├── version_test.go     header/version wiring
 │   │   ├── integration_test.go `integration`-tagged: delete/restore + history
 │   │   ├── flows_test.go       dialog flows driven headlessly (create/dup/jump)
 │   │   └── helpers_test.go
 │   ├── view/                tview-based TUI rendering
 │   │   ├── view.go
 │   │   └── view_test.go        layout + focus (a lost focus kills every binding)
+│   ├── version/             the single source of the version (§9.3)
+│   │   ├── version.go
+│   │   └── version_test.go     line shape + packaging derive from it
 │   └── util/clip/           clipboard with OSC52 fallback
 │       ├── clip.go
 │       └── clip_test.go
 │
-├── .github/workflows/ci.yml  gofmt/vet/staticcheck/test/-race, cross-build, etcd
-├── resources/               screenshots, icons
+├── test/e2e/                tmux-driven end-to-end suite + docker compose (§15.3)
+├── .github/workflows/ci.yml  gofmt/vet/staticcheck/test/-race, cross-build, etcd, e2e
+├── resources/               README screenshots (captured from the real binary)
+├── tools/screenshots/       regenerates them: drive the TUI in tmux, render ANSI → PNG
 ├── examples/                import-sample.json for the JSON import feature
 ├── DEBIAN/                  Debian packaging metadata
 ├── Makefile                 cross-build matrix + .deb targets (preferred)
@@ -104,12 +117,15 @@ etcd-walker/
 └── DESIGN.md                this document
 ```
 
-The codebase is intentionally small and flat — one production file per
-package, except `pkg/controller`, where self-contained flows are kept out of
-the already-large `controller.go`: `history.go` (the revision-history
-screens), `journal.go` (the session journal and its model decorator),
-`timetravel.go`, `panes.go` and `snapshot.go` (§14). Every file has a sibling
-`_test.go`, so newcomers can read it end-to-end in a single sitting.
+The codebase is intentionally small and flat — mostly one production file
+per package. The exceptions keep self-contained flows out of the large main
+files: `pkg/model/watch.go` (live-mode watch/ping and the CAS conflict type,
+§15), and in `pkg/controller` `history.go` (the revision-history screens),
+`journal.go` (the session journal and its model decorator), `timetravel.go`,
+`panes.go`, `snapshot.go` (§14) and `live.go` (§15). Tests are grouped by
+feature rather than strictly one per file (`watch.go`, for instance, is
+covered by `cas_watch_test.go`), so newcomers can still read a package
+end-to-end in a single sitting.
 
 ---
 
@@ -186,7 +202,7 @@ type backend interface {
     revision() (int64, error)
     set(path, value string) error
     setTTL(path, value string, ttlSeconds int64) error
-    setKeep(path, value string, leaseID, ttlSeconds int64) error
+    setKeep(path, value string, leaseID, ttlSeconds, expectModRev int64) error // CAS when expectModRev > 0 (§15.2)
     mkdir(path string) error
     del(path string) error
     deldir(path string) error
@@ -198,6 +214,7 @@ type backend interface {
     history(key string, limit int) ([]*Revision, bool, error)
     authStatus() (enabled bool, known bool, err error)
     export(dir string, rev int64) (map[string]string, error)
+    watch(ctx context.Context, dir string) <-chan WatchEvent        // live mode (§15.1)
 }
 ```
 
@@ -208,11 +225,14 @@ would look plausible. See §14.1.
 
 Two implementations satisfy it:
 
-* `v3Backend` — wraps `go.etcd.io/etcd/client/v3`. It holds three handles: a
-  `clientv3.KV` (get/put/delete/range), a `lessor` (a three-method narrowing
+* `v3Backend` — wraps `go.etcd.io/etcd/client/v3`. It holds four handles: a
+  `clientv3.KV` (get/put/delete/range), a `clientv3.Watcher` (live mode,
+  §15.1), a `lessor` (a three-method narrowing
   of `clientv3.Lease` — `Grant`/`Revoke`/`TimeToLive` — that
   `*clientv3.Client` satisfies in production and a `fakeLessor` satisfies in
   tests), and the full `*clientv3.Client` for `Auth.AuthStatus` and `Close`.
+  It also keeps the dial address and TLS config so a failed probe can be
+  explained by a direct handshake (`explainTLS`, B-23).
   Splitting the lease methods out is what made the B-1 fix testable (§12).
   Speaks gRPC, supports auth and TLS. `close()` releases the client;
   `NewModel` calls it on any path that abandons a dialled backend, so a
@@ -232,9 +252,10 @@ worth calling out:
   in skip mode existing keys are left alone.
 * `Model.SetTTL(key, value, ttlSeconds)` — pass-through to `setTTL`; sets or
   clears a key's expiry (see §5.5).
-* `Model.SetKeepTTL(key, value, leaseID, ttlSeconds)` — pass-through to
-  `setKeep`; writes a new value while keeping the key's existing expiry
-  (see §5.5).
+* `Model.SetKeepTTL(key, value, leaseID, ttlSeconds, expectModRev)` —
+  pass-through to `setKeep`; writes a new value while keeping the key's
+  existing expiry (see §5.5). A non-zero `expectModRev` makes it a
+  compare-and-swap that fails with `*ConflictError` (§15.2).
 * `Model.Search(dir, query, inValues, limit)` — recursive, case-insensitive
   substring search over full key paths (and values when `inValues`); returns
   at most `limit` nodes plus a truncation flag. On v3 the sweep is keys-only
@@ -401,7 +422,8 @@ surfaces as-is.
   recursive-find form, results picker — reused by search results, the
   revision picker and the journal viewer — jump, export, JSON import
   file-browser, import-mode prompt, revision detail/diff pane,
-  restore-confirm, multi-line editor, hotkeys help).
+  restore-confirm, multi-line editor, save-conflict question
+  (`NewConflictQ`, §15.2), hotkeys help).
 
 Key design decisions:
 
@@ -409,8 +431,9 @@ Key design decisions:
   the model. The controller installs all input captures and `done`
   handlers.
 * Dialogs are added to `Pages` and removed when dismissed, so any
-  background list state survives a modal interaction. All dialogs share the
-  page name `"modal"`, so a handler must remove the current dialog **before**
+  background list state survives a modal interaction. Dialogs share the
+  page name `"modal"` (the transient info notice uses `"modal-info"` and the
+  hotkey panel `"modal-help"`), so a handler must remove the current dialog **before**
   showing a follow-up (e.g. an error) — a deferred remove would delete the
   follow-up instead.
 * **A modal that swallows every key cannot scroll.** The hotkey panel closed
@@ -459,6 +482,12 @@ type Controller struct {
     active   int
 
     startupErr error
+
+    liveState                            // watches, health ping, header error (§15.1)
+    headerBase   string                  // header text without the live badge
+    headerColor  tcell.Color
+    quietDetails bool                    // live refresh: no modal on a details error
+    queue        func(func())            // App.QueueUpdateDraw; synchronous in tests
 }
 
 type paneState struct {
@@ -517,7 +546,7 @@ type Node struct {
 * On **both** panes' lists — one shared capture, since it always acts on
   whichever pane is active and only that one has the focus (§14.3): every
   other hotkey (`Ctrl+N`, `Ctrl+D`, `Delete`, `Ctrl+E`, `Ctrl+R`, `Ctrl+T`,
-  `Ctrl+V`, `Ctrl+G`, `Ctrl+U`, `Ctrl+B`, `Tab`, `F5`, `F6`, `Ctrl+P`,
+  `Ctrl+V`, `Ctrl+G`, `Ctrl+U`, `Ctrl+B`, `Ctrl+L`, `Tab`, `F5`, `F6`, `Ctrl+P`,
   `Ctrl+Y`, `Ctrl+S`, `/`, `Ctrl+F`, `Ctrl+J`, `Ctrl+W`, `Ctrl+O`, `Ctrl+A`,
   `Ctrl+H`, `Backspace`).
 
@@ -528,7 +557,7 @@ type Node struct {
 
 Each hotkey calls a small method (`create`, `duplicate`, `delete`,
 `editMultiline`, `rename`, `setTTL`, `history`, `goToRevision`,
-`showSnapshots`, `crossTransfer`, `copyPath`, `copyValue`, `search`,
+`showSnapshots`, `toggleLive`, `crossTransfer`, `copyPath`, `copyValue`, `search`,
 `findRecursive`, `jump`, `export`, `importJSON`, `showJournal`) which opens
 the appropriate dialog and, on submission, calls into the model and then
 `updateList()` to refresh the listing. The two pane bindings are the
@@ -723,21 +752,26 @@ trace without disturbing the interface.
   also non-fatal: `updateList` reports the error and falls back to
   `lastGoodDir` — the last directory that listed successfully — showing an
   empty level only if even that fallback fails.
-* The process only exits non-zero when `tview` itself fails or the user
-  hits `Ctrl+Q`.
+* The process exits non-zero only when `tview` itself fails; `Ctrl+Q` is
+  a normal exit (status 0).
 
 ### 9.3 Versioning
 
-The current user-facing version is **0.10.1**, duplicated in three places
-that must be bumped together (`TestVersionIsConsistentAcrossTheRepo` fails if
-they drift, and it has caught a partial bump):
+The user-facing version (currently **0.11.0**) lives in exactly one place
+since F-3: `var Version` in [pkg/version/version.go](pkg/version/version.go).
 
-* The header line in [pkg/controller/controller.go](pkg/controller/controller.go)
-  — the `appVersion` constant the header string interpolates.
-* `VERSION ?= 0.10.1` in the `Makefile` (overridable on the CLI:
-  `make debs VERSION=…`).
-* The `version=` variable at the top of `build-deb.sh` (the legacy helper;
-  `build-deb-arm64.sh` just delegates to it).
+* The header and `etcd-walker -version` read it. `-version` prints version,
+  commit, Go toolchain and platform and exits before any config is read or
+  connection attempted. The commit comes from the toolchain's own VCS stamp
+  (`debug.ReadBuildInfo`, `vcs.revision` + `-dirty`), so a plain `go build`
+  in a checkout needs no flags; `-X …/pkg/version.Commit=` overrides it.
+* The `Makefile` and `build-deb.sh` *read* the version out of that file
+  (`sed` over the `var Version = "…"` line) and stamp it back in with
+  `-ldflags -X …/pkg/version.Version=…`, so `make debs VERSION=0.12.0-rc1`
+  still produces a one-off build without editing source.
+* `TestPackagingDerivesVersionFromSource` fails if either script hard-codes a
+  version again, and `TestVersionLineShapeIsWhatThePackagingParses` fails if
+  the line is reformatted into something the `sed` would not match.
 
 ---
 
@@ -778,13 +812,14 @@ Equivalent raw commands, if you prefer not to use the Makefile:
 
 ## 10a. Testing & CI
 
-Three layers, all runnable from the Makefile:
+Four layers, all runnable from the Makefile:
 
 | Layer | Command | What it covers |
 |-------|---------|----------------|
 | Unit | `make test` / `make test-race` | Everything below, against in-memory fakes. Hermetic — no network, no screen. |
 | Coverage | `make cover` | Prints the total; `coverage.out` is git-ignored. |
 | Integration | `make test-integration` | The `integration`-tagged suites in `pkg/model` and `pkg/controller`, against a **real etcd**. |
+| End-to-end | `make e2e` | Hermetic: the real binary in tmux against its own dockerised v3, v2, auth and TLS clusters (§15.3). |
 
 **The fakes.** `pkg/model` drives the v3 backend through an in-memory
 `clientv3.KV` that models revision history, compaction and per-key leases,
@@ -801,7 +836,7 @@ and `GetButton(GetButtonIndex("Save"))` fires a form button. That is how
 **What is deliberately not unit-tested.** `main()`/`Run()` are wiring — the
 logic they used to hide has been pulled out into `resolve()` and
 `headerText()`, which are tested directly. `pkg/view` is mostly widget
-construction and stays the thinnest layer (~32%); what *is* covered there is
+construction and stays the thinnest layer (~30%); what *is* covered there is
 the part where a mistake kills the whole UI — that the layout gives a pane
 the focus, and that the hotkey panel fits a short terminal — both found by
 running the app, not by calling a handler.
@@ -812,13 +847,16 @@ only assert what we already believe. B-1 is the case in point — the shared-
 lease test genuinely deletes the sibling key when the guard is removed, which
 no fake proved. The suite writes everything under a per-test
 `/etcd-walker-it/<test>-<nanos>` prefix and deletes it on cleanup, and reads
-`ETCD_WALKER_TEST_ENDPOINT` / `_USER` / `_PASSWORD` from the environment.
+`ETCD_WALKER_TEST_ENDPOINT` / `_USER` / `_PASSWORD` from the environment, plus
+`ETCD_WALKER_TEST_V2_ENDPOINT` for the v2 live/CAS cases (skipped when unset).
 
-**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs three jobs
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs four jobs
 on push and PR: `build` (gofmt check, vet with and without the `integration`
 tag, **staticcheck**, build, test, `-race`, coverage artifact), `cross-build` (linux/amd64, linux/arm64, freebsd/amd64 — the
-targets the README advertises), and `etcd-integration` (the tagged suite
-against an `etcd:v3.5.15` service container). Every job takes its Go version
+targets the README advertises), `etcd-integration` (the tagged suite
+against an `etcd:v3.5.15` service container, plus `etcd:v3.3.27` with the v2
+API on port 2479 for `ETCD_WALKER_TEST_V2_ENDPOINT`), and `e2e` (installs
+tmux and runs `make e2e`, §15.3). Every job takes its Go version
 from `go.mod` via `go-version-file`, so CI cannot drift from the module.
 
 ---
@@ -859,8 +897,10 @@ A prioritized feature backlog lives in [ROADMAP.md](ROADMAP.md).
 
 Findings from the July 2026 review (B-1..B-6), the August 2026 deep review
 (B-7..B-13, plus O-1..O-3, which that review first logged as behaviour changes
-before they were taken on), and a follow-up review of the 0.9.0 safety work
-(B-14..B-16) and of the test/CI round (B-17..B-18). All are fixed; the limitations below stand. Bugs carry a `B-`
+before they were taken on), a follow-up review of the 0.9.0 safety work
+(B-14..B-16) and of the test/CI round (B-17..B-18), and the November 2026
+end-to-end rounds against real clusters (B-19..B-21), and the gap review,
+hermetic TLS scenario and VPS fault rounds that followed them (B-22..B-26). All are fixed; the limitations below stand. Bugs carry a `B-`
 id, limitations an `L-` id; the roadmap references them.
 
 ### Bugs / hazards — all fixed
@@ -888,6 +928,14 @@ id, limitations an `L-` id; the roadmap references them.
 | B-16 | `controller.go`, `history.go` success modals | Dry-run reported completed mutations as fact — "3 written, 0 skipped", "Restored", "Copied" — in the one mode whose entire purpose is to state what *would* happen. Import now reports "N keys would be written"; restore and copy route their header through `writeHeader`, which appends "(dry run — not written)". | 2026-08-16 |
 | B-17 | `main.go` flag wiring | Flag registration (`flag.Var` calls) and the bundle handed to `resolve()` were two separate lists. Dropping a field from the struct literal compiled, passed the whole suite, and **nil-panicked on startup** — verified. Registration and bundling are now one `registerFlags(fs)` used by both `main()` and the tests, so there is no second place to forget, with a reflection test asserting no field is nil. | 2026-08-19 |
 | B-18 | `main.go` `boolFlag` | `*boolFlag` did not implement `IsBoolFlag`, so the `flag` package treated every boolean as requiring an argument: `etcd-walker -read-only` failed with "flag needs an argument" — the exact form the README's production example uses. Affected `-read-only`, `-dry-run`, `-tls`, `-debug`, `-tls-skip-verify`. `IsBoolFlag` added; the bare form works and `-flag=false` still turns a config setting off. | 2026-08-19 |
+| B-19 | `live.go` `SetLive` | *(found by e2e round 1, in new code)* Turning live mode on only started watches, which report changes from now on. Anything written while live mode was off stayed invisible until some unrelated change arrived — the first thing live mode did was show a stale tree under a `LIVE` header. `SetLive(true)` now re-reads every visible pane once. | 2026-11-26 |
+| B-20 | `controller.go` `rowLabel`, `listTitle`, details, editor title | *(found by e2e round 1, pre-existing)* Key names went to tview unescaped. A key called `[bracket]` — or any `[word]` — was parsed as a colour tag and **vanished from the listing**; the same name in the details pane, list title and editor title was mangled. B-13 escaped the chrome; this is the same bug for *data*. All four now go through `tview.Escape`. | 2026-11-26 |
+| B-21 | `watch.go` `v3Backend.watch` | *(found by e2e round 2, in new code)* When a cluster is recreated, or restored from an older backup, its revision goes **backwards**. The v3 client transparently resumes a broken watch at the last revision it saw + 1 — a revision the new cluster will not reach for a long time — so the watch went silent while the header said healthy `● LIVE`: a frozen tree, the exact failure live mode exists to prevent. The watch now checks the store revision every 5 s and restarts from the present (and asks for a full re-read) when it is below what it has seen; independently, the controller restarts every watch when the connection recovers from a failed ping. | 2026-11-26 |
+| B-22 | `controller.go` `search` | *(gap review, made reachable by F-1)* The quick-search dialog captured the row order when it opened. A live refresh that inserted rows while it was open shifted every row, and Enter put the cursor on whatever key now sat at the old index. The order is now read when the search completes. | 2026-11-26 |
+| B-23 | `model.go` `NewModel` (v3, auto) | *(hermetic e2e TLS scenario)* gRPC retries a failed TLS handshake until the dial deadline, so an untrusted server certificate or a missing client certificate was reported as `context deadline exceeded` — indistinguishable from a dead host. A failed probe over TLS now does one direct handshake (`explainTLS`) and appends the real cause (`x509: certificate signed by unknown authority`, `tls: certificate required`); `auto` mode says why v3 failed instead of only "neither reachable". | 2026-11-26 |
+| B-24 | `controller.go` `saveValue` | *(gap review, confirmed by the blackhole fault scenario)* The editor closes before the write, so a save that failed for any reason other than a conflict — timeout, dropped connection, permission denied — threw away everything the user had typed. Dismissing the error now reopens the editor with the text, and the retry is still a CAS against the original revision. | 2026-11-26 |
+| B-25 | `model.go` `newV3Backend` | *(VPS fault round B, 75 s blackhole)* The v3 client had no gRPC keepalive. When packets silently vanish (partition, dropped NAT entry — no RST) the HTTP/2 connection is never declared dead, every RPC queues behind TCP retransmits that back off for minutes, and the live session stayed red long after the network came back — it did not recover within 40 s. Now `DialKeepAliveTime` 10 s / `DialKeepAliveTimeout` 5 s (pings only while a stream is open — etcd's server refuses idle pings) and a reconnect back-off capped at 5 s instead of gRPC's 120 s. Measured after the fix: live v3 recovers 4 s after a 75 s blackhole, v2 1.5 s, non-live v3 1.3 s. | 2026-11-26 |
+| B-26 | `controller.go` dialog titles | *(VPS round B, 300-character key)* A title wider than its box is clipped, and with a long key the clipped part was the mode ("Edit (multiline)") and the Save/Cancel hint — the editor gave no clue how to leave it. Key paths in the editor, rename and TTL titles are now shortened from the left to 60 characters (`titlePath`), keeping the identifying tail. | 2026-11-26 |
 
 **B-1 fix** — `setTTL` now delegates the cleanup to `revokeIfOrphaned`, which
 resolves the superseded lease with `TimeToLive(..., WithAttachedKeys())` and
@@ -927,7 +975,8 @@ roadmap N-1 (CAS-safe writes via `Txn`/`ModRevision`) is the real fix.
 | L-5 | Renames/copies are client-side copy-then-delete loops, not transactions — a failure mid-way leaves a partial target (and, for rename, the intact source). v3 could batch per-key `Txn`s but a whole-tree atomic move doesn't fit in one txn anyway. |
 | L-6 | `fillDetails` issues a live `Ls` per directory-focus and a `Get` (+`TimeToLive` when leased) per key-focus — cursor movement does network round-trips; sluggish on high-latency clusters. |
 | L-7 | OSC52 clipboard fallback refuses payloads > 10 kB (`ErrTooLarge`) rather than truncating. |
-| L-8 | No live refresh: listings only update after an action. A v3 `Watch` on the current prefix is roadmap F-1. |
+| ~~L-8~~ | ~~No live refresh~~ — lifted by F-1 (§15.1); live mode is opt-in. |
+| L-9 | Only the value editor and revision restore are compare-and-swap (N-1, §15.2). `setTTL` re-reads immediately before writing (B-7) but is still last-write-wins, as are the copy-then-delete loops of L-5. |
 
 ---
 
@@ -1192,3 +1241,125 @@ running application started with the entire keyboard dead while looking
 perfectly normal. `NewView` now populates the layout before `SetRoot` and sets
 the focus explicitly; `TestNewViewFocusesTheFirstPane` pins it. Only a live
 run surfaced this: no unit test that calls handlers directly can.
+
+---
+
+## 15. Live refresh and conflict-safe saves
+
+### 15.1 Live refresh (F-1)
+
+`Ctrl+L` / `-live` / `"live": true`. Implemented in
+[pkg/controller/live.go](pkg/controller/live.go) and
+[pkg/model/watch.go](pkg/model/watch.go).
+
+**Model.** `Model.Watch(ctx, dir)` returns a channel of `WatchEvent`s that is
+closed when `ctx` ends. An event carries no payload — just "something under
+this prefix changed" — or an `Err` for status. The controller re-lists on each
+event instead of patching the listing from deltas: `ls` already knows every
+rule about synthetic directories, `.dir` markers and hidden keys, and a second
+copy of those rules in an event applier would drift.
+
+* **v3** watches `withTrail(dir)` with `WithPrefix` (so `/app` never sees
+  `/apple`) and `WithRequireLeader`. A broken stream is re-established from the
+  last revision seen + 1, so nothing is skipped; a compacted resume point turns
+  into a "re-read everything" event; and a store revision *below* what the
+  watch has seen (a recreated/restored cluster, B-21) restarts it from now.
+* **v2** uses `KeysAPI.Watcher(dir, Recursive)`. `EventIndexCleared` (v2 keeps
+  only 1000 events) becomes a re-read; any other error is reported and the
+  watcher recreated after `watchRetry`.
+
+`Model.Ping()` is the startup probe, reused as a periodic health check.
+
+**Controller.** `liveState` is embedded in `Controller` and owned by the UI
+goroutine; the watch and ping goroutines only reach it through `c.queue`
+(`App.QueueUpdateDraw` in production, a synchronous call in tests).
+
+* `syncWatches()` runs at the end of every `updateList`, so navigation, time
+  travel and toggling the second pane re-point the watches without each having
+  to remember to. Watches are indexed by *physical* pane, not active/inactive,
+  because the panes swap roles and the watches must not. A pane pinned to a
+  revision is never watched — the past does not change.
+* `pumpWatch` coalesces bursts: the first change after a quiet spell is
+  delivered at once, then at most one refresh per `defaultLiveGap` (500 ms).
+  A busy prefix (`/registry` on Kubernetes) would otherwise re-list many times
+  a second. Under a sustained write storm the e2e suite measures cursor
+  latency at ~0.2 s.
+* `refreshActive` is `updateList` without its side effects: no error modal (a
+  failed background refresh goes to the header), no fall-back to another
+  directory, and the cursor stays on the same *entry* (by map key), or the same
+  row if the entry vanished. `quietDetails` suppresses the list's changed func
+  while rows are rebuilt, so one refresh costs one details read.
+* Each delivery carries the watch's `gen`; an event from a watch that has since
+  been replaced is dropped.
+* Ping every 5 s. A failure turns the header red (`⚠ LIVE: <error>`); the
+  recovery restarts every watch from the present *and then* re-reads the panes
+  (new watch first, so there is no gap) — the outage may not be replayable, and
+  the cluster that came back may not be the one that left.
+
+### 15.2 Conflict-safe saves (N-1)
+
+`SetKeepTTL` grew an `expectModRev` argument; `> 0` makes the write a
+compare-and-swap:
+
+* **v3** — `Txn().If(ModRevision(k) = rev).Then(Put…).Else(Get k)`. A deleted
+  key has ModRevision 0, so it fails the compare and is not resurrected. The
+  `Else` read lets the conflict report what the key is now without a second
+  round trip.
+* **v2** — `SetOptions.PrevIndex`. `ErrorCodeTestFailed` → conflict,
+  `ErrorCodeKeyNotFound` → deleted conflict.
+
+Both return `*model.ConflictError{Expected, Actual, Deleted}`; nothing has been
+written when it is returned.
+
+**The base is a snapshot.** The editor captures a private copy of the node it
+opened (`base`). `val.node` keeps being replaced by the on-focus re-read and
+by live refreshes while the editor is open; comparing against *that* would
+wave through precisely the concurrent write the check exists to catch.
+`TestEditorBaseIsSnapshotNotLiveNode` and the `cas-live-*` e2e scenarios pin
+it.
+
+**Resolution** (`resolveConflict` / `conflictChoice`): *diff* shows the
+server's value against the user's text (minus = server), *overwrite* saves
+again — still as a CAS, against the revision the user was shown (the one in
+the dialog, or the one the diff displayed, which the diff records), with the
+key's *live* lease/TTL re-read at that moment — so a third writer landing
+while the dialog is open is caught again rather than clobbered unseen
+(`TestConflictOverwriteDoesNotClobberWriteMadeWhileDialogOpen`), *reload* reopens
+the editor on the server's value, *keep editing* (also `Esc`) returns to the
+editor with the text intact. A deleted key offers *recreate* (unconditional,
+permanent — its lease may be gone), keep editing, or *discard*. The protected-
+prefix confirmation happens once, before the first attempt; resolving a
+conflict does not ask again.
+
+`restoreRevision` is a CAS against the version it re-reads just before
+writing, so an old value cannot silently revert someone else's change.
+
+### 15.3 End-to-end suite
+
+[test/e2e/e2e.py](test/e2e/e2e.py) runs the real binary inside tmux, changes
+etcd behind the UI's back and asserts on the captured screen. `make e2e` runs
+it **hermetically** through [test/e2e/run.sh](test/e2e/run.sh):
+
+* its own compose project (`ew-e2e-<pid>`) from
+  [test/e2e/docker-compose.yml](test/e2e/docker-compose.yml) on four free
+  loopback ports — etcd 3.5 (v3), etcd 3.3 (v2 API), an auth-enabled 3.5 with a
+  5 s token TTL, and a 3.5 serving HTTPS with client-certificate auth;
+* a throwaway CA, server and client certificates, plus a second CA nobody
+  trusts for the negative cases, generated per run;
+* a private tmux server (`tmux -L`) — the suite kills sessions freely and must
+  never touch the developer's own tmux — and a temporary
+  `ETCD_WALKER_STATE_DIR` for undo snapshots;
+* `docker compose up --wait` on healthchecks, and teardown (`down -v`, temp dir
+  removed) on success, failure or Ctrl+C. `EW_KEEP=1` leaves it up.
+
+CI runs it as the `e2e` job. Scenario groups:
+
+| Group | Covers |
+|-------|--------|
+| rounds 1–3 | live create/update/delete/nested changes and cursor stability, toggling, dual panes, time travel, TTL/lease expiry, odd key names, every conflict-dialog path (huge, binary, protected), refreshes under an open dialog/editor, resize, disconnect, a paused server, a recreated cluster, compaction, auth token expiry, revoked permissions, write storms |
+| gaps (`g-*`) | quick search under live refresh, the TTL dialog, create/rename/duplicate/delete from the UI, directory delete + undo snapshot restore, live from the config file, rapid navigation, v2 directory TTL, journal, history restore, a 3000-key directory, TLS/mTLS (good, untrusted CA, no client cert, skip-verify), F6 between live panes |
+| faults (`f-*`, `EW_FAULTS=1`, root) | netem injected into the cluster container's namespace: 600 ms RTT, 30 % loss, a 100 % blackhole (no RST) during a save and at startup, and a link flapping every second |
+| outages (`b-*`; the network ones need `EW_FAULTS=1`) | a 75 s blackhole with writes landing meanwhile (live v3/v2 and non-live), the watch's resume point compacted away during an outage, RTT above the operation timeout (the `(cached)` marker and red header must both clear afterwards), SIGTERM, 300-character and 40-level-deep keys, a watched directory replaced by a key of the same name |
+
+B-19..B-26 were found this way or by the gap review that wrote the `g-*`
+scenarios; none was reachable from a unit test that calls handlers directly.

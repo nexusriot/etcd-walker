@@ -7,36 +7,26 @@ import (
 	"testing"
 )
 
-// The user-facing version is duplicated in three files (DESIGN §9.3) until
-// F-3 single-sources it via ldflags. They have drifted before — the header
-// said 0.8.0 while the roadmap and Makefile had moved on — and a stale
-// version in a shipped .deb is the kind of thing nobody notices until a bug
-// report cites the wrong build. Pin them together.
-func TestVersionIsConsistentAcrossTheRepo(t *testing.T) {
-	// Tests run in their package directory; the repo root is two levels up.
+// F-3 single-sourced the version in pkg/version (DESIGN §9.3). Before that it
+// was repeated in three files and drifted more than once. Pin the packaging
+// scripts to *derive* it: a literal version reappearing in either one is the
+// drift coming back.
+func TestPackagingDerivesVersionFromSource(t *testing.T) {
 	const root = "../.."
-
-	cases := []struct {
-		file    string
-		pattern string
-	}{
-		{root + "/Makefile", `(?m)^VERSION\s*\?=\s*(\S+)`},
-		{root + "/build-deb.sh", `(?m)^version=(\S+)`},
-	}
-	for _, tc := range cases {
-		raw, err := os.ReadFile(tc.file)
+	for _, file := range []string{root + "/Makefile", root + "/build-deb.sh"} {
+		raw, err := os.ReadFile(file)
 		if err != nil {
-			t.Fatalf("reading %s: %v", tc.file, err)
+			t.Fatalf("reading %s: %v", file, err)
 		}
-		m := regexp.MustCompile(tc.pattern).FindStringSubmatch(string(raw))
-		if m == nil {
-			t.Errorf("%s: no version line matching %s — did the file's shape change?",
-				tc.file, tc.pattern)
-			continue
+		s := string(raw)
+		if !strings.Contains(s, "pkg/version/version.go") {
+			t.Errorf("%s no longer reads the version from pkg/version/version.go", file)
 		}
-		if got := strings.TrimSpace(m[1]); got != appVersion {
-			t.Errorf("%s declares version %q, but controller.appVersion is %q — "+
-				"DESIGN §9.3: all three must be bumped together", tc.file, got, appVersion)
+		if !strings.Contains(s, ".Version=") {
+			t.Errorf("%s no longer stamps the version via -ldflags -X", file)
+		}
+		if m := regexp.MustCompile(`(?m)^(VERSION\s*\?=|version=)\s*[0-9]`).FindString(s); m != "" {
+			t.Errorf("%s hard-codes a version again (%q) — read it from pkg/version", file, m)
 		}
 	}
 }

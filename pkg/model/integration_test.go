@@ -230,7 +230,7 @@ func TestIntegrationExclusiveLeaseIsRevoked(t *testing.T) {
 		t.Errorf("re-TTL left the key without a live expiry: %+v", second)
 	}
 	// Editing the value must keep that expiry running.
-	if err := m.SetKeepTTL(p+"/solo", "edited", second.LeaseID, second.TTL); err != nil {
+	if err := m.SetKeepTTL(p+"/solo", "edited", second.LeaseID, second.TTL, 0); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := m.Get(p + "/solo")

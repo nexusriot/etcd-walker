@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/nexusriot/etcd-walker/pkg/config"
 	"github.com/nexusriot/etcd-walker/pkg/controller"
 	"github.com/nexusriot/etcd-walker/pkg/model"
+	"github.com/nexusriot/etcd-walker/pkg/version"
 )
 
 type stringFlag struct {
@@ -73,7 +75,11 @@ type cliFlags struct {
 	debug, tls, tlsSkipVerify *boolFlag
 	readOnly, dryRun          *boolFlag
 	noSnapshot, dual          *boolFlag
+	live                      *boolFlag
 	configPath                *string
+	// showVersion prints the version and exits before any config is read or
+	// any connection attempted, so it works on a box with no etcd at all.
+	showVersion *bool
 }
 
 // session is what resolve produces beyond the connection options and the
@@ -81,6 +87,7 @@ type cliFlags struct {
 type session struct {
 	debug bool
 	dual  bool
+	live  bool
 }
 
 // registerFlags declares every flag on fs and returns the bundle wired to it.
@@ -98,7 +105,7 @@ func registerFlags(fs *flag.FlagSet) cliFlags {
 		timeout: &stringFlag{}, protect: &stringFlag{},
 		debug: &boolFlag{}, tls: &boolFlag{}, tlsSkipVerify: &boolFlag{},
 		readOnly: &boolFlag{}, dryRun: &boolFlag{},
-		noSnapshot: &boolFlag{}, dual: &boolFlag{},
+		noSnapshot: &boolFlag{}, dual: &boolFlag{}, live: &boolFlag{},
 	}
 	fs.Var(f.host, "host", "etcd host (e.g. 127.0.0.1)")
 	fs.Var(f.port, "port", "etcd port (e.g. 2379)")
@@ -116,7 +123,9 @@ func registerFlags(fs *flag.FlagSet) cliFlags {
 	fs.Var(f.dryRun, "dry-run", "record what each change would do without performing it")
 	fs.Var(f.protect, "protect", "comma-separated prefixes needing a typed confirmation before any write (e.g. /registry)")
 	fs.Var(f.noSnapshot, "no-snapshot", "do not save an undo snapshot before deleting a directory")
+	fs.Var(f.live, "live", "start with live refresh on: panes re-list as the cluster changes (Ctrl+L toggles)")
 	fs.Var(f.dual, "dual", "start with two panes side by side (Tab switches, Ctrl+B toggles)")
+	f.showVersion = fs.Bool("version", false, "print the version and exit")
 	f.configPath = fs.String("config", config.DefaultPath, "config file, optional")
 	return f
 }
@@ -157,6 +166,7 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 		}
 		sess.debug = cfg.Debug
 		sess.dual = cfg.DualPane
+		sess.live = cfg.Live
 		opts.TLSEnabled = cfg.TLSEnabled
 		opts.TLSCAFile = cfg.TLSCAFile
 		opts.TLSCertFile = cfg.TLSCertFile
@@ -192,6 +202,9 @@ func resolve(cfg *config.Config, f cliFlags) (model.Options, controller.Policy, 
 	}
 	if f.dual.set {
 		sess.dual = f.dual.value
+	}
+	if f.live.set {
+		sess.live = f.live.value
 	}
 	// The flag is spelled as the negation, so -no-snapshot turns the default
 	// off and -no-snapshot=false turns it back on over a config that disabled it.
@@ -236,6 +249,11 @@ func main() {
 	f := registerFlags(flag.CommandLine)
 	flag.Parse()
 
+	if *f.showVersion {
+		fmt.Println(version.String())
+		return
+	}
+
 	cfg, err := config.Load(*f.configPath)
 	if err != nil {
 		log.WithError(err).Warn("failed to load config, falling back to defaults")
@@ -259,12 +277,14 @@ func main() {
 		"dry_run":     policy.DryRun,
 		"snapshots":   policy.SnapshotBeforeDelete,
 		"dual_pane":   sess.dual,
+		"live":        sess.live,
 		"protected":   len(policy.ProtectedPrefixes),
 		"config":      *f.configPath,
 	}).Debug("Starting etcd-walker")
 
 	ctrl := controller.NewController(opts, policy)
 	ctrl.SetDualPane(sess.dual)
+	ctrl.SetLive(sess.live)
 	if err := ctrl.Run(); err != nil {
 		log.WithError(err).Error("etcd-walker exited with error")
 		os.Exit(1)

@@ -332,13 +332,13 @@ func TestV2SetKeepReappliesTTL(t *testing.T) {
 	api := &fakeKeysAPI{gets: map[string]*clientv2.Response{}}
 	b := &v2Backend{api: api, timeout: time.Second}
 
-	if err := b.setKeep("/k", "new", 0, 45); err != nil {
+	if err := b.setKeep("/k", "new", 0, 45, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got := api.sets[0].opts.TTL; got != 45*time.Second {
 		t.Errorf("setKeep kept TTL %v, want 45s", got)
 	}
-	if err := b.setKeep("/k", "new", 0, 0); err != nil {
+	if err := b.setKeep("/k", "new", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got := api.sets[1].opts.TTL; got != 0 {

@@ -7,7 +7,22 @@ rename, delete and export keys and directories from a single curses-style
 interface, with full support for etcd v2 (HTTP) and etcd v3 (gRPC) — including
 authentication and TLS.
 
-![Profiles](resources/screenshot-v2.png)
+![Two panes: the live tree next to the same directory at a past revision](resources/01-two-panes-live-and-past.png)
+
+<sub>Live refresh on (`● LIVE`): the left pane follows the cluster, the right
+pane shows the same directory at revision 15 — `10.0.4.21` has since been
+removed and `10.0.4.24` added.</sub>
+
+| Details pane: JSON value, revisions, TTL | Someone else changed the key while you were editing |
+|---|---|
+| ![Details pane](resources/02-details-json.png) | ![Conflict dialog](resources/03-conflict-dialog.png) |
+
+![Conflict diff: the server's value against your unsaved edit](resources/04-conflict-diff.png)
+
+<sub>The conflict diff: what is on the server now (`-`) against your unsaved
+edit (`+`). Nothing was written; choose overwrite, reload or keep editing.
+Screenshots are captured from the real binary against etcd 3.5 —
+`tools/screenshots/` regenerates them.</sub>
 
 Grab the latest pre-built binaries / `.deb` packages here:
 [latest version](https://github.com/nexusriot/etcd-walker/releases/latest)
@@ -42,6 +57,21 @@ Grab the latest pre-built binaries / `.deb` packages here:
   so you can put yesterday's revision next to today's tree — and `F5`/`F6`
   copy or move the selected entry into the other pane's directory without
   asking for a path
+- **Live refresh** (`Ctrl+L` / `-live`): each pane watches its directory
+  (etcd watch on v3 and v2) and re-lists itself as the cluster changes,
+  keeping the cursor on the same entry. Bursts are coalesced (at most one
+  refresh per pane every 500 ms), so a busy prefix stays usable. The header
+  shows `● LIVE`, or a red `⚠ LIVE: <error>` when the cluster stops
+  answering; when it comes back every pane is re-read and the watches restart
+  — including after the cluster was recreated or restored and its revision
+  went backwards. Panes pinned to a past revision are not watched
+- **Conflict-safe saves**: the value editor saves with a compare-and-swap on
+  the revision it opened (`Txn` on v3, `prevIndex` on v2). If anyone changed
+  or deleted the key meanwhile, nothing is written and you choose: **diff**
+  (server vs. your text), **overwrite** (still checked against the version
+  you were just shown), **reload** the server's value, or **keep editing**;
+  a deleted key offers **recreate** / keep editing / discard. `Esc` keeps
+  your text. Revision restores (`Ctrl+V`) are compare-and-swap too
 - Quick search inside the current level (`/` or `Ctrl+S`)
 - Recursive find under the current directory (`Ctrl+F`) — case-insensitive
   substring match on key paths, optionally inside values, with a results
@@ -112,6 +142,7 @@ Grab the latest pre-built binaries / `.deb` packages here:
 | `Ctrl+T`        | Set / clear TTL on a key (seconds or `1h30m`)|
 | `Ctrl+V`        | Revision history of a key (v3): view / diff / restore |
 | `Ctrl+G`        | Browse a past revision (v3): number, `-N`, or empty for live |
+| `Ctrl+L`        | Toggle live refresh (panes follow cluster changes) |
 | `Ctrl+B`        | Show / hide the second pane                   |
 | `Tab`           | Switch panes                                 |
 | `F5` / `F6`     | Copy / move the selected entry to the other pane |
@@ -169,7 +200,8 @@ Full schema (every field is optional):
   "protected_prefixes": ["/registry"],
 
   "snapshot_before_delete": true,
-  "dual_pane": false
+  "dual_pane": false,
+  "live": false
 }
 ```
 
@@ -194,6 +226,7 @@ Field reference:
 | `protected_prefixes` | []string | _empty_  | Prefixes needing a typed confirmation before any write; `"/"` protects everything |
 | `snapshot_before_delete` | bool | `true`  | Export a directory's subtree to a local undo snapshot before deleting it. Omitting the key keeps it **on** |
 | `dual_pane`       | bool    | `false`     | Start with two panes side by side               |
+| `live`            | bool    | `false`     | Start with live refresh on (`Ctrl+L` toggles)   |
 
 #### Command-line flags
 
@@ -217,7 +250,9 @@ Field reference:
 -no-snapshot bool          do not save an undo snapshot before deleting a
                            directory (snapshots are on by default)
 -dual bool                 start with two panes side by side
+-live bool                 start with live refresh on (Ctrl+L toggles)
 -debug bool                enable debug logging
+-version                   print version, commit and platform, then exit
 ```
 
 Flags that are explicitly set on the command line always win over the
@@ -380,15 +415,18 @@ error in-app so the misconfiguration is easy to spot.
 
 - The v2 backend always connects over plain HTTP — the TLS options apply
   to v3 only.
-- No live refresh: the listing updates after an action, not when the
-  cluster changes underneath you. Re-enter a directory to re-read it.
+- Live refresh is opt-in (`Ctrl+L` / `-live`). Without it the listing
+  updates after an action, not when the cluster changes underneath you.
+  The watch covers the directory's whole subtree, so a change deep below a
+  busy prefix still costs a (coalesced) re-list of the level on screen.
 - Moving the cursor costs a round trip — the details pane re-reads the
   focused key each time — so scrolling a large directory over a slow link
   is sluggish. A failed re-read is always reported, never silently cached.
 - Renames and copies are client-side copy-then-delete loops, not
   transactions: a failure part-way leaves a partial target.
-- Concurrent edits are last-write-wins. Two people editing the same key
-  will not notice each other; the second save overwrites the first.
+- Only the value editor and revision restores are compare-and-swap. TTL
+  changes, renames, copies, duplicates and imports re-read just before
+  writing but are still last-write-wins.
 - v3 listings, recursive find and export fetch their whole key range in a
   single request (listings are keys-only, which keeps browsing light, but
   a find/export over a huge keyspace can be slow and memory-hungry).
@@ -425,12 +463,31 @@ make test-integration
 
 It defaults to `127.0.0.1:2379` and takes `ETCD_WALKER_TEST_ENDPOINT`,
 `ETCD_WALKER_TEST_USER` and `ETCD_WALKER_TEST_PASSWORD` from the
-environment. Everything it writes goes under a unique `/etcd-walker-it/…`
+environment; the v2 live-refresh and conflict-safe-save cases also need
+`ETCD_WALKER_TEST_V2_ENDPOINT` (an etcd serving the v2 API) and are skipped
+without it. Everything it writes goes under a unique `/etcd-walker-it/…`
 prefix and is removed afterwards.
+
+Finally, an end-to-end suite drives the **real binary in tmux** against
+real etcd and asserts on what the screen shows — live refresh, conflict
+dialogs, TLS/mTLS, disconnects, paused servers, recreated clusters, revoked
+permissions, load. It is hermetic: it starts its own clusters (etcd 3.5 for
+v3, etcd 3.3 for the v2 API, an auth-enabled 3.5 and an mTLS 3.5) under a
+unique compose project on free loopback ports, generates throwaway
+certificates, uses a private tmux server, and tears it all down afterwards:
+
+```bash
+make e2e                      # needs docker compose, tmux, python3, openssl
+make e2e E2E="cas live"       # only matching scenarios
+```
+
+Network-fault scenarios (latency, loss, blackhole, flapping, injected with
+`tc netem`) need root and run with `EW_FAULTS=1 test/e2e/run.sh`.
 
 CI runs the unit suite (plus `-race` and a coverage artifact), a
 gofmt/vet/staticcheck check, cross-builds for linux amd64/arm64 and freebsd,
-and the integration suite against an etcd service container — on every pull
+the integration suite against etcd service containers (v3, and 3.3 for v2),
+and the hermetic e2e suite — on every pull
 request and on every push to `master`/`main`.
 
 ---
@@ -522,11 +579,12 @@ The resulting package is written to `build/etcd-walker_<version>_<arch>.deb`.
               [-tls] [-tls-ca path] [-tls-cert path] [-tls-key path] \
               [-tls-skip-verify] [-timeout seconds] \
               [-read-only] [-dry-run] [-protect prefixes] \
-              [-no-snapshot] [-dual]
+              [-no-snapshot] [-dual] [-live] [-version]
 ```
 
 Default values: host `127.0.0.1`, port `2379`, protocol `auto`,
-debug `false`, timeout `5s`, undo snapshots **on**, single pane.
+debug `false`, timeout `5s`, undo snapshots **on**, single pane, live
+refresh off.
 
 ---
 

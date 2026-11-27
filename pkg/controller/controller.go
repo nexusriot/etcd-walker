@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/nexusriot/etcd-walker/pkg/model"
 	"github.com/nexusriot/etcd-walker/pkg/util/clip"
+	"github.com/nexusriot/etcd-walker/pkg/version"
 	"github.com/nexusriot/etcd-walker/pkg/view"
 	"github.com/rivo/tview"
 	log "github.com/sirupsen/logrus"
@@ -38,7 +40,9 @@ type modelAPI interface {
 	Revision() (int64, error)
 	Set(key, value string) error
 	SetTTL(key, value string, ttlSeconds int64) error
-	SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error
+	// SetKeepTTL's expectModRev > 0 makes the save a compare-and-swap: it
+	// fails with a *model.ConflictError if the key moved on since (N-1).
+	SetKeepTTL(key, value string, leaseID, ttlSeconds, expectModRev int64) error
 	MkDir(directory string) error
 	Del(key string) error
 	DelDir(key string) error
@@ -50,6 +54,9 @@ type modelAPI interface {
 	History(key string, limit int) ([]*model.Revision, bool, error)
 	ExportAt(dir string, rev int64) (map[string]string, error)
 	Import(items map[string]string, overwrite bool) (written, skipped int, err error)
+	// Watch and Ping drive the live mode (F-1); both are reads.
+	Watch(ctx context.Context, dir string) <-chan model.WatchEvent
+	Ping() error
 }
 
 // Policy is the session's safety configuration: what may be changed at all,
@@ -154,6 +161,20 @@ type Controller struct {
 	active int
 
 	startupErr error
+
+	// liveState is the live-refresh mode (F-1, Ctrl+L): see live.go.
+	liveState
+	// headerBase/headerColor are the static status line; renderHeader adds
+	// the live indicator to it.
+	headerBase  string
+	headerColor tcell.Color
+	// quietDetails suppresses the list's changed func while a pane is being
+	// rebuilt programmatically, so a refresh costs one details read instead of
+	// one per row the cursor passes through (and the parked pane never draws).
+	quietDetails bool
+	// queue runs f on the UI goroutine. App.QueueUpdateDraw in production;
+	// tests substitute a synchronous call.
+	queue func(f func())
 }
 
 type Node struct {
@@ -166,10 +187,6 @@ type Node struct {
 }
 
 func splitFunc(r rune) bool { return r == '/' }
-
-// appVersion is the user-facing version. DESIGN §9.3: it is duplicated in the
-// Makefile and build-deb.sh, and all three must move together until F-3 lands.
-const appVersion = "0.10.1"
 
 // headerText renders the frame's status line and the colour that goes with it.
 // It is separated from NewController so it can be tested without dialling a
@@ -199,7 +216,7 @@ func headerText(opts model.Options, proto, auth string, policy Policy) (string, 
 	}
 
 	return fmt.Sprintf("Etcd-walker v.%s (on %s:%s%s)  –  protocol: %s  |  Auth: %s%s",
-		appVersion, opts.Host, opts.Port, tlsTag, proto, auth, mode), color
+		version.Version, opts.Host, opts.Port, tlsTag, proto, auth, mode), color
 }
 
 func NewController(opts model.Options, policy Policy) *Controller {
@@ -215,18 +232,21 @@ func NewController(opts model.Options, policy Policy) *Controller {
 	}
 
 	text, headerColor := headerText(opts, headerProto, auth, policy)
-	v.Frame.AddText(text, true, tview.AlignCenter, headerColor)
 
 	controller := &Controller{
-		view:       v,
-		policy:     policy,
-		endpoint:   fmt.Sprintf("%s:%s", opts.Host, opts.Port),
-		journal:    &Journal{dryRun: policy.DryRun},
-		paneState:  newPaneState(),
-		inactive:   newPaneState(),
-		injected:   make(map[string]map[string]*model.Node),
-		startupErr: err,
+		view:        v,
+		policy:      policy,
+		endpoint:    fmt.Sprintf("%s:%s", opts.Host, opts.Port),
+		journal:     &Journal{dryRun: policy.DryRun},
+		paneState:   newPaneState(),
+		inactive:    newPaneState(),
+		injected:    make(map[string]map[string]*model.Node),
+		startupErr:  err,
+		headerBase:  text,
+		headerColor: headerColor,
 	}
+	controller.queue = func(f func()) { v.App.QueueUpdateDraw(f) }
+	controller.renderHeader()
 	// Assign only a real model: a nil *model.Model stored in the interface
 	// would read as non-nil. On startup error Run() never touches the model.
 	// Every mutation goes through the journalling decorator, which is also
@@ -251,6 +271,22 @@ func displayName(base string, isDir bool) string {
 		return base + "/"
 	}
 	return base
+}
+
+// maxTitlePath bounds how much of a key path a dialog title shows. A title
+// wider than its box is clipped, and with a long key the part that went was
+// the mode ("Edit (multiline)") and the Save/Cancel hint — found by the VPS
+// round-B extreme-keys scenario with a 300-character key.
+const maxTitlePath = 60
+
+// titlePath renders a key path for a dialog title: escaped, and shortened
+// from the left (the tail is the part that identifies the key).
+func titlePath(p string) string {
+	r := []rune(p)
+	if len(r) > maxTitlePath {
+		p = "…" + string(r[len(r)-maxTitlePath+1:])
+	}
+	return tview.Escape(p)
 }
 
 func normAbs(p string) string {
@@ -475,7 +511,10 @@ func (c *Controller) rowLabel(entry *Node, display string) string {
 	if n.IsDir {
 		prefix = "📁 "
 	}
-	label := prefix + display
+	// Escape the name: etcd keys are arbitrary bytes, and a key such as
+	// "[bracket]" would otherwise be parsed as a colour tag and vanish from
+	// the listing (the B-13 class of bug, for data rather than chrome).
+	label := prefix + tview.Escape(display)
 	if entry.stale {
 		return "[gray]" + label + "  (cached)[-]"
 	}
@@ -536,7 +575,14 @@ func (c *Controller) updateList() []string {
 	} else {
 		c.lastGoodDir = c.currentDir
 	}
+	display := c.renderList()
+	// The directory may have changed: point the live watch at it.
+	c.syncWatches()
+	return display
+}
 
+// renderList rebuilds the active list widget from c.currentNodes.
+func (c *Controller) renderList() []string {
 	c.view.List.Clear()
 	c.view.List.SetTitle(c.listTitle())
 
@@ -583,9 +629,9 @@ func (c *Controller) updateList() []string {
 // trap, since everything on it is read-only and possibly long gone.
 func (c *Controller) listTitle() string {
 	if c.atRevision() {
-		return fmt.Sprintf("[ [::b]%s[::-] @ [yellow::b]rev %d[white::-] ]", c.currentDir, c.rev)
+		return fmt.Sprintf("[ [::b]%s[::-] @ [yellow::b]rev %d[white::-] ]", tview.Escape(c.currentDir), c.rev)
 	}
-	return "[ [::b]" + c.currentDir + "[::-] ]"
+	return "[ [::b]" + tview.Escape(c.currentDir) + "[::-] ]"
 }
 
 func (c *Controller) fillDetails(mapKey string) {
@@ -630,9 +676,9 @@ func (c *Controller) fillDetails(mapKey string) {
 	}
 	fmt.Fprintf(c.view.Details, "[::b]Path info[::-]\n")
 	fmt.Fprintf(c.view.Details, "  [green]Type:[-] %s\n", map[bool]string{true: "Directory", false: "Key"}[n.IsDir])
-	fmt.Fprintf(c.view.Details, "  [green]Basename:[-] %s\n", base)
-	fmt.Fprintf(c.view.Details, "  [green]Parent:[-] %s\n", parent)
-	fmt.Fprintf(c.view.Details, "  [green]Full path:[-] %s\n", n.Name)
+	fmt.Fprintf(c.view.Details, "  [green]Basename:[-] %s\n", tview.Escape(base))
+	fmt.Fprintf(c.view.Details, "  [green]Parent:[-] %s\n", tview.Escape(parent))
+	fmt.Fprintf(c.view.Details, "  [green]Full path:[-] %s\n", tview.Escape(n.Name))
 	fmt.Fprintf(c.view.Details, "  [green]Depth:[-] %d\n", depthOf(n.Name))
 
 	fmt.Fprintf(c.view.Details, "\n[::b]Cluster info[::-]\n")
@@ -986,6 +1032,8 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlB:
 			c.SetDualPane(!c.dual)
 			return nil
+		case tcell.KeyCtrlL:
+			return c.toggleLive()
 		case tcell.KeyTab, tcell.KeyBacktab:
 			c.switchPane()
 			return nil
@@ -1071,6 +1119,7 @@ func (c *Controller) Up() {
 
 func (c *Controller) Stop() {
 	log.Debugf("exit...")
+	c.stopLive()
 	c.view.App.Stop()
 }
 
@@ -1108,7 +1157,7 @@ func (c *Controller) Run() error {
 		}
 		idx := i
 		l.SetChangedFunc(func(_ int, _ string, secondary string, _ rune) {
-			if idx != c.active {
+			if idx != c.active || c.quietDetails {
 				return
 			}
 			c.fillDetails(strings.TrimSpace(secondary))
@@ -1124,13 +1173,15 @@ func (c *Controller) search() *tcell.EventKey {
 
 	// Use the exact ordering the visible list was built with. Recomputing it
 	// here used to sort differently from updateList, landing the cursor on
-	// the wrong row whenever one name was a prefix of another.
-	ordered := c.ordered
-
+	// the wrong row whenever one name was a prefix of another. And read it
+	// when the search *completes*, not when the dialog opened: in live mode
+	// the list can be rebuilt underneath an open search, and an ordering
+	// captured earlier would put the cursor on whatever key now occupies the
+	// old row (found by the gap review after F-1).
 	search.SetDoneFunc(func(key tcell.Key) {
 		oldPos := c.view.List.GetCurrentItem()
 		value := strings.TrimSpace(search.GetText())
-		pos := c.getPosition(value, ordered)
+		pos := c.getPosition(value, c.ordered)
 		// +1 because of the top "[..]" entry. A miss (pos < 0) leaves the
 		// cursor alone rather than yanking it to the first row.
 		if pos >= 0 && pos+1 != oldPos && key == tcell.KeyEnter {
@@ -1144,8 +1195,8 @@ func (c *Controller) search() *tcell.EventKey {
 		if prefix == "" {
 			return nil
 		}
-		result := make([]string, 0, len(ordered))
-		for _, word := range ordered {
+		result := make([]string, 0, len(c.ordered))
+		for _, word := range c.ordered {
 			if strings.HasPrefix(strings.ToLower(word), prefix) {
 				result = append(result, word)
 			}
@@ -1309,9 +1360,9 @@ func (c *Controller) rename() *tcell.EventKey {
 
 	curBase := baseOf(val.node.Name)
 
-	title := fmt.Sprintf("Rename key: %s", val.node.Name)
+	title := fmt.Sprintf("Rename key: %s", titlePath(val.node.Name))
 	if val.node.IsDir {
-		title = fmt.Sprintf("Rename folder: %s", val.node.Name)
+		title = fmt.Sprintf("Rename folder: %s", titlePath(val.node.Name))
 	}
 
 	renameForm := c.view.NewEditValueForm(title, curBase)
@@ -1393,7 +1444,7 @@ func (c *Controller) setTTL() *tcell.EventKey {
 		cur = strconv.FormatInt(val.node.TTL, 10)
 	}
 
-	form := c.view.NewTTLForm(fmt.Sprintf("Set TTL: %s", val.node.Name), cur)
+	form := c.view.NewTTLForm(fmt.Sprintf("Set TTL: %s", titlePath(val.node.Name)), cur)
 	form.AddButton("Save", func() {
 		raw := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
 		c.view.Pages.RemovePage("modal")
@@ -1477,7 +1528,13 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 	}
 	val.node = fresh
 
-	c.openValueEditor(val, val.node.Value)
+	// The editor works against a private copy of the node as it was read
+	// here: its ModRev is what the save will compare against (N-1). val.node
+	// itself keeps being replaced by on-focus and live refreshes while the
+	// editor is open, and comparing against *those* would wave through the
+	// very concurrent write the check exists to catch.
+	base := *fresh
+	c.openValueEditor(val, &base, base.Value)
 	return nil
 }
 
@@ -1488,14 +1545,18 @@ func (c *Controller) editMultiline() *tcell.EventKey {
 // In a read-only session the editor still opens — it is the only way to read a
 // value past the details pane's preview cap — but disabled, and saving is
 // refused by the policy guard regardless.
-func (c *Controller) openValueEditor(val *Node, initial string) {
-	title := fmt.Sprintf(" Edit (multiline): %s ", val.node.Name)
+//
+// base is the node the edit started from; saving is conditional on the key
+// still being at base.ModRev.
+func (c *Controller) openValueEditor(val *Node, base *model.Node, initial string) {
+	name := titlePath(val.node.Name)
+	title := fmt.Sprintf(" Edit (multiline): %s ", name)
 	viewOnly := c.policy.ReadOnly || c.atRevision()
 	if c.policy.ReadOnly {
-		title = fmt.Sprintf(" View (read-only): %s ", val.node.Name)
+		title = fmt.Sprintf(" View (read-only): %s ", name)
 	}
 	if c.atRevision() {
-		title = fmt.Sprintf(" View at rev %d: %s ", c.rev, val.node.Name)
+		title = fmt.Sprintf(" View at rev %d: %s ", c.rev, name)
 	}
 	ta := c.view.NewMultilineEditor(title, initial)
 	if viewOnly {
@@ -1519,26 +1580,9 @@ func (c *Controller) openValueEditor(val *Node, initial string) {
 			c.guarded(guard{
 				action: "save",
 				paths:  []string{val.node.Name},
-				do: func() {
-					// Preserve any expiry: SetKeepTTL re-attaches the v3 lease / re-applies
-					// the v2 TTL so editing a key's value no longer silently drops it.
-					if err := c.model.SetKeepTTL(val.node.Name, value, val.node.LeaseID, val.node.TTL); err != nil {
-						c.error("Failed to save value", err, false)
-						return
-					}
-					if strings.HasPrefix(baseOf(val.node.Name), "_") {
-						nd := &model.Node{Name: val.node.Name, IsDir: false, Value: value, ClusterId: val.node.ClusterId, TTL: val.node.TTL, LeaseID: val.node.LeaseID}
-						c.injectWritten(nd)
-					}
-					ordered := c.updateList()
-					c.selectRow(displayName(baseOf(val.node.Name), false), ordered)
-					// Refresh details panel with mapKey
-					i := c.view.List.GetCurrentItem()
-					_, mk := c.view.List.GetItemText(i)
-					c.fillDetails(strings.TrimSpace(mk))
-				},
+				do:     func() { c.saveValue(val, base, value) },
 				// Declining the confirmation must not cost the user their edit.
-				onCancel: func() { c.openValueEditor(val, value) },
+				onCancel: func() { c.openValueEditor(val, base, value) },
 			})
 			return nil
 
@@ -1550,6 +1594,148 @@ func (c *Controller) openValueEditor(val *Node, initial string) {
 	})
 
 	c.view.OpenEditor(ta)
+}
+
+// saveValue writes the editor's text as a compare-and-swap against base. On
+// success the listing and details are refreshed; on a conflict (someone else
+// wrote or deleted the key since base was read) nothing is written and the
+// user chooses what happens next.
+func (c *Controller) saveValue(val *Node, base *model.Node, value string) {
+	// Preserve any expiry: SetKeepTTL re-attaches the v3 lease / re-applies
+	// the v2 TTL so editing a key's value does not silently drop it.
+	err := c.model.SetKeepTTL(base.Name, value, base.LeaseID, base.TTL, base.ModRev)
+	if ce, ok := model.AsConflict(err); ok {
+		c.resolveConflict(val, base, value, ce)
+		return
+	}
+	if err != nil {
+		// The editor is already closed. A failed save (timeout, dropped
+		// connection, permission denied) must not also cost the user what
+		// they typed: dismissing the error reopens the editor with it.
+		c.errorThen("Failed to save value — your text is kept", err, func() {
+			c.openValueEditor(val, base, value)
+		})
+		return
+	}
+	if strings.HasPrefix(baseOf(base.Name), "_") {
+		nd := &model.Node{Name: base.Name, IsDir: false, Value: value, ClusterId: base.ClusterId, TTL: base.TTL, LeaseID: base.LeaseID}
+		c.injectWritten(nd)
+	}
+	ordered := c.updateList()
+	c.selectRow(displayName(baseOf(base.Name), false), ordered)
+	c.fillDetails(currentMapKeyOf(c.view.List))
+}
+
+// resolveConflict is shown when a save was refused because the key changed
+// under the editor. Nothing has been written at this point; every choice is
+// explicit:
+//
+//   - diff: what is on the server now vs. what the user typed
+//   - overwrite: save anyway — but still as a CAS against the version just
+//     looked at, so a *third* writer in the meantime is caught again
+//   - reload: discard the edit and reopen the editor on the server's value
+//   - keep editing: back to the editor with the user's text intact
+//
+// A deleted key offers recreate / keep editing / discard instead.
+func (c *Controller) resolveConflict(val *Node, base *model.Node, mine string, ce *model.ConflictError) {
+	var text string
+	if ce.Deleted {
+		text = fmt.Sprintf("%s was deleted on the server after you opened it (rev %d).\n\nYour edit was NOT saved.",
+			base.Name, ce.Expected)
+	} else {
+		text = fmt.Sprintf("%s was changed on the server after you opened it (rev %d → %d).\n\nYour edit was NOT saved.",
+			base.Name, ce.Expected, ce.Actual)
+	}
+	q := c.view.NewConflictQ(text, ce.Deleted)
+	q.SetDoneFunc(func(_ int, label string) {
+		c.view.Pages.RemovePage("modal")
+		c.conflictChoice(val, base, mine, ce, label)
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(q, 70, 11), true, true)
+}
+
+// conflictChoice acts on the button picked in the conflict dialog.
+func (c *Controller) conflictChoice(val *Node, base *model.Node, mine string, ce *model.ConflictError, label string) {
+	switch label {
+	case "diff":
+		c.showConflictDiff(val, base, mine, ce)
+	case "overwrite":
+		cur, err := c.model.GetAt(base.Name, 0)
+		if err != nil || cur == nil || cur.IsDir {
+			c.error("Overwrite failed", fmt.Errorf("re-reading %s: %v", base.Name, err), false)
+			return
+		}
+		// The live key's lease/TTL, not the stale base's: overwriting the
+		// value must not also roll back someone else's TTL change. But the
+		// CAS is against the revision the user was shown (ce.Actual, which
+		// the diff view advances to what it displayed), not this re-read:
+		// a third writer landing while the dialog was open is caught again
+		// instead of being clobbered unseen.
+		nb := *cur
+		nb.ModRev = ce.Actual
+		c.saveValue(val, &nb, mine)
+	case "recreate":
+		// The key is gone, so there is no revision to compare against.
+		// Its old lease may be gone too; recreate it permanent.
+		fresh := *base
+		fresh.ModRev, fresh.LeaseID, fresh.TTL = 0, 0, 0
+		c.saveValue(val, &fresh, mine)
+	case "reload":
+		cur, err := c.model.GetAt(base.Name, 0)
+		if err != nil || cur == nil || cur.IsDir {
+			c.error("Reload failed", fmt.Errorf("re-reading %s: %v", base.Name, err), false)
+			return
+		}
+		nb := *cur
+		c.openValueEditor(val, &nb, nb.Value)
+	case "keep editing", "":
+		// Esc lands here too: a stray keystroke must not throw away the
+		// user's text. Only "discard" drops it.
+		c.openValueEditor(val, base, mine)
+	}
+}
+
+// showConflictDiff renders the server's current value against the user's
+// unsaved text (minus = server, plus = yours). Esc returns to the conflict
+// dialog, which is where the decision is made.
+func (c *Controller) showConflictDiff(val *Node, base *model.Node, mine string, ce *model.ConflictError) {
+	back := func() {
+		c.view.Pages.RemovePage("modal")
+		c.resolveConflict(val, base, mine, ce)
+	}
+	cur, err := c.model.GetAt(base.Name, 0)
+	if err != nil || cur == nil || cur.IsDir {
+		c.error("Diff failed", fmt.Errorf("re-reading %s: %v", base.Name, err), false)
+		return
+	}
+	// What the diff shows is now "the version the user was shown": an
+	// overwrite chosen after looking at it is a CAS against this revision.
+	ce.Actual = cur.ModRev
+	tv := c.view.NewHistoryDetail(fmt.Sprintf(" conflict on %s: server (rev %d) vs your edit — %s ",
+		tview.Escape(base.Name), cur.ModRev, tview.Escape("[Esc] back")))
+	switch ops := diffLines(cur.Value, mine); {
+	case !utf8.ValidString(cur.Value) || !utf8.ValidString(mine):
+		fmt.Fprintf(tv, "binary value — cannot diff (server: %d bytes, yours: %d bytes)\n", len(cur.Value), len(mine))
+	case ops == nil:
+		fmt.Fprintf(tv, "values too large to diff (server: %d bytes, yours: %d bytes)\n", len(cur.Value), len(mine))
+	default:
+		minus, plus := diffCounts(ops)
+		if minus == 0 && plus == 0 {
+			fmt.Fprint(tv, "no differences — the server already holds exactly your text\n")
+		} else {
+			fmt.Fprintf(tv, "[red]--- server (rev %d)[-]  [green]+++ your edit[-]  ([red]-%d[-] / [green]+%d[-] lines)\n\n",
+				cur.ModRev, minus, plus)
+			fmt.Fprint(tv, renderDiff(ops))
+		}
+	}
+	tv.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if ev.Key() == tcell.KeyEsc {
+			back()
+			return nil
+		}
+		return ev
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(tv, 80, 24), true, true)
 }
 
 // export prompts for a filename and writes every non-directory key under the
@@ -1758,6 +1944,16 @@ func (c *Controller) promptImportMode(path string) {
 	})
 	c.view.Pages.RemovePage("modal")
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(q, 60, 9), true, true)
+}
+
+// errorThen shows an error and runs then once it is dismissed.
+func (c *Controller) errorThen(header string, err error, then func()) {
+	errMsg := c.view.NewErrorMessageQ(header, err.Error())
+	errMsg.SetDoneFunc(func(int, string) {
+		c.view.Pages.RemovePage("modal")
+		then()
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 60, 9), true, true)
 }
 
 func (c *Controller) error(header string, err error, fatal bool) {

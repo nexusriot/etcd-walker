@@ -7,6 +7,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/nexusriot/etcd-walker/pkg/model"
+	"github.com/nexusriot/etcd-walker/pkg/version"
 	"github.com/rivo/tview"
 )
 
@@ -352,7 +353,7 @@ func TestHeaderColorsAndOmissions(t *testing.T) {
 		t.Errorf("dry-run header colour = %v, want aqua", c)
 	}
 	// The version in the header is the one the docs promise (DESIGN §9.3).
-	if !strings.Contains(plain, appVersion) {
-		t.Errorf("header %q does not carry appVersion %q", plain, appVersion)
+	if !strings.Contains(plain, version.Version) {
+		t.Errorf("header %q does not carry version.Version %q", plain, version.Version)
 	}
 }

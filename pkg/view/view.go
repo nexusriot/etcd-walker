@@ -56,6 +56,28 @@ func (v *View) SetDual(on bool) {
 	v.Main.AddItem(v.Details, 0, 2, false)
 }
 
+// Legend is the hotkey line along the bottom of the frame.
+const Legend = "[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::b][Ctrl+G][::-]Rev [::b][Ctrl+L][::-]Live [::b][Ctrl+B][::-]2-pane [::b][Tab[][::-]Pane [::b][F5/F6][::-]Copy/Move [::b][Ctrl+U][::-]Undo [::b][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit"
+
+// legendAlign is left, not centre: the legend is far wider than most
+// terminals, and a centred line is clipped at *both* ends — which cut off
+// the navigation keys at the start and Ctrl+H/Ctrl+Q at the end. Left-aligned,
+// the most basic keys always show, and Ctrl+H (which lists everything) is
+// one keystroke away. Spotted while taking the README screenshots.
+const legendAlign = tview.AlignLeft
+
+// SetHeader replaces the frame's status line. tview.Frame can only clear all
+// of its texts at once, so the legend is re-added with it. Safe on a headless
+// View built by a test (no Frame).
+func (v *View) SetHeader(text string, color tcell.Color) {
+	if v.Frame == nil {
+		return
+	}
+	v.Frame.Clear()
+	v.Frame.AddText(text, true, tview.AlignCenter, color)
+	v.Frame.AddText(Legend, false, legendAlign, tcell.ColorWhite)
+}
+
 // NewView builds the running UI — the two-pane main page, the page stack all
 // modals share, and the frame carrying the header and the hotkey legend.
 // Tests construct a View literal instead: this one's Details pane calls
@@ -112,12 +134,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText(
-		"[::b][↓,↑][::-] Dwn/Up  [::b][Ent/Bs][::-]Open/Up [::b][Ctrl+N][::-]New [::b][Ctrl+D][::-]Dup [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][Ctrl+R][::-]Rename [::b][Ctrl+V][::-]Hist [::b][Ctrl+G][::-]Rev [::b][Ctrl+B][::-]2-pane [::b][Tab[][::-]Pane [::b][F5/F6][::-]Copy/Move [::b][Ctrl+U][::-]Undo [::b][/,Ctrl+S][::-]Search [::b][Ctrl+F][::-]Find [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
-		false,
-		tview.AlignCenter,
-		tcell.ColorWhite,
-	)
+	frame.AddText(Legend, false, legendAlign, tcell.ColorWhite)
 
 	v := View{
 		App:         app,
@@ -259,6 +276,20 @@ func (v *View) NewOverwriteQ(details string) *tview.Modal {
 	return m
 }
 
+// NewConflictQ explains that a save was refused because the key changed on
+// the server since the editor opened it, and offers the ways out. The buttons
+// differ when the key was deleted rather than rewritten: there is nothing to
+// diff against or reload.
+func (v *View) NewConflictQ(details string, deleted bool) *tview.Modal {
+	m := tview.NewModal()
+	buttons := []string{"diff", "overwrite", "reload", "keep editing"}
+	if deleted {
+		buttons = []string{"recreate", "keep editing", "discard"}
+	}
+	m.SetText(details).AddButtons(buttons).SetBackgroundColor(tcell.ColorDarkRed)
+	return m
+}
+
 // NewRestoreQ asks before overwriting the current value with an old revision.
 func (v *View) NewRestoreQ(details string) *tview.Modal {
 	m := tview.NewModal()
@@ -330,6 +361,11 @@ func (v *View) NewHotkeysModal() *tview.TextView {
                 revisions back, or empty to return to live.
                 A pinned pane is read-only; each pane has
                 its own revision.
+[::b]Live refresh[::-]
+  Ctrl+L        Toggle live mode: panes re-list as the
+                cluster changes (etcd watch); the header
+                shows LIVE, or a warning when the cluster
+                is unreachable
 [::b]Two panes[::-]
   Ctrl+B        Show/hide the second pane
   Tab           Switch panes
@@ -339,7 +375,8 @@ func (v *View) NewHotkeysModal() *tview.TextView {
   /, Ctrl+S     Search by name (in current level)
   Ctrl+F        Find recursively (paths, optionally values)
 [::b]Editor[::-]
-  Ctrl+S        Save
+  Ctrl+S        Save (refused if the key changed on the
+                server meanwhile: diff/overwrite/reload)
   Esc/Ctrl+Q    Cancel/Cancel+Quit
 [::b]Misc[::-]
   Ctrl+H        This help

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"testing"
@@ -34,9 +35,15 @@ func (r *recordingBackend) setTTL(key, value string, ttl int64) error {
 	r.note("setTTL", key, value, ttl)
 	return nil
 }
-func (r *recordingBackend) setKeep(key, value string, leaseID, ttl int64) error {
-	r.note("setKeep", key, value, leaseID, ttl)
+func (r *recordingBackend) setKeep(key, value string, leaseID, ttl, rev int64) error {
+	r.note("setKeep", key, value, leaseID, ttl, rev)
 	return nil
+}
+func (r *recordingBackend) watch(_ context.Context, dir string) <-chan WatchEvent {
+	r.note("watch", dir)
+	ch := make(chan WatchEvent)
+	close(ch)
+	return ch
 }
 func (r *recordingBackend) mkdir(dir string) error  { r.note("mkdir", dir); return nil }
 func (r *recordingBackend) del(key string) error    { r.note("del", key); return nil }
@@ -83,7 +90,7 @@ func TestModelDelegatesToBackend(t *testing.T) {
 		{"Get", func(m *Model) { m.Get("/k") }, "get", []interface{}{"/k", int64(0)}},
 		{"Set", func(m *Model) { m.Set("/k", "v") }, "set", []interface{}{"/k", "v"}},
 		{"SetTTL", func(m *Model) { m.SetTTL("/k", "v", 60) }, "setTTL", []interface{}{"/k", "v", int64(60)}},
-		{"SetKeepTTL", func(m *Model) { m.SetKeepTTL("/k", "v", 7, 30) }, "setKeep", []interface{}{"/k", "v", int64(7), int64(30)}},
+		{"SetKeepTTL", func(m *Model) { m.SetKeepTTL("/k", "v", 7, 30, 11) }, "setKeep", []interface{}{"/k", "v", int64(7), int64(30), int64(11)}},
 		{"MkDir", func(m *Model) { m.MkDir("/d") }, "mkdir", []interface{}{"/d"}},
 		{"Del", func(m *Model) { m.Del("/k") }, "del", []interface{}{"/k"}},
 		{"DelDir", func(m *Model) { m.DelDir("/d") }, "deldir", []interface{}{"/d"}},
@@ -95,6 +102,8 @@ func TestModelDelegatesToBackend(t *testing.T) {
 		{"Search", func(m *Model) { m.Search("/d", "q", true, 5) }, "search", []interface{}{"/d", "q", true, 5, int64(0)}},
 		{"History", func(m *Model) { m.History("/k", 9) }, "history", []interface{}{"/k", 9}},
 		{"ProtocolVersion", func(m *Model) { m.ProtocolVersion() }, "proto", nil},
+		{"Watch", func(m *Model) { m.Watch(context.Background(), "/d") }, "watch", []interface{}{"/d"}},
+		{"Ping", func(m *Model) { m.Ping() }, "probe", nil},
 		// The *At readers must pass the revision through untouched: a dropped
 		// rev would silently serve current data under a historical label.
 		{"LsAt", func(m *Model) { m.LsAt("/d", 42) }, "ls", []interface{}{"/d", int64(42)}},

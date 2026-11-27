@@ -49,6 +49,9 @@ type Config struct {
 
 	// DualPane starts the browser with two panes side by side.
 	DualPane bool `json:"dual_pane"`
+
+	// Live starts with live refresh on: panes re-list as the cluster changes.
+	Live bool `json:"live"`
 }
 
 // Load tries to read and unmarshal config from the given path.

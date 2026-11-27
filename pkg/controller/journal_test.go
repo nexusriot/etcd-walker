@@ -68,7 +68,7 @@ func TestJournalDryRunDoesNotWrite(t *testing.T) {
 	if err := w.Set("/a/k", "v"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.SetKeepTTL("/a/k", "v2", 0, 0); err != nil {
+	if err := w.SetKeepTTL("/a/k", "v2", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Del("/a/k"); err != nil {
@@ -197,7 +197,8 @@ func TestScriptSafe(t *testing.T) {
 func TestModelAPISurfaceIsJournalled(t *testing.T) {
 	iface := reflect.TypeOf((*modelAPI)(nil)).Elem()
 
-	const knownMethods = 19
+	// 21: Watch and Ping (live mode, F-1) are reads and are promoted.
+	const knownMethods = 21
 	if got := iface.NumMethod(); got != knownMethods {
 		t.Fatalf("modelAPI has %d methods, expected %d — if you added one, decide "+
 			"whether it mutates: mutators must be overridden in journaling (and "+
@@ -224,7 +225,7 @@ func TestEveryMutatorIsRecorded(t *testing.T) {
 	calls := map[string]func(w *journaling) error{
 		"Set":        func(w *journaling) error { return w.Set("/k", "v") },
 		"SetTTL":     func(w *journaling) error { return w.SetTTL("/k", "v", 60) },
-		"SetKeepTTL": func(w *journaling) error { return w.SetKeepTTL("/k", "v", 0, 0) },
+		"SetKeepTTL": func(w *journaling) error { return w.SetKeepTTL("/k", "v", 0, 0, 0) },
 		"MkDir":      func(w *journaling) error { return w.MkDir("/d") },
 		"Del":        func(w *journaling) error { return w.Del("/k") },
 		"DelDir":     func(w *journaling) error { return w.DelDir("/d") },

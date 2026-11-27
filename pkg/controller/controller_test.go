@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +44,13 @@ type fakeModel struct {
 	readRevs []int64
 
 	setKeepCalls   []setKeepCall
+	setKeepErrs    []error // returned by successive SetKeepTTL calls
+	searchHits     []*model.Node
+	searchTrunc    bool
+	searchErr      error
+	watchDirs      []string
+	watchChans     map[string]chan model.WatchEvent
+	pingErr        error
 	delDirCalls    []string
 	renameDirCalls []string
 	renameKeyCalls []string
@@ -60,6 +68,7 @@ type setKeepCall struct {
 	key, value string
 	leaseID    int64
 	ttl        int64
+	rev        int64
 }
 
 func (f *fakeModel) ProtocolVersion() string { return "v3" }
@@ -104,12 +113,33 @@ func (f *fakeModel) Revision() (int64, error) {
 	return f.rev, nil
 }
 
-func (f *fakeModel) Set(k, v string) error              { f.note("set %s %s", k, v); return f.setErr }
-func (f *fakeModel) SetTTL(string, string, int64) error { return nil }
-func (f *fakeModel) SetKeepTTL(key, value string, leaseID, ttl int64) error {
-	f.setKeepCalls = append(f.setKeepCalls, setKeepCall{key, value, leaseID, ttl})
+func (f *fakeModel) Set(k, v string) error { f.note("set %s %s", k, v); return f.setErr }
+func (f *fakeModel) SetTTL(k, v string, secs int64) error {
+	f.note("setttl %s %s %d", k, v, secs)
 	return nil
 }
+func (f *fakeModel) SetKeepTTL(key, value string, leaseID, ttl, rev int64) error {
+	f.setKeepCalls = append(f.setKeepCalls, setKeepCall{key, value, leaseID, ttl, rev})
+	if len(f.setKeepErrs) > 0 {
+		err := f.setKeepErrs[0]
+		f.setKeepErrs = f.setKeepErrs[1:]
+		return err
+	}
+	return nil
+}
+
+// Watch hands out a channel the test can push events into; watchDirs records
+// every directory a watch was started on.
+func (f *fakeModel) Watch(ctx context.Context, dir string) <-chan model.WatchEvent {
+	f.watchDirs = append(f.watchDirs, dir)
+	ch := make(chan model.WatchEvent, 16)
+	if f.watchChans == nil {
+		f.watchChans = map[string]chan model.WatchEvent{}
+	}
+	f.watchChans[dir] = ch
+	return ch
+}
+func (f *fakeModel) Ping() error          { return f.pingErr }
 func (f *fakeModel) MkDir(d string) error { f.note("mkdir %s", d); return nil }
 func (f *fakeModel) Del(key string) error {
 	f.delCalls = append(f.delCalls, key)
@@ -140,9 +170,10 @@ func (f *fakeModel) Import(items map[string]string, o bool) (int, int, error) {
 	f.note("import %d %v", len(items), o)
 	return len(items), 0, nil
 }
-func (f *fakeModel) SearchAt(_, _ string, _ bool, _ int, rev int64) ([]*model.Node, bool, error) {
+func (f *fakeModel) SearchAt(dir, q string, inValues bool, _ int, rev int64) ([]*model.Node, bool, error) {
 	f.readRevs = append(f.readRevs, rev)
-	return nil, false, nil
+	f.note("search %s %s %v", dir, q, inValues)
+	return f.searchHits, f.searchTrunc, f.searchErr
 }
 func (f *fakeModel) History(key string, limit int) ([]*model.Revision, bool, error) {
 	f.histCalls++
@@ -159,9 +190,12 @@ func newTestController(m modelAPI) *Controller {
 		tview.NewList().ShowSecondaryText(false),
 		tview.NewList().ShowSecondaryText(false),
 	}
+	pages := tview.NewPages()
 	v := &view.View{
-		App:     tview.NewApplication(),
-		Pages:   tview.NewPages(),
+		App:   tview.NewApplication(),
+		Pages: pages,
+		// A Frame for the value editor to return to when it closes.
+		Frame:   tview.NewFrame(pages),
 		List:    lists[0],
 		Lists:   lists,
 		Details: tview.NewTextView().SetDynamicColors(true),
@@ -182,6 +216,9 @@ func newTestController(m modelAPI) *Controller {
 		paneState: newPaneState(),
 		inactive:  newPaneState(),
 		injected:  make(map[string]map[string]*model.Node),
+		// Synchronous: the live-mode tests deliver watch events by hand and
+		// want their effect visible as soon as onWatch returns.
+		queue: func(f func()) { f() },
 	}
 }
 

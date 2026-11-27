@@ -369,13 +369,13 @@ func TestV3SetKeepWritesValue(t *testing.T) {
 	b, kv := newTestBackend(map[string]string{"/k": "old"})
 	// leaseID is ignored by fakeKV (it does not model leases), but setKeep must
 	// still write the new value whether or not a lease is supplied.
-	if err := b.setKeep("/k", "new", 7, 0); err != nil {
+	if err := b.setKeep("/k", "new", 7, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if kv.store["/k"] != "new" {
 		t.Errorf("setKeep(lease) value = %q, want new", kv.store["/k"])
 	}
-	if err := b.setKeep("/k", "newer", 0, 0); err != nil {
+	if err := b.setKeep("/k", "newer", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if kv.store["/k"] != "newer" {
@@ -386,7 +386,7 @@ func TestV3SetKeepWritesValue(t *testing.T) {
 func TestModelSetKeepTTL(t *testing.T) {
 	b, kv := newTestBackend(map[string]string{"/cfg/a": "1"})
 	m := &Model{backend: b}
-	if err := m.SetKeepTTL("/cfg/a", "2", 0, 0); err != nil {
+	if err := m.SetKeepTTL("/cfg/a", "2", 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if kv.store["/cfg/a"] != "2" {

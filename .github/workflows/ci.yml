@@ -98,6 +98,16 @@ jobs:
           ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
         ports:
           - 2379:2379
+      # etcd 3.3 serves the v2 API: the CAS/watch integration tests run
+      # against both protocols and skip v2 only when this is absent.
+      etcd-v2:
+        image: quay.io/coreos/etcd:v3.3.27
+        env:
+          ETCD_ENABLE_V2: "true"
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2479
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+        ports:
+          - 2479:2379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -108,14 +118,16 @@ jobs:
       # missing cluster must not look like a pass — so wait for it first.
       - name: wait for etcd
         run: |
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:2379/version >/dev/null 2>&1; then
-              echo "etcd is up: $(curl -fsS http://127.0.0.1:2379/version)"
-              exit 0
-            fi
-            sleep 1
+          for port in 2379 2479; do
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:$port/version >/dev/null 2>&1; then
+                echo "etcd :$port is up: $(curl -fsS http://127.0.0.1:$port/version)"
+                continue 2
+              fi
+              sleep 1
+            done
+            echo "etcd :$port did not become ready in 30s"; exit 1
           done
-          echo "etcd did not become ready in 30s"; exit 1
 
       # The unit suite runs against fakes; this exercises the real v3 client —
       # the layer where lease, revision and prefix semantics actually live.
@@ -123,3 +135,23 @@ jobs:
         run: go test ./... -tags=integration -run Integration -count=1 -v
         env:
           ETCD_WALKER_TEST_ENDPOINT: 127.0.0.1:2379
+          ETCD_WALKER_TEST_V2_ENDPOINT: 127.0.0.1:2479
+
+  e2e:
+    name: e2e (real binary in tmux, etcd v2/v3/auth/TLS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      # Hermetic: its own compose project on free ports, private tmux socket,
+      # temporary TLS material and state dir, torn down afterwards.
+      - name: e2e
+        run: make e2e
+        env:
+          TERM: xterm-256color

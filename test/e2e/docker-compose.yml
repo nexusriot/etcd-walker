@@ -1,0 +1,84 @@
+# etcd-walker end-to-end test clusters.
+#
+# Normally brought up by run.sh, which picks free ports, generates the TLS
+# material, uses a unique compose project name and tears everything down
+# afterwards. Every port is bound to loopback only.
+#
+#   etcd-v3    etcd 3.5, plain v3
+#   etcd-v2    etcd 3.3 with the v2 API enabled (the newest line that serves it
+#              without experimental flags)
+#   etcd-auth  etcd 3.5; the harness enables auth (root/rootpw, ro/ropw) and the
+#              5 s simple-token TTL exercises token expiry
+#   etcd-tls   etcd 3.5 over HTTPS with client-certificate auth (mTLS)
+x-health: &health
+  interval: 1s
+  timeout: 3s
+  retries: 60
+
+services:
+  etcd-v3:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --name=v3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:${EW_V3_PORT:-12379}
+    ports: ["127.0.0.1:${EW_V3_PORT:-12379}:2379"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+    mem_limit: 256m
+
+  etcd-v2:
+    image: quay.io/coreos/etcd:v3.3.27
+    command:
+      - /usr/local/bin/etcd
+      - --name=v2
+      - --data-dir=/etcd-data
+      - --enable-v2=true
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:${EW_V2_PORT:-22379}
+    ports: ["127.0.0.1:${EW_V2_PORT:-22379}:2379"]
+    healthcheck:
+      <<: *health
+      # cluster-health would query the *advertised* URL (the host port), which
+      # does not exist inside the container; the v3 endpoint check is local.
+      test: ["CMD-SHELL", "ETCDCTL_API=3 /usr/local/bin/etcdctl endpoint health"]
+    mem_limit: 256m
+
+  etcd-auth:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --name=auth
+      - --data-dir=/etcd-data
+      - --auth-token=simple
+      - --auth-token-ttl=5
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:${EW_AUTH_PORT:-32379}
+    ports: ["127.0.0.1:${EW_AUTH_PORT:-32379}:2379"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+    mem_limit: 256m
+
+  etcd-tls:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --name=tls
+      - --data-dir=/etcd-data
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://127.0.0.1:${EW_TLS_PORT:-42379}
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+      - --trusted-ca-file=/certs/ca.crt
+      - --client-cert-auth=true
+    volumes: ["${EW_CERT_DIR:-./certs}:/certs:ro"]
+    ports: ["127.0.0.1:${EW_TLS_PORT:-42379}:2379"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "etcdctl", "--endpoints=https://127.0.0.1:2379", "--cacert=/certs/ca.crt",
+             "--cert=/certs/client.crt", "--key=/certs/client.key", "endpoint", "health"]
+    mem_limit: 256m

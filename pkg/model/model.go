@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	// v3 client
@@ -119,8 +122,13 @@ func (m *Model) SetTTL(key, value string, ttlSeconds int64) error {
 // leaseID (0 = write the key without a lease); on v2 it re-applies ttlSeconds
 // (0 = no expiry). This is what the value editor uses so editing a key no
 // longer silently clears its TTL.
-func (m *Model) SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error {
-	return m.backend.setKeep(key, value, leaseID, ttlSeconds)
+//
+// expectModRev makes the write conditional (N-1): it only lands if the key's
+// ModRev is still expectModRev — the revision the user's edit was based on —
+// and otherwise fails with a *ConflictError instead of overwriting whatever
+// someone else wrote in the meantime. 0 writes unconditionally.
+func (m *Model) SetKeepTTL(key, value string, leaseID, ttlSeconds, expectModRev int64) error {
+	return m.backend.setKeep(key, value, leaseID, ttlSeconds, expectModRev)
 }
 func (m *Model) MkDir(directory string) error                 { return m.backend.mkdir(directory) }
 func (m *Model) Del(key string) error                         { return m.backend.del(key) }
@@ -193,7 +201,12 @@ type backend interface {
 	get(key string, rev int64) (*Node, error)
 	set(key, value string) error
 	setTTL(key, value string, ttlSeconds int64) error
-	setKeep(key, value string, leaseID, ttlSeconds int64) error
+	// setKeep writes while preserving the key's expiry; expectModRev > 0 makes
+	// it a compare-and-swap on the key's ModRev (see Model.SetKeepTTL).
+	setKeep(key, value string, leaseID, ttlSeconds, expectModRev int64) error
+	// watch streams a notification whenever anything under dir changes,
+	// until ctx is cancelled (see Model.Watch).
+	watch(ctx context.Context, dir string) <-chan WatchEvent
 	mkdir(directory string) error
 	del(key string) error
 	deldir(key string) error
@@ -224,14 +237,16 @@ func NewModel(opts Options) (*Model, error) {
 		}
 		if err := b3.probe(); err != nil {
 			b3.close()
-			return nil, fmt.Errorf("v3 probe failed: %w", err)
+			return nil, fmt.Errorf("v3 probe failed: %w", b3.explainTLS(err))
 		}
 
 		return &Model{backend: b3, authLabel: authLabelOf(b3)}, nil
 
 	case "auto":
+		var v3err error
 		if b3, err := newV3Backend(opts); err == nil {
 			perr := b3.probe()
+			v3err = b3.explainTLS(perr)
 			switch {
 			case perr == nil:
 				return &Model{backend: b3, authLabel: authLabelOf(b3)}, nil
@@ -252,6 +267,11 @@ func NewModel(opts Options) (*Model, error) {
 			}
 		}
 
+		if v3err != nil {
+			// Say why v3 failed: with TLS on, "neither reachable" alone hides a
+			// certificate problem behind what reads like a dead host.
+			return nil, fmt.Errorf("auto: neither v3 nor v2 reachable at %s:%s (v3: %v)", host, port, v3err)
+		}
 		return nil, fmt.Errorf("auto: neither v3 nor v2 reachable at %s:%s", host, port)
 
 	default: // v2
@@ -295,9 +315,15 @@ type lessor interface {
 }
 
 type v3Backend struct {
-	cli     clientv3.KV
-	lessor  lessor
+	cli    clientv3.KV
+	lessor lessor
+	// watcher serves the live mode (Model.Watch). *clientv3.Client in
+	// production; nil in unit tests that do not exercise watching.
+	watcher clientv3.Watcher
 	c       *clientv3.Client
+	// tlsCfg/addr let a failed probe be explained (explainTLS); nil without TLS.
+	tlsCfg  *tls.Config
+	addr    string
 	timeout time.Duration
 }
 
@@ -351,6 +377,25 @@ func newV3Backend(opts Options) (*v3Backend, error) {
 		DialTimeout: timeout,
 		Logger:      zap.NewNop(),
 		TLS:         tlsCfg,
+		// Without keepalives a connection whose packets silently vanish (a
+		// partition, a dropped NAT entry — no RST) is never declared dead:
+		// every RPC queues behind TCP retransmits that back off for minutes,
+		// so the session stayed red long after the network returned (VPS
+		// fault round B, 75 s blackhole). Probe it, and redial quickly.
+		// Pings are only sent while a stream (the live watch) is open: etcd's
+		// server refuses pings on idle connections (PermitWithoutStream=false
+		// in its enforcement policy) and would GOAWAY us for them.
+		DialKeepAliveTime:    10 * time.Second,
+		DialKeepAliveTimeout: 5 * time.Second,
+		DialOptions: []grpc.DialOption{grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  500 * time.Millisecond,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   5 * time.Second, // gRPC's default is 120 s
+			},
+			MinConnectTimeout: timeout,
+		})},
 	}
 	if opts.Username != "" {
 		cfg.Username = opts.Username
@@ -361,7 +406,8 @@ func newV3Backend(opts Options) (*v3Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &v3Backend{cli: clientv3.NewKV(c), lessor: c, c: c, timeout: timeout}, nil
+	return &v3Backend{cli: clientv3.NewKV(c), lessor: c, watcher: c, c: c, timeout: timeout,
+		tlsCfg: tlsCfg, addr: net.JoinHostPort(opts.Host, opts.Port)}, nil
 }
 
 func (b *v3Backend) proto() string { return "v3" }
@@ -685,16 +731,42 @@ func (b *v3Backend) revokeIfOrphaned(ctx context.Context, lease clientv3.LeaseID
 // setKeep updates the key's value while preserving its current lease, so an
 // ordinary value edit no longer detaches the key's TTL. leaseID 0 means the
 // key has no lease and is written permanently.
-func (b *v3Backend) setKeep(key, value string, leaseID, _ int64) error {
+func (b *v3Backend) setKeep(key, value string, leaseID, _, expectModRev int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	k := normPath(key)
-	if leaseID == 0 {
-		_, err := b.cli.Put(ctx, k, value)
+	var opts []clientv3.OpOption
+	if leaseID != 0 {
+		opts = append(opts, clientv3.WithLease(clientv3.LeaseID(leaseID)))
+	}
+	if expectModRev <= 0 {
+		_, err := b.cli.Put(ctx, k, value, opts...)
 		return err
 	}
-	_, err := b.cli.Put(ctx, k, value, clientv3.WithLease(clientv3.LeaseID(leaseID)))
-	return err
+	// Compare-and-swap: the Put only lands if nobody has written the key since
+	// the revision the edit started from. A key deleted meanwhile has
+	// ModRevision 0, so it fails the compare too rather than being resurrected.
+	// The Else branch reads the key back so the conflict can say what it is
+	// now, without a second round trip.
+	resp, err := b.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(k), "=", expectModRev)).
+		Then(clientv3.OpPut(k, value, opts...)).
+		Else(clientv3.OpGet(k)).
+		Commit()
+	if err != nil {
+		return err
+	}
+	if resp.Succeeded {
+		return nil
+	}
+	ce := &ConflictError{Key: k, Expected: expectModRev, Deleted: true}
+	if len(resp.Responses) > 0 {
+		if rr := resp.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) > 0 {
+			ce.Deleted = false
+			ce.Actual = rr.Kvs[0].ModRevision
+		}
+	}
+	return ce
 }
 
 func (b *v3Backend) mkdir(directory string) error {
@@ -1095,14 +1167,37 @@ func (b *v2Backend) setTTL(key, value string, ttlSeconds int64) error {
 
 // setKeep updates the value while keeping the key's expiry by re-applying the
 // remaining TTL (0 = permanent). v2 has no leases, so leaseID is ignored.
-func (b *v2Backend) setKeep(key, value string, _, ttlSeconds int64) error {
+func (b *v2Backend) setKeep(key, value string, _, ttlSeconds, expectModRev int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
+	k := normPath(key)
 	opts := &clientv2.SetOptions{}
 	if ttlSeconds > 0 {
 		opts.TTL = time.Duration(ttlSeconds) * time.Second
 	}
-	_, err := b.api.Set(ctx, normPath(key), value, opts)
+	if expectModRev > 0 {
+		// v2's native compare-and-swap: the server refuses the write unless the
+		// key's ModifiedIndex still equals PrevIndex.
+		opts.PrevIndex = uint64(expectModRev)
+	}
+	_, err := b.api.Set(ctx, k, value, opts)
+	if err == nil || expectModRev <= 0 {
+		return err
+	}
+	var e clientv2.Error
+	if !errors.As(err, &e) {
+		return err
+	}
+	switch e.Code {
+	case clientv2.ErrorCodeTestFailed:
+		ce := &ConflictError{Key: k, Expected: expectModRev}
+		if cur, gerr := b.api.Get(ctx, k, nil); gerr == nil && cur.Node != nil {
+			ce.Actual = int64(cur.Node.ModifiedIndex)
+		}
+		return ce
+	case clientv2.ErrorCodeKeyNotFound:
+		return &ConflictError{Key: k, Expected: expectModRev, Deleted: true}
+	}
 	return err
 }
 

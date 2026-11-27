@@ -262,7 +262,7 @@ func TestRegisterFlagsDeclaresDocumentedFlags(t *testing.T) {
 		"host", "port", "protocol", "debug", "username", "password",
 		"tls", "tls-ca", "tls-cert", "tls-key", "tls-skip-verify",
 		"timeout", "read-only", "dry-run", "protect", "config",
-		"no-snapshot", "dual",
+		"no-snapshot", "dual", "live", "version",
 	} {
 		if !declared[name] {
 			t.Errorf("-%s is documented but not registered", name)
@@ -274,7 +274,7 @@ func TestRegisterFlagsDeclaresDocumentedFlags(t *testing.T) {
 // IsBoolFlag, `etcd-walker -read-only` fails with "flag needs an argument" —
 // and that is the exact command the README's production example gives.
 func TestBoolFlagsAcceptBareForm(t *testing.T) {
-	for _, name := range []string{"read-only", "dry-run", "tls", "debug", "tls-skip-verify", "no-snapshot", "dual"} {
+	for _, name := range []string{"read-only", "dry-run", "tls", "debug", "tls-skip-verify", "no-snapshot", "dual", "live", "version"} {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
 		registerFlags(fs)
@@ -372,5 +372,19 @@ func TestResolveDualPane(t *testing.T) {
 	f.dual = setBool(f.dual, false)
 	if _, _, sess := resolve(&config.Config{DualPane: true}, f); sess.dual {
 		t.Error("-dual=false must override the config")
+	}
+}
+
+func TestResolveLive(t *testing.T) {
+	if _, _, sess := resolve(nil, noFlags()); sess.live {
+		t.Error("live refresh must default to off")
+	}
+	if _, _, sess := resolve(&config.Config{Live: true}, noFlags()); !sess.live {
+		t.Error(`"live": true not applied`)
+	}
+	f := noFlags()
+	f.live = setBool(f.live, false)
+	if _, _, sess := resolve(&config.Config{Live: true}, f); sess.live {
+		t.Error("-live=false must override the config")
 	}
 }

@@ -147,7 +147,7 @@ func (w *journaling) SetTTL(key, value string, ttlSeconds int64) error {
 			ttlSeconds, shellQuote(key), ttlSeconds))
 }
 
-func (w *journaling) SetKeepTTL(key, value string, leaseID, ttlSeconds int64) error {
+func (w *journaling) SetKeepTTL(key, value string, leaseID, ttlSeconds, expectModRev int64) error {
 	summary := fmt.Sprintf("edit %s (%d bytes)", key, len(value))
 	script := putScript(key, value)
 	if leaseID != 0 {
@@ -155,7 +155,7 @@ func (w *journaling) SetKeepTTL(key, value string, leaseID, ttlSeconds int64) er
 		// reproducible without that lease's id at replay time.
 		script = fmt.Sprintf("# %s (keeping lease %d — re-attach manually)", script, leaseID)
 	}
-	return w.apply(func() error { return w.modelAPI.SetKeepTTL(key, value, leaseID, ttlSeconds) },
+	return w.apply(func() error { return w.modelAPI.SetKeepTTL(key, value, leaseID, ttlSeconds, expectModRev) },
 		summary, script)
 }
 
