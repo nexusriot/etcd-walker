@@ -106,7 +106,8 @@ etcd-walker/
 ├── tools/screenshots/       regenerates them: drive the TUI in tmux, render ANSI → PNG
 ├── examples/                import-sample.json for the JSON import feature
 ├── DEBIAN/                  Debian packaging metadata
-├── Makefile                 cross-build matrix + .deb targets (preferred)
+├── packaging/               rpm spec + FreeBSD pkg writer (§10)
+├── Makefile                 cross-build matrix + deb/rpm/FreeBSD packages (preferred)
 ├── build-deb.sh             builds an amd64/arm64 .deb (legacy helper)
 ├── build-deb-arm64.sh       thin wrapper: build-deb.sh arm64
 ├── dist/                    Makefile binary build output (git-ignored)
@@ -784,7 +785,8 @@ matrix; the shell scripts remain as thin legacy helpers.
 * `make x86_64` / `x86_64-static` / `linux-i686` / `freebsd-x86_64` /
   `uconsole` / `pizero2w` / `pizero2w-armhf` / `darwin` / `windows` —
   per-platform binaries written to `dist/` (`-trimpath -ldflags "-s -w"`,
-  `CGO_ENABLED=0` for the static/cross targets). `make all` builds them all.
+  `CGO_ENABLED=0` for the static/cross targets). `make bins` builds them
+  all; `make all` is `bins` plus `packages` (debs, rpms and FreeBSD pkgs).
   The `uconsole` (ClockworkPi CM4) and `pizero2w` targets are both
   `linux/arm64`; `pizero2w-armhf` is `linux/arm GOARM=7` for 32-bit Pi OS.
 * `make debs` — `.deb`s for `amd64`, `i386`, `arm64` and `armhf` under
@@ -792,6 +794,30 @@ matrix; the shell scripts remain as thin legacy helpers.
   `DEBIAN/` metadata, patches `_version_` and `Architecture:` in
   `DEBIAN/control`, and runs `dpkg-deb --build`. Override the version with
   `make debs VERSION=0.0.40`.
+* `make rpms` — `.rpm`s for `x86_64`, `i686`, `aarch64` and `armv7hl` under
+  `build/`. `build_rpm` cross-compiles the static binary, then runs
+  `rpmbuild -bb --target <arch>` on the binary-only
+  [packaging/rpm/etcd-walker.spec](packaging/rpm/etcd-walker.spec) with its
+  own `_topdir` per arch (so `make -j` is safe). The spec turns off debuginfo
+  and the `brp-*` post-install scripts, which would run the host's
+  arch-specific `strip` over a foreign binary. RPM forbids `-` in Version, so
+  a pre-release `0.12.0-rc1` is packaged as `0.12.0~rc1`, which sorts before
+  `0.12.0`.
+* `make freebsd-pkgs` — pkg(8) packages for FreeBSD `amd64` and `arm64`.
+  `pkg create` only exists on FreeBSD, so
+  [packaging/freebsd/mkpkg.py](packaging/freebsd/mkpkg.py) writes the format
+  directly: an xz-compressed tar whose first members are `+COMPACT_MANIFEST`
+  and `+MANIFEST` (JSON), then the payload under absolute `/usr/local/…`
+  paths, owned `root:wheel`, each file's hash recorded as `1$<sha256>`. The
+  ABI is `FreeBSD:*:<arch>`: the binary is static and pkg matches the ABI with
+  `fnmatch`, so one package covers every release.
+* `make all` — `bins` + `packages`, then `checksums`: the current
+  `VERSION`'s debs, rpms and pkgs are copied from `build/` into `dist/` and
+  `dist/SHA256SUMS` is written over that version's artifacts only (stale
+  builds of other versions in `dist/` are not listed), so `dist/` is the
+  complete, verifiable release. `checksums` runs as a sub-make after the
+  builds rather than as a prerequisite, so `make -j all` cannot hash a
+  half-written file.
 * `make test | test-race | vet | fmt | tidy | run | clean` — the usual
   developer shortcuts.
 
@@ -1351,6 +1377,15 @@ it **hermetically** through [test/e2e/run.sh](test/e2e/run.sh):
   `ETCD_WALKER_STATE_DIR` for undo snapshots;
 * `docker compose up --wait` on healthchecks, and teardown (`down -v`, temp dir
   removed) on success, failure or Ctrl+C. `EW_KEEP=1` leaves it up.
+* the 3.5 clusters run with `--unsafe-no-fsync` and every container gets
+  512 MB: on GitHub's runners a stalled WAL fsync froze etcd for seconds and
+  failed unrelated scenarios with `context deadline exceeded` — even
+  `etcdctl` inside the container timed out. (A tmpfs data dir would also
+  avoid it, but would wipe the data on the `stop`/`start` the disconnect
+  scenarios do.)
+* on a failed run, `run.sh` prints `docker compose ps`, the containers'
+  memory use and etcd's recent warnings/errors before tearing down, so a CI
+  failure is diagnosable from its log alone.
 
 CI runs it as the `e2e` job. Scenario groups:
 

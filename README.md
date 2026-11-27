@@ -503,8 +503,12 @@ make x86_64          # linux/amd64 into dist/
 make x86_64-static   # fully static linux/amd64 (CGO off)
 make uconsole        # linux/arm64 (ClockworkPi uConsole CM4)
 make pizero2w        # linux/arm64 (Raspberry Pi Zero 2 W, 64-bit OS)
-make all             # every platform into dist/
+make all             # every binary + package, gathered in dist/ with SHA256SUMS
+make bins            # just the binaries (every platform into dist/)
+make packages        # just the packages: debs + rpms + freebsd-pkgs
 make debs            # .deb packages (amd64 + i386 + arm64 + armhf)
+make rpms            # .rpm packages (x86_64 + i686 + aarch64 + armv7hl)
+make freebsd-pkgs    # FreeBSD pkg(8) packages (amd64 + arm64)
 make test vet fmt    # developer shortcuts
 ```
 
@@ -546,10 +550,11 @@ GOOS=freebsd GOARCH=amd64 go build -o etcd-walker_freebsd_x86_64 ./cmd/etcd-walk
 
 #### Building a `.deb` package
 
-Install the build dependencies once:
+Besides Go (the version in `go.mod`), packaging needs `dpkg-deb` for debs,
+`rpmbuild` for rpms and `python3` for FreeBSD packages — on Debian/Ubuntu:
 
 ```bash
-sudo apt-get install git devscripts build-essential lintian upx-ucl golang
+sudo apt-get install dpkg rpm python3
 ```
 
 Then build the packages with the Makefile (preferred):
@@ -568,6 +573,41 @@ The legacy shell helpers still work and produce an equivalent package:
 ```
 
 The resulting package is written to `build/etcd-walker_<version>_<arch>.deb`.
+
+#### Building `.rpm` and FreeBSD packages
+
+```bash
+make rpms                       # x86_64 + i686 + aarch64 + armv7hl (needs rpmbuild)
+make rpm-aarch64                # a single architecture
+make freebsd-pkgs               # amd64 + arm64 (needs python3)
+```
+
+RPMs come from the binary-only spec in `packaging/rpm/` and land in
+`build/etcd-walker-<version>-1.<arch>.rpm`; install with `sudo dnf install
+./etcd-walker-…rpm`. Nothing is compiled by `rpmbuild`, so any build host can
+package every architecture.
+
+FreeBSD packages are written by `packaging/freebsd/mkpkg.py` in pkg(8)'s own
+format — no FreeBSD machine needed — as
+`build/etcd-walker-<version>-freebsd-<arch>.pkg`. Install with
+`pkg add ./etcd-walker-…pkg`. The binary is static, so one package covers
+every supported FreeBSD release.
+
+A pre-release `VERSION` such as `0.12.0-rc1` becomes `0.12.0~rc1` in the
+RPM and `0.12.0.rc1` in the FreeBSD package, since neither format allows
+`-` in a version.
+
+#### Release artifacts and checksums
+
+`make all` ends by copying the packages next to the binaries and writing
+`dist/SHA256SUMS` (`sha256sum` format, one line per artifact of the current
+`VERSION`), so `dist/` holds the complete release. Verify a download with:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+`make checksums` regenerates the file from whatever has been built so far.
 
 ---
 

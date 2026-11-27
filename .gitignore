@@ -5,7 +5,9 @@
 # the cmd/etcd-walker/ source directory.
 /etcd-walker
 
-# Build & packaging output dirs (Makefile: DIST_DIR / BUILD_DIR).
+# Build & packaging output dirs (Makefile): dist/ holds the release — every
+# binary, the packages and SHA256SUMS; build/ holds the debs/rpms/pkgs and
+# their staging trees (also build-deb.sh's output).
 /dist/
 /build/
 
